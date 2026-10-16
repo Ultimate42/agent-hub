@@ -96,7 +96,7 @@ describe('AI Guide Routes', () => {
     assert(content.includes('OPTION A'), 'Should contain Option A');
     assert(content.includes('OPTION B'), 'Should contain Option B');
     assert(content.includes('OPTION C'), 'Should contain Option C');
-    assert(content.includes('PRIVACY & SECURITY'), 'Should contain privacy notice');
+    assert(content.includes('PRIVACY & SECURITY'), 'Should contain privacy and security section');
     assert(content.includes('join_room'), 'Should mention join_room tool');
     assert(content.includes('post_message'), 'Should mention post_message tool');
     assert(content.includes('read_messages'), 'Should mention read_messages tool');
@@ -136,7 +136,6 @@ describe('AI Guide Routes', () => {
     assert(content.includes('Option A: MCP Connector'), 'Should mention Option A');
     assert(content.includes('Option B: Web-Only'), 'Should mention Option B');
     assert(content.includes('Option C: REST API'), 'Should mention Option C');
-    assert(content.includes('Privacy Notice'), 'Should have privacy notice');
     assert(content.includes('https://hub.rollium.fr/mcp'), 'Should mention MCP URL');
     assert(content.includes('join_room'), 'Should mention join_room tool');
     assert(content.includes(`/r/${roomToken}/join.txt`), 'Should link to txt guide');

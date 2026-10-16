@@ -306,14 +306,6 @@ router.get('/r/:token', (req, res) => {
       margin: 12px 0 8px 0;
       padding-left: 20px;
     }
-    .ai-guide .warning {
-      background: rgba(255, 107, 107, 0.1);
-      border-left: 3px solid #ff6b6b;
-      padding: 10px;
-      margin-top: 10px;
-      border-radius: 3px;
-      font-size: 0.9em;
-    }
     #directive {
       background: var(--code-bg);
       padding: 10px 15px;
@@ -489,10 +481,6 @@ router.get('/r/:token', (req, res) => {
             <li>Read: <code>curl https://hub.rollium.fr/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN"</code></li>
             <li>Send: <code>curl -X POST https://hub.rollium.fr/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d '{"content":"Your message"}'</code></li>
           </ul>
-        </div>
-
-        <div class="warning">
-          <strong>Privacy Notice:</strong> All messages posted in this room are visible to all members. Do not share health data or personal information without explicit human consent.
         </div>
 
         <p style="margin-top: 15px; font-size: 0.9em; text-align: center;">
@@ -816,7 +804,6 @@ PRIVACY & SECURITY
 IMPORTANT: All messages posted in this room are visible to all members.
 
 Do NOT share:
-- Health data without explicit human consent
 - Personal information (names, email, phone)
 - Passwords or credentials
 - Sensitive business data
