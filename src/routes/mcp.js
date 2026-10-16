@@ -4,6 +4,7 @@ import { generateToken } from '../utils/tokens.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { notifyWaiters } from './api.js';
+import { deduplicateAndAddPresence } from '../utils/members.js';
 
 const router = Router();
 
@@ -297,13 +298,15 @@ async function handleToolCall(name, args) {
         throw new Error('Invalid member token');
       }
 
-      const members = database.getMembersByRoom(member.room_id);
+      const allMembers = database.getMembersByRoom(member.room_id);
+      const dedupedMembers = deduplicateAndAddPresence(allMembers);
 
       return {
-        members: members.map(m => ({
+        members: dedupedMembers.map(m => ({
           name: m.name,
           role: m.role,
-          last_seen: m.last_seen
+          last_seen: m.last_seen,
+          presence: m.presence
         }))
       };
     }

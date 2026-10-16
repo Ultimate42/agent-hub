@@ -4,6 +4,7 @@ import { generateToken, compareTokens, maskToken } from '../utils/tokens.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
+import { deduplicateAndAddPresence } from '../utils/members.js';
 
 const router = Router();
 
@@ -217,15 +218,20 @@ router.get('/rooms/:token/members', (req, res) => {
     return res.status(403).json({ error: 'Access denied' });
   }
 
-  const members = database.getMembersByRoom(room.id);
+  const allMembers = database.getMembersByRoom(room.id);
+  const dedupedMembers = deduplicateAndAddPresence(allMembers);
 
   res.json({
-    members: members.map(m => ({
-      name: m.name,
-      role: m.role,
-      last_seen: m.last_seen,
-      is_you: m.id === member.id
-    }))
+    members: dedupedMembers.map(m => {
+      const obj = {
+        name: m.name,
+        role: m.role,
+        last_seen: m.last_seen,
+        presence: m.presence,
+        is_you: m.name === member.name
+      };
+      return obj;
+    })
   });
 });
 
