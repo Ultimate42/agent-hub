@@ -7,7 +7,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
+const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -30,6 +33,9 @@ let state = {
 const PID_FILE = path.join(__dirname, 'archiviste.pid');
 let messagesThisMinute = 0;
 let lastMinuteReset = Date.now();
+
+// Track last help response per author to avoid spam
+const lastHelpResponsePerAuthor = new Map(); // author -> timestamp
 
 // Backoff configuration
 const BACKOFF_CONFIG = {
@@ -342,6 +348,65 @@ function normalize(text) {
 }
 
 /**
+ * Determine if a message should trigger LLM response
+ * Returns true if:
+ * - Not a recognized command (retiens:/cherche:/résume:/?)
+ * - AND (mentions "Archiviste"/@Archiviste OR contains generic agent appeal like "each agent"/"tous les agents")
+ * Exported for testing
+ */
+export function shouldCallLLM(content) {
+  const normalized = normalize(content);
+
+  // Check if it's a recognized command - if so, skip LLM
+  if (
+    normalized.startsWith('retiens:') ||
+    normalized.startsWith('ajoute:') ||
+    normalized.startsWith('cherche:') ||
+    normalized.startsWith('recherche:') ||
+    normalized.startsWith('résume:') ||
+    normalized.startsWith('resume:')
+  ) {
+    return false;
+  }
+
+  if (content.trim() === '?' || content.trim() === 'aide') {
+    return false;
+  }
+
+  // Check for Archiviste mention or agent appeal
+  const hasMention = /\b(archiviste|@archiviste)\b/i.test(content);
+  const hasAgentAppeal = /\b(each agent|tous les agents)\b/i.test(content);
+
+  return hasMention || hasAgentAppeal;
+}
+
+/**
+ * Call Claude Haiku via CLI with timeout
+ * Returns the response text or null on error
+ */
+async function callClaudeLLM(systemPrompt, userMessage) {
+  try {
+    const fullPrompt = `${systemPrompt}\n\n${userMessage}`;
+
+    // Use echo | claude to pass prompt via stdin
+    const { stdout, stderr } = await execFileAsync('bash', ['-c', `echo "${fullPrompt.replace(/"/g, '\\"')}" | claude -p --model haiku`], {
+      timeout: 90000, // 90 seconds
+      maxBuffer: 10 * 1024 * 1024, // 10MB
+      shell: false,
+    });
+
+    if (stderr && !stderr.includes('warning')) {
+      console.warn(`[ARCHIVISTE] Claude stderr: ${stderr.substring(0, 200)}`);
+    }
+
+    return stdout.trim();
+  } catch (err) {
+    console.error(`[ARCHIVISTE] Claude call failed: ${err.message.substring(0, 200)}`);
+    return null;
+  }
+}
+
+/**
  * Check rate limit: max 20 messages per minute
  */
 function canPostMessage() {
@@ -369,8 +434,15 @@ async function processMessage(msg) {
       return;
     }
 
-    const content = msg.content || '';
+    // Ignore messages from other bots unless they mention Archiviste
     const author = msg.author || msg.member_name || 'Unknown';
+    const messageType = msg.type || 'message';
+    if (messageType === 'system') {
+      console.log(`[ARCHIVISTE] Ignoring system message`);
+      return;
+    }
+
+    const content = msg.content || '';
     console.log(`[ARCHIVISTE] Processing msg_id=${msg.id} author=${author}: ${content.substring(0, 60)}`);
 
     const normalized = normalize(content);
@@ -447,9 +519,68 @@ async function processMessage(msg) {
       }
     }
 
-    // All other messages: SILENCE (no response)
+    // LLM mode: if message mentions Archiviste or addresses all agents
+    else if (shouldCallLLM(content)) {
+      console.log('[ARCHIVISTE] -> Triggering LLM mode');
+
+      if (!canPostMessage()) {
+        console.warn('[ARCHIVISTE] Rate limit reached, skipping LLM');
+        return;
+      }
+
+      // Search memory for context
+      const memoryContext = await readMemory(content);
+      const memoryText = memoryContext && typeof memoryContext.result === 'string'
+        ? memoryContext.result.trim().substring(0, 500)
+        : '';
+
+      // Build system prompt
+      const systemPrompt =
+        'You are Archiviste, a memory agent for Florent\'s life assistant. ' +
+        'Respond in English in the hub. Keep response to 5 lines max. ' +
+        (memoryText ? `Relevant memory context: ${memoryText}` : '');
+
+      // Call Claude LLM
+      const llmResponse = await callClaudeLLM(systemPrompt, content);
+
+      if (llmResponse) {
+        // Truncate to 5 lines max
+        const truncated = llmResponse.split('\n').slice(0, 5).join('\n');
+        await postMessage(truncated);
+      } else {
+        console.error('[ARCHIVISTE] LLM failed, no response posted');
+      }
+    }
+
+    // All other messages: brief response (not a command)
     else {
-      console.log('[ARCHIVISTE] -> No command, silence');
+      console.log('[ARCHIVISTE] -> No command, brief response');
+
+      if (!canPostMessage()) {
+        console.warn('[ARCHIVISTE] Rate limit reached, skipping response');
+        return;
+      }
+
+      // Check if we already replied to this author in the last 5 minutes
+      const now = Date.now();
+      const lastResponse = lastHelpResponsePerAuthor.get(author) || 0;
+      const fiveMinutesMs = 5 * 60 * 1000;
+
+      if (now - lastResponse < fiveMinutesMs) {
+        console.log(`[ARCHIVISTE] Already responded to ${author} within 5 min, skipping`);
+        return;
+      }
+
+      // Detect message language (simple heuristic: has French accents or words)
+      const isFrench = /[àâääéèêëïîôöùûüœç]/i.test(content) ||
+                       /(que|et|le|de|est|un|une|je|tu|il|elle|nous|vous|ils|elles)\b/i.test(content);
+
+      const briefResponse = isFrench
+        ? 'Je suis un script relais vers la mémoire du coach (modèle Haiku côté memory-agent).\nCommandes: retiens:, cherche:, résume:, ?, aide'
+        : 'I am a relay script to the coach\'s memory (Haiku model on memory-agent side).\nCommands: retiens:, cherche:, résume:, ?, aide';
+
+      await postMessage(briefResponse);
+      lastHelpResponsePerAuthor.set(author, now);
     }
   } catch (err) {
     console.error('[ARCHIVISTE] Error in processMessage:', err.message);
