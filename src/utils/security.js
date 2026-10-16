@@ -102,8 +102,14 @@ export function corsHandler(req, res, next) {
 
 /**
  * Rate limit middleware
+ * Excludes long-poll requests (/messages/wait) from rate limiting
  */
 export function rateLimitMiddleware(req, res, next) {
+  // Exclude long-poll from rate limiting
+  if (req.path.includes('/messages/wait') && req.method === 'GET') {
+    return next();
+  }
+
   // Use token if available, otherwise IP
   const token = req.get('Authorization')?.replace('Bearer ', '') ||
                 req.query.token;

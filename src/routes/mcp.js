@@ -144,6 +144,28 @@ async function handleToolCall(name, args) {
         throw new Error('Room not found');
       }
 
+      // Check if member with same name already exists (idempotent)
+      const existingMember = database.getMemberByNameAndRoom(room.id, args.name);
+
+      if (existingMember) {
+        // Member exists: update token and role, invalidate old token
+        const newToken = generateToken(config.tokenLength);
+        database.updateMemberToken(existingMember.id, newToken);
+
+        if (args.role && args.role !== 'agent') {
+          database.updateMemberRole(existingMember.id, args.role);
+        }
+
+        logger.info('MCP: Member rejoined (token refreshed)', { roomId: room.id, memberId: existingMember.id, name: args.name });
+
+        return {
+          member_token: newToken,
+          room_name: room.name,
+          directive: room.directive,
+          is_rejoin: true
+        };
+      }
+
       const memberCount = database.countMembersByRoom(room.id);
       if (memberCount >= config.maxMembersPerRoom) {
         throw new Error('Room is full');
@@ -157,7 +179,8 @@ async function handleToolCall(name, args) {
       return {
         member_token: memberToken,
         room_name: room.name,
-        directive: room.directive
+        directive: room.directive,
+        is_rejoin: false
       };
     }
 

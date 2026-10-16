@@ -106,9 +106,22 @@ const stmts = {
     JOIN rooms r ON m.room_id = r.id
     WHERE m.token = ?
   `),
+  getMemberByNameAndRoom: db.prepare(`
+    SELECT id, name, role, token, status, last_seen, created_at
+    FROM members
+    WHERE room_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+    ORDER BY id DESC
+    LIMIT 1
+  `),
   getMembersByRoom: db.prepare(`
     SELECT id, name, role, permissions, status, coordination_role, last_heartbeat, last_seen, created_at
     FROM members WHERE room_id = ?
+  `),
+  updateMemberToken: db.prepare(`
+    UPDATE members SET token = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?
+  `),
+  updateMemberRole: db.prepare(`
+    UPDATE members SET role = ? WHERE id = ?
   `),
   updateMemberLastSeen: db.prepare(`
     UPDATE members SET last_seen = CURRENT_TIMESTAMP WHERE id = ?
@@ -219,8 +232,20 @@ export const database = {
     return stmts.getMemberByToken.get(token);
   },
 
+  getMemberByNameAndRoom(roomId, name) {
+    return stmts.getMemberByNameAndRoom.get(roomId, name);
+  },
+
   getMembersByRoom(roomId) {
     return stmts.getMembersByRoom.all(roomId);
+  },
+
+  updateMemberToken(memberId, token) {
+    stmts.updateMemberToken.run(token, memberId);
+  },
+
+  updateMemberRole(memberId, role) {
+    stmts.updateMemberRole.run(role, memberId);
   },
 
   updateMemberLastSeen(memberId) {

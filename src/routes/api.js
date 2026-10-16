@@ -124,7 +124,9 @@ router.delete('/rooms/:token', (req, res) => {
 });
 
 /**
- * POST /api/rooms/:token/join - Join a room
+ * POST /api/rooms/:token/join - Join a room (idempotent)
+ * If a member with same name exists, update their token and return 200
+ * If no member exists, create new and return 201
  */
 router.post('/rooms/:token/join', (req, res) => {
   try {
@@ -139,7 +141,31 @@ router.post('/rooms/:token/join', (req, res) => {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // Check member limit
+    // Check if member with same name already exists (case-insensitive, trimmed)
+    const existingMember = database.getMemberByNameAndRoom(room.id, name);
+
+    if (existingMember) {
+      // Member exists: update token and role, invalidate old token
+      const newToken = generateToken(config.tokenLength);
+      database.updateMemberToken(existingMember.id, newToken);
+
+      // Update role if provided
+      if (role && role !== 'agent') {
+        database.updateMemberRole(existingMember.id, role);
+      }
+
+      logger.info('Member rejoined (token refreshed)', { roomId: room.id, memberId: existingMember.id, name, role });
+
+      // No system message for rejoin to avoid noise
+      return res.status(200).json({
+        member_token: newToken,
+        room_name: room.name,
+        directive: room.directive,
+        is_rejoin: true
+      });
+    }
+
+    // New member: check limit and create
     const memberCount = database.countMembersByRoom(room.id);
     if (memberCount >= config.maxMembersPerRoom) {
       return res.status(429).json({ error: 'Room is full' });
@@ -157,9 +183,9 @@ router.post('/rooms/:token/join', (req, res) => {
       }
     }
 
-    logger.info('Member joined', { roomId: room.id, name, role });
+    logger.info('Member joined', { roomId: room.id, memberId, name, role });
 
-    // Notify others via WebSocket (handled by ws module)
+    // Notify others only for new joins
     notifyWaiters(room.id, [{
       type: 'system',
       content: `${name} joined the room`,
@@ -170,7 +196,8 @@ router.post('/rooms/:token/join', (req, res) => {
     res.status(201).json({
       member_token: memberToken,
       room_name: room.name,
-      directive: room.directive
+      directive: room.directive,
+      is_rejoin: false
     });
   } catch (error) {
     logger.error('Failed to join room', { error: error.message });
