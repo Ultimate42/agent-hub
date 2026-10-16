@@ -31,7 +31,7 @@ app.use((req, res, next) => {
 
   res.on('finish', () => {
     // Mask any token-like strings in URL
-    const safeUrl = req.originalUrl.replace(/([?&]token=)[^&]+/g, '$1***');
+    const safeUrl = req.originalUrl.replace(/([?&]token=)[^&]+/g, '$1***').replace(/(\/(?:rooms|r)\/)[A-Za-z0-9_-]{8,}/g, '$1***');
 
     logger.info('HTTP request', {
       method: req.method,
