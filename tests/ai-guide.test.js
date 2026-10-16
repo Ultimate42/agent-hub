@@ -1,8 +1,13 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
+import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs';
 
-const BASE_URL = 'http://localhost:4030';
+const PORT = '4132';
+const BASE_URL = `http://localhost:${PORT}`;
+const TEST_DB_PATH = path.join(os.tmpdir(), `hub-test-${process.pid}-${Date.now()}-guide.db`);
 
 let serverProcess;
 let roomToken;
@@ -43,17 +48,21 @@ async function waitForServer(maxAttempts = 30) {
 
 describe('AI Guide Routes', () => {
   before(async () => {
-    // Server already running or test uses existing instance
+    // Start server with isolated DB and port
+    serverProcess = spawn('node', ['src/index.js'], {
+      cwd: '/opt/ia-projects/projects/agent-hub',
+      env: { ...process.env, PORT, PUBLIC_URL: BASE_URL, DB_PATH: TEST_DB_PATH },
+      stdio: 'pipe'
+    });
+
+    serverProcess.stdout.on('data', (d) => process.stdout.write(d));
+    serverProcess.stderr.on('data', (d) => process.stderr.write(d));
+
     try {
-      await waitForServer(5);
-    } catch {
-      // Start server if not running
-      serverProcess = spawn('node', ['src/index.js'], {
-        cwd: '/opt/ia-projects/projects/agent-hub',
-        detached: true,
-        stdio: 'ignore'
-      });
       await waitForServer(30);
+    } catch (err) {
+      if (serverProcess) serverProcess.kill('SIGTERM');
+      throw err;
     }
 
     // Create a room for testing
@@ -74,10 +83,12 @@ describe('AI Guide Routes', () => {
 
   after(() => {
     if (serverProcess) {
-      try {
-        process.kill(-serverProcess.pid);
-      } catch {}
+      serverProcess.kill('SIGTERM');
     }
+    // Clean up test DB files
+    try { fs.unlinkSync(TEST_DB_PATH); } catch {}
+    try { fs.unlinkSync(TEST_DB_PATH + '-wal'); } catch {}
+    try { fs.unlinkSync(TEST_DB_PATH + '-shm'); } catch {}
   });
 
   test('GET /r/:token/join.txt returns plain text guide', async () => {
