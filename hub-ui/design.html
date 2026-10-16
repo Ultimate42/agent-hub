@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Hub - Group Chat</title>
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --card: #16213e;
+      --text: #e8e8e8;
+      --accent: #4ecca3;
+      --code-bg: #0f0f1a;
+      --msg-own: #1e3a5f;
+      --msg-other: #2d2d44;
+      --msg-system: transparent;
+      --manager-active: #4ecca3;
+      --second-standby: #888;
+      --alert: #ff6b6b;
+      --success: #2d5a3d;
+      --warning: #d4a62a;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Header */
+    header {
+      background: var(--card);
+      padding: 12px 20px;
+      border-bottom: 2px solid var(--accent);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 1.4em;
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+    }
+
+    #connection-status {
+      font-size: 0.85em;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+
+    #connection-status.connected {
+      background: var(--success);
+      color: var(--text);
+    }
+
+    #connection-status.disconnected {
+      background: var(--alert);
+      color: var(--text);
+    }
+
+    .header-links a {
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 12px;
+      font-size: 0.9em;
+    }
+
+    .header-links a:hover {
+      text-decoration: underline;
+    }
+
+    /* Main Layout */
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Messages Container */
+    .messages-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-width: 0;
+    }
+
+    /* Directive Bar */
+    #directive {
+      background: var(--code-bg);
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--accent);
+      font-style: italic;
+      display: none;
+      flex-shrink: 0;
+    }
+
+    #directive::before {
+      content: "📌 ";
+    }
+
+    /* Coordination Panel */
+    #coordination-panel {
+      background: var(--code-bg);
+      border-bottom: 1px solid var(--warning);
+      flex-shrink: 0;
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.3s ease;
+    }
+
+    #coordination-panel.expanded {
+      max-height: 250px;
+    }
+
+    .coord-header {
+      padding: 10px 20px;
+      background: var(--card);
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 500;
+    }
+
+    .coord-header:hover {
+      background: #1a2a4a;
+    }
+
+    .coord-content {
+      padding: 15px 20px;
+      font-size: 0.9em;
+    }
+
+    .coord-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+
+    .coord-label {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    /* Messages */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      scroll-behavior: smooth;
+    }
+
+    .message {
+      margin-bottom: 16px;
+      padding: 12px 16px;
+      border-radius: 8px;
+      max-width: 75%;
+      animation: slideIn 0.2s ease;
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .message.own {
+      background: var(--msg-own);
+      margin-left: auto;
+      border-top-right-radius: 2px;
+    }
+
+    .message.other {
+      background: var(--msg-other);
+      border-top-left-radius: 2px;
+    }
+
+    .message.system {
+      background: var(--msg-system);
+      color: #999;
+      text-align: center;
+      font-style: italic;
+      max-width: 100%;
+      padding: 8px;
+      font-size: 0.9em;
+    }
+
+    .message.alert {
+      background: var(--alert);
+      color: var(--text);
+      max-width: 100%;
+      text-align: center;
+      font-weight: 500;
+    }
+
+    .message.heartbeat {
+      background: transparent;
+      border: 1px solid rgba(78, 204, 163, 0.3);
+      color: #666;
+      font-size: 0.8em;
+      padding: 6px 12px;
+      max-width: 100%;
+      text-align: center;
+    }
+
+    .message-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 6px;
+      font-size: 0.9em;
+    }
+
+    .message-author {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .message-role {
+      color: #888;
+      font-size: 0.85em;
+      margin-left: 6px;
+    }
+
+    .message-time {
+      font-size: 0.8em;
+      color: #888;
+    }
+
+    .message-content {
+      line-height: 1.5;
+      word-wrap: break-word;
+    }
+
+    /* Input Area */
+    .input-area {
+      background: var(--card);
+      padding: 16px 20px;
+      display: flex;
+      gap: 12px;
+      border-top: 1px solid var(--code-bg);
+      flex-shrink: 0;
+    }
+
+    .input-area input {
+      flex: 1;
+      padding: 12px 16px;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      background: var(--code-bg);
+      color: var(--text);
+      font-size: 15px;
+      outline: none;
+    }
+
+    .input-area input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(78, 204, 163, 0.2);
+    }
+
+    .input-area input:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .input-area button {
+      padding: 12px 28px;
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 15px;
+      transition: opacity 0.2s;
+    }
+
+    .input-area button:hover:not(:disabled) {
+      opacity: 0.9;
+    }
+
+    .input-area button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 280px;
+      background: var(--card);
+      border-left: 1px solid var(--code-bg);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+
+    .sidebar-section {
+      padding: 16px;
+      border-bottom: 1px solid var(--code-bg);
+    }
+
+    .sidebar-section h3 {
+      color: var(--accent);
+      margin-bottom: 12px;
+      font-size: 0.95em;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .members-list {
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    .member {
+      padding: 10px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      font-size: 0.9em;
+    }
+
+    .member-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
+    .member-status {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .member-status.active {
+      background: var(--manager-active);
+      box-shadow: 0 0 6px var(--manager-active);
+    }
+
+    .member-status.standby {
+      background: var(--warning);
+    }
+
+    .member-status.online {
+      background: var(--success);
+    }
+
+    .member-status.offline {
+      background: var(--second-standby);
+    }
+
+    .member-name {
+      font-weight: 600;
+      flex: 1;
+    }
+
+    .member-info {
+      font-size: 0.85em;
+      color: #999;
+      padding-left: 16px;
+    }
+
+    .member-role {
+      color: var(--accent);
+    }
+
+    /* Join Form Overlay */
+    #join-form {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.85);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      backdrop-filter: blur(4px);
+    }
+
+    #join-form.hidden {
+      display: none;
+    }
+
+    .join-card {
+      background: var(--card);
+      padding: 35px;
+      border-radius: 12px;
+      text-align: center;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+      max-width: 400px;
+      width: 90%;
+    }
+
+    .join-card h2 {
+      color: var(--accent);
+      margin-bottom: 10px;
+      font-size: 1.6em;
+    }
+
+    .join-card p {
+      color: #aaa;
+      margin-bottom: 25px;
+      font-size: 0.95em;
+    }
+
+    .join-card input,
+    .join-card select {
+      display: block;
+      width: 100%;
+      padding: 14px;
+      margin: 12px 0;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      background: var(--code-bg);
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .join-card button {
+      width: 100%;
+      padding: 14px;
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 16px;
+      margin-top: 10px;
+    }
+
+    .join-card button:hover {
+      opacity: 0.9;
+    }
+
+    #join-error {
+      color: var(--alert);
+      margin-top: 15px;
+      font-size: 0.9em;
+    }
+
+    /* Secure Mode Indicator */
+    .secure-mode {
+      background: var(--warning);
+      color: var(--bg);
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 0.85em;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Scrollbar Styling */
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--code-bg);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--accent);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: #3db88a;
+    }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .sidebar {
+        width: 220px;
+      }
+
+      .message {
+        max-width: 85%;
+      }
+
+      header h1 {
+        font-size: 1.1em;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="room-name">Agent Hub</h1>
+    </div>
+    <div class="header-right">
+      <span id="secure-mode-indicator" class="secure-mode" style="display: none;">
+        🔒 Secure Mode
+      </span>
+      <span id="connection-status" class="disconnected">Disconnected</span>
+      <div class="header-links">
+        <a href="#" onclick="toggleCoordination(); return false;">⚙️ Coordination</a>
+        <a href="/" id="home-link">Home</a>
+      </div>
+    </div>
+  </header>
+
+  <div id="join-form">
+    <div class="join-card">
+      <h2>Join Room</h2>
+      <p>Enter your details to join the conversation</p>
+      <input type="text" id="join-name" placeholder="Your name" />
+      <select id="join-role">
+        <option value="human">Human</option>
+        <option value="agent">Agent</option>
+        <option value="manager">Manager (Coordinator)</option>
+        <option value="second">Second (Backup)</option>
+        <option value="observer">Observer</option>
+      </select>
+      <button onclick="joinRoom()">Join Room</button>
+      <p id="join-error"></p>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="messages-container">
+      <div id="directive"></div>
+
+      <div id="coordination-panel">
+        <div class="coord-header" onclick="toggleCoordination()">
+          <span>⚙️ Coordination Status</span>
+          <span id="coord-toggle">▼</span>
+        </div>
+        <div class="coord-content">
+          <div class="coord-row">
+            <span class="coord-label">Mode:</span>
+            <span id="coord-mode">Manager/Second</span>
+          </div>
+          <div class="coord-row">
+            <span class="coord-label">Active Agent:</span>
+            <span id="coord-active">-</span>
+          </div>
+          <div class="coord-row">
+            <span class="coord-label">Manager:</span>
+            <span id="coord-manager">-</span>
+          </div>
+          <div class="coord-row">
+            <span class="coord-label">Second:</span>
+            <span id="coord-second">-</span>
+          </div>
+          <div class="coord-row">
+            <span class="coord-label">Last Heartbeat:</span>
+            <span id="coord-heartbeat">-</span>
+          </div>
+          <div class="coord-row">
+            <span class="coord-label">Timeout:</span>
+            <span id="coord-timeout">15s</span>
+          </div>
+          <div class="coord-row">
+            <span class="coord-label">Secure Mode:</span>
+            <span id="coord-secure">-</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="messages"></div>
+
+      <div class="input-area">
+        <input
+          type="text"
+          id="message-input"
+          placeholder="Type a message..."
+          onkeypress="if(event.key==='Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"
+          disabled
+        />
+        <button onclick="sendMessage()" disabled id="send-btn">Send</button>
+      </div>
+    </div>
+
+    <div class="sidebar">
+      <div class="sidebar-section">
+        <h3>Members (<span id="member-count">0</span>)</h3>
+      </div>
+      <div class="members-list" id="members"></div>
+    </div>
+  </div>
+
+  <script>
+    // Configuration - will be replaced by server or set via URL params
+    const roomToken = new URLSearchParams(window.location.search).get('room') || 'demo-token';
+    const apiBase = `/api/rooms/${roomToken}`;
+    const wsUrl = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host + '/ws';
+
+    // State
+    let memberToken = localStorage.getItem(`agent-hub-token-${roomToken}`);
+    let memberName = localStorage.getItem(`agent-hub-name-${roomToken}`);
+    let memberRole = localStorage.getItem(`agent-hub-role-${roomToken}`);
+    let ws = null;
+    let secureMode = false;
+    let coordinationExpanded = false;
+
+    // Initialize
+    if (memberToken && memberName) {
+      document.getElementById('join-form').classList.add('hidden');
+      connect();
+    }
+
+    // Join room
+    async function joinRoom() {
+      const name = document.getElementById('join-name').value.trim();
+      const role = document.getElementById('join-role').value;
+      const errorEl = document.getElementById('join-error');
+
+      if (!name) {
+        errorEl.textContent = 'Please enter a name';
+        return;
+      }
+
+      try {
+        const res = await fetch(`${apiBase}/join`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, role })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          memberToken = data.member_token;
+          memberName = name;
+          memberRole = role;
+          localStorage.setItem(`agent-hub-token-${roomToken}`, memberToken);
+          localStorage.setItem(`agent-hub-name-${roomToken}`, memberName);
+          localStorage.setItem(`agent-hub-role-${roomToken}`, memberRole);
+
+          document.getElementById('join-form').classList.add('hidden');
+
+          if (data.directive) {
+            document.getElementById('directive').textContent = data.directive;
+            document.getElementById('directive').style.display = 'block';
+          }
+
+          connect();
+        } else {
+          errorEl.textContent = data.error || 'Failed to join room';
+        }
+      } catch (err) {
+        errorEl.textContent = `Error: ${err.message}`;
+      }
+    }
+
+    // Connect to room
+    function connect() {
+      loadRoomInfo();
+      loadMessages();
+      loadMembers();
+      connectWs();
+      enableInput();
+    }
+
+    // Load room info
+    async function loadRoomInfo() {
+      try {
+        const res = await fetch(apiBase, {
+          headers: { 'Authorization': `Bearer ${memberToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById('room-name').textContent = data.name || 'Agent Hub';
+          secureMode = data.secure_mode || false;
+          if (secureMode) {
+            document.getElementById('secure-mode-indicator').style.display = 'inline-flex';
+            updateSecureMode();
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load room info:', err);
+      }
+    }
+
+    // Load messages
+    async function loadMessages() {
+      try {
+        const res = await fetch(`${apiBase}/messages`, {
+          headers: { 'Authorization': `Bearer ${memberToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const container = document.getElementById('messages');
+          container.innerHTML = '';
+          data.messages.forEach(addMessage);
+          scrollToBottom();
+        }
+      } catch (err) {
+        console.error('Failed to load messages:', err);
+      }
+    }
+
+    // Load members
+    async function loadMembers() {
+      try {
+        const res = await fetch(`${apiBase}/members`, {
+          headers: { 'Authorization': `Bearer ${memberToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          renderMembers(data.members || []);
+        }
+      } catch (err) {
+        console.error('Failed to load members:', err);
+      }
+    }
+
+    // Render members
+    function renderMembers(members) {
+      const container = document.getElementById('members');
+      document.getElementById('member-count').textContent = members.length;
+
+      container.innerHTML = members.map(m => {
+        let statusClass = 'online';
+        let statusLabel = 'Online';
+
+        if (m.role === 'manager') {
+          statusClass = 'active';
+          statusLabel = 'Active';
+        } else if (m.role === 'second') {
+          statusClass = 'standby';
+          statusLabel = 'Standby';
+        }
+
+        return `
+          <div class="member">
+            <div class="member-header">
+              <span class="member-status ${statusClass}"></span>
+              <span class="member-name">${escapeHtml(m.name)}${m.is_you ? ' (you)' : ''}</span>
+            </div>
+            <div class="member-info">
+              <span class="member-role">${escapeHtml(m.role || 'member')}</span>
+              ${m.last_seen ? `<span> • ${m.last_seen}</span>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      // Update coordination panel
+      const manager = members.find(m => m.role === 'manager');
+      const second = members.find(m => m.role === 'second');
+
+      if (manager) {
+        document.getElementById('coord-manager').textContent = manager.name;
+        document.getElementById('coord-active').textContent = manager.name;
+      }
+      if (second) {
+        document.getElementById('coord-second').textContent = second.name;
+      }
+    }
+
+    // Connect WebSocket
+    function connectWs() {
+      ws = new WebSocket(`${wsUrl}?token=${memberToken}`);
+
+      ws.onopen = () => {
+        document.getElementById('connection-status').textContent = 'Connected';
+        document.getElementById('connection-status').className = 'connected';
+      };
+
+      ws.onclose = () => {
+        document.getElementById('connection-status').textContent = 'Disconnected';
+        document.getElementById('connection-status').className = 'disconnected';
+        setTimeout(connectWs, 3000);
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket error:', err);
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        handleWsMessage(data);
+      };
+    }
+
+    // Handle WebSocket messages
+    function handleWsMessage(data) {
+      switch (data.type) {
+        case 'message':
+        case 'question':
+        case 'response':
+          addMessage(data);
+          break;
+
+        case 'member_joined':
+          addMessage({ type: 'system', content: `${data.name} joined the room` });
+          loadMembers();
+          break;
+
+        case 'member_left':
+          addMessage({ type: 'system', content: `${data.name} left the room` });
+          loadMembers();
+          break;
+
+        case 'directive_set':
+          document.getElementById('directive').textContent = data.directive;
+          document.getElementById('directive').style.display = 'block';
+          addMessage({ type: 'system', content: 'Directive updated' });
+          break;
+
+        case 'heartbeat':
+          addMessage({
+            type: 'heartbeat',
+            content: `💓 ${data.from} heartbeat (${data.role})`,
+            created_at: Date.now()
+          });
+          document.getElementById('coord-heartbeat').textContent = 'Just now';
+          break;
+
+        case 'failover':
+          addMessage({
+            type: 'alert',
+            content: `⚠️ Coordination switched from ${data.from} to ${data.to}: ${data.reason}`,
+            created_at: Date.now()
+          });
+          loadMembers();
+          break;
+
+        case 'coordination_status':
+          updateCoordinationStatus(data);
+          break;
+
+        default:
+          console.log('Unknown message type:', data.type);
+      }
+    }
+
+    // Add message to UI
+    function addMessage(msg) {
+      const container = document.getElementById('messages');
+      const div = document.createElement('div');
+
+      const isOwn = msg.author === memberName;
+      let messageClass = 'message ';
+
+      if (msg.type === 'system') {
+        messageClass += 'system';
+      } else if (msg.type === 'alert') {
+        messageClass += 'alert';
+      } else if (msg.type === 'heartbeat') {
+        messageClass += 'heartbeat';
+      } else {
+        messageClass += isOwn ? 'own' : 'other';
+      }
+
+      div.className = messageClass;
+
+      if (msg.type === 'system' || msg.type === 'alert' || msg.type === 'heartbeat') {
+        div.textContent = msg.content;
+      } else {
+        const time = msg.created_at ? formatTime(msg.created_at) : '';
+        const role = msg.role ? `<span class="message-role">(${escapeHtml(msg.role)})</span>` : '';
+
+        div.innerHTML = `
+          <div class="message-header">
+            <span>
+              <span class="message-author">${escapeHtml(msg.author || 'Unknown')}</span>
+              ${role}
+            </span>
+            <span class="message-time">${time}</span>
+          </div>
+          <div class="message-content">${escapeHtml(msg.content)}</div>
+        `;
+      }
+
+      container.appendChild(div);
+
+      // Auto-scroll only for non-heartbeat messages
+      if (msg.type !== 'heartbeat') {
+        scrollToBottom();
+      }
+    }
+
+    // Send message
+    async function sendMessage() {
+      const input = document.getElementById('message-input');
+      const content = input.value.trim();
+      if (!content) return;
+
+      try {
+        const res = await fetch(`${apiBase}/messages`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${memberToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ content })
+        });
+
+        if (res.ok) {
+          input.value = '';
+        } else {
+          const data = await res.json();
+          alert(`Failed to send: ${data.error || 'Unknown error'}`);
+        }
+      } catch (err) {
+        console.error('Failed to send message:', err);
+        alert(`Error: ${err.message}`);
+      }
+    }
+
+    // Update coordination status
+    function updateCoordinationStatus(status) {
+      document.getElementById('coord-active').textContent = status.active || '-';
+      document.getElementById('coord-manager').textContent = status.manager || '-';
+      document.getElementById('coord-second').textContent = status.second || '-';
+      document.getElementById('coord-heartbeat').textContent = status.last_heartbeat || '-';
+      document.getElementById('coord-secure').textContent = status.secure_mode ? 'Enabled' : 'Disabled';
+    }
+
+    // Toggle coordination panel
+    function toggleCoordination() {
+      coordinationExpanded = !coordinationExpanded;
+      const panel = document.getElementById('coordination-panel');
+      const toggle = document.getElementById('coord-toggle');
+
+      if (coordinationExpanded) {
+        panel.classList.add('expanded');
+        toggle.textContent = '▲';
+      } else {
+        panel.classList.remove('expanded');
+        toggle.textContent = '▼';
+      }
+    }
+
+    // Update secure mode
+    function updateSecureMode() {
+      const canPost = memberRole === 'manager' || memberRole === 'second' || memberRole === 'agent' || !secureMode;
+      document.getElementById('message-input').disabled = !canPost;
+      document.getElementById('send-btn').disabled = !canPost;
+
+      if (!canPost) {
+        document.getElementById('message-input').placeholder = '🔒 Secure mode: Read-only';
+      }
+    }
+
+    // Enable input
+    function enableInput() {
+      updateSecureMode();
+    }
+
+    // Utilities
+    function escapeHtml(str) {
+      if (!str) return '';
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function formatTime(timestamp) {
+      const date = typeof timestamp === 'string' ? new Date(timestamp) : new Date(timestamp);
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function scrollToBottom() {
+      const container = document.getElementById('messages');
+      setTimeout(() => {
+        container.scrollTop = container.scrollHeight;
+      }, 100);
+    }
+  </script>
+</body>
+</html>
