@@ -1,21 +1,36 @@
 # Archiviste Agent
 
-Resident agent that joins the "Sante-Sport-Nutrition: memoire" room and manages Florent's health, sport, nutrition, and weight memory via memory-agent API.
+Resident memory manager. Joins room, listens for commands, interfaces with memory-agent API (MEMORY_API_URL=http://localhost:4010).
 
-## Launch Methods
+## Behavior
 
-**Option 1: Simple (nohup with auto-restart wrapper)**
+**Single instance**: PID lock (archiviste.pid) + wrapper flock (/tmp/archiviste.lock). Duplicate starts exit cleanly.
+**Silent mode**: Only responds to commands. Non-command messages get no reply.
+**Rate limit**: Max 20 messages/min per instance.
+**Long-poll**: Uses `since=lastProcessedMessageId` to never miss messages.
+**Welcome**: Posted once per state (state.welcomedAt).
+
+## Commands (Exact Match)
+
+| Command | Action |
+|---------|--------|
+| `retiens: <text>` | Save note to memory, confirm with "✓ Enregistré" |
+| `ajoute: <text>` | Alias for retiens: |
+| `cherche: <query>` | Search memory, display result with "📚" |
+| `recherche: <query>` | Alias for cherche: |
+| `résume: <sujet>` | Summarize topic, display with "📊" |
+| `resume: <sujet>` | English alias for résume: |
+| `?` or `aide` | Show help (exact match only) |
+| Other text | **Silence** (no response) |
+
+## Start
+
 ```bash
-nohup /opt/ia-projects/projects/agent-hub/archiviste/start-archiviste.sh > /opt/ia-projects/projects/agent-hub/archiviste/archiviste.log 2>&1 &
+cd /opt/ia-projects/projects/agent-hub/archiviste && \
+nohup ./start-archiviste.sh >> archiviste.log 2>&1 &
 ```
 
-**Option 2: systemd (user service, requires systemctl --user)**
-Create `/home/ubuntu/.config/systemd/user/archiviste.service` and enable with `systemctl --user start archiviste`.
+## State
 
-**State**: `state.json` (600 perms) stores member_token and last message ID.
-
-## Commands
-
-- `retiens: <text>` — Save to memory
-- `cherche: <query>` — Search memory
-- `résume: <subject>` — Summarize a topic
+`state.json` (mode 600): memberToken, lastProcessedMessageId, welcomedAt, joinedAt.
+`archiviste.pid`: PID file for single-instance lock.

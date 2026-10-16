@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 // Configuration
 const ROOM_TOKEN = process.env.ROOM_TOKEN || '***REMOVED***';
 const AGENT_HUB_URL = process.env.AGENT_HUB_URL || 'http://localhost:4030';
-const MEMORY_API_URL = process.env.MEMORY_API_URL || 'http://localhost:7654';
+const MEMORY_API_URL = process.env.MEMORY_API_URL || 'http://localhost:4010';
 const STATE_FILE = path.join(__dirname, 'state.json');
 const AGENT_NAME = 'Archiviste';
 const AGENT_ROLE = 'agent';
@@ -24,7 +24,12 @@ let state = {
   memberToken: null,
   joinedAt: null,
   lastProcessedMessageId: null,
+  welcomedAt: null,
 };
+
+const PID_FILE = path.join(__dirname, 'archiviste.pid');
+let messagesThisMinute = 0;
+let lastMinuteReset = Date.now();
 
 // Backoff configuration
 const BACKOFF_CONFIG = {
@@ -64,7 +69,7 @@ function saveState() {
 }
 
 /**
- * Fetch with retry and backoff
+ * Fetch with smart retry: 5xx, 429, or network errors only
  */
 async function fetchWithRetry(url, options = {}, attempt = 0, timeoutMs = 40000) {
   try {
@@ -78,6 +83,11 @@ async function fetchWithRetry(url, options = {}, attempt = 0, timeoutMs = 40000)
 
     clearTimeout(timeoutId);
 
+    // Don't retry on 4xx except 429
+    if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+      throw new Error(`HTTP ${response.status}: not retryable`);
+    }
+
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -85,6 +95,15 @@ async function fetchWithRetry(url, options = {}, attempt = 0, timeoutMs = 40000)
     currentBackoffMs = BACKOFF_CONFIG.initialDelayMs; // Reset on success
     return response;
   } catch (err) {
+    // No retry for non-network, non-5xx, non-429 errors
+    if (attempt === 0 && err.message.includes('not retryable')) {
+      throw err;
+    }
+
+    if (attempt >= 2) {
+      throw new Error(`Failed after ${attempt + 1} attempts: ${err.message}`);
+    }
+
     const nextBackoff = Math.min(
       BACKOFF_CONFIG.initialDelayMs * Math.pow(BACKOFF_CONFIG.multiplier, attempt),
       BACKOFF_CONFIG.maxDelayMs
@@ -95,12 +114,7 @@ async function fetchWithRetry(url, options = {}, attempt = 0, timeoutMs = 40000)
     );
 
     await sleep(nextBackoff);
-
-    if (attempt < 5) {
-      return fetchWithRetry(url, options, attempt + 1, timeoutMs);
-    }
-
-    throw new Error(`Failed after ${attempt + 1} attempts: ${err.message}`);
+    return fetchWithRetry(url, options, attempt + 1, timeoutMs);
   }
 }
 
@@ -180,9 +194,12 @@ async function postMessage(content) {
 /**
  * Write to memory via memory-agent API
  */
-async function writeMemory(content, path = 'divers') {
+async function writeMemory(content, path = 'sante-sport-nutrition/notes') {
   try {
-    const response = await fetchWithRetry(
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90000);
+
+    const response = await fetch(
       `${MEMORY_API_URL}/write`,
       {
         method: 'POST',
@@ -192,10 +209,24 @@ async function writeMemory(content, path = 'divers') {
           tree: 'coach',
           path: path,
         }),
+        signal: controller.signal,
       }
     );
 
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    }
+
     const data = await response.json();
+    // Verify success: check for id field or explicit success indicator
+    const isSuccess = data.id || data.success;
+    if (!isSuccess) {
+      console.error('[ARCHIVISTE] Write memory response missing id/success:', data);
+      return false;
+    }
     console.log(`[ARCHIVISTE] Memory written: ${data.id || 'success'}`);
     return true;
   } catch (err) {
@@ -209,22 +240,68 @@ async function writeMemory(content, path = 'divers') {
  */
 async function readMemory(subject) {
   try {
-    const response = await fetchWithRetry(
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90000);
+
+    const response = await fetch(
       `${MEMORY_API_URL}/read`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           subject: subject,
+          tree: 'coach',
         }),
+        signal: controller.signal,
       }
     );
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
 
     const data = await response.json();
     return data;
   } catch (err) {
     console.error(`[ARCHIVISTE] Failed to read memory: ${err.message}`);
     return null;
+  }
+}
+
+/**
+ * Initialize lastProcessedMessageId from latest messages
+ */
+async function initializeLastMessageId() {
+  if (state.lastProcessedMessageId !== null) {
+    return; // Already initialized
+  }
+
+  if (!state.memberToken) {
+    console.error('[ARCHIVISTE] Cannot init, no member token');
+    return;
+  }
+
+  try {
+    const response = await fetchWithRetry(
+      `${AGENT_HUB_URL}/api/rooms/${ROOM_TOKEN}/messages?limit=1`,
+      {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${state.memberToken}`,
+        },
+      }
+    );
+
+    const data = await response.json();
+    if (data.messages && data.messages.length > 0) {
+      state.lastProcessedMessageId = data.messages[0].id;
+      saveState();
+      console.log(`[ARCHIVISTE] Initialized lastProcessedMessageId: ${state.lastProcessedMessageId}`);
+    }
+  } catch (err) {
+    console.warn(`[ARCHIVISTE] Failed to init message ID: ${err.message}`);
   }
 }
 
@@ -238,8 +315,9 @@ async function pollMessages() {
   }
 
   try {
+    const sinceParam = state.lastProcessedMessageId ? `&since=${state.lastProcessedMessageId}` : '';
     const response = await fetchWithRetry(
-      `${AGENT_HUB_URL}/api/rooms/${ROOM_TOKEN}/messages/wait?timeout=30000`,
+      `${AGENT_HUB_URL}/api/rooms/${ROOM_TOKEN}/messages/wait?timeout=30000${sinceParam}`,
       {
         method: 'GET',
         headers: {
@@ -257,20 +335,48 @@ async function pollMessages() {
 }
 
 /**
- * Process a single message
+ * Normalize text: trim, lowercase, remove accents from prefix
+ */
+function normalize(text) {
+  return text.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+/**
+ * Check rate limit: max 20 messages per minute
+ */
+function canPostMessage() {
+  const now = Date.now();
+  if (now - lastMinuteReset > 60000) {
+    messagesThisMinute = 0;
+    lastMinuteReset = now;
+  }
+  if (messagesThisMinute >= 20) {
+    console.warn('[ARCHIVISTE] Rate limit: 20 messages/min reached');
+    return false;
+  }
+  messagesThisMinute++;
+  return true;
+}
+
+/**
+ * Process a single message - use author/author_role (not member_name/member_role)
  */
 async function processMessage(msg) {
   try {
-    // Ignore own messages
-    if (msg.member_name === AGENT_NAME) {
+    // Ignore own messages - check author field, not member_name
+    if (msg.author === AGENT_NAME) {
+      console.log(`[ARCHIVISTE] Ignoring own message (author=${msg.author})`);
       return;
     }
 
     const content = msg.content || '';
-    console.log(`[ARCHIVISTE] Processing msg_id=${msg.id} name=${msg.member_name} role=${msg.member_role}: ${content.substring(0, 60)}`);
+    const author = msg.author || msg.member_name || 'Unknown';
+    console.log(`[ARCHIVISTE] Processing msg_id=${msg.id} author=${author}: ${content.substring(0, 60)}`);
 
-    // Command: retiens: ... (add memory)
-    if (content.toLowerCase().startsWith('retiens:') || content.toLowerCase().startsWith('ajoute:')) {
+    const normalized = normalize(content);
+
+    // Command: retiens: ... or ajoute: ... (add memory)
+    if (normalized.startsWith('retiens:') || normalized.startsWith('ajoute:')) {
       console.log('[ARCHIVISTE] -> Matched: retiens/ajoute');
       const memoryContent = content.substring(content.indexOf(':') + 1).trim();
       const success = await writeMemory({
@@ -279,64 +385,114 @@ async function processMessage(msg) {
         date: new Date().toISOString(),
       });
 
-      if (success) {
-        await postMessage(
-          `✓ Mémoire enregistrée: "${memoryContent.substring(0, 40)}..."`
-        );
-      } else {
-        await postMessage('❌ Erreur lors de l\'enregistrement.');
+      if (success && canPostMessage()) {
+        await postMessage(`✓ Enregistré: "${memoryContent.substring(0, 40)}..."`);
+      } else if (!success && canPostMessage()) {
+        await postMessage('❌ Erreur enregistrement.');
       }
     }
 
-    // Command: cherche: ... (search memory)
-    else if (
-      content.toLowerCase().startsWith('cherche:') ||
-      content.toLowerCase().startsWith('recherche:')
-    ) {
+    // Command: cherche: ... or recherche: ... (search memory)
+    else if (normalized.startsWith('cherche:') || normalized.startsWith('recherche:')) {
       console.log('[ARCHIVISTE] -> Matched: cherche/recherche');
       const query = content.substring(content.indexOf(':') + 1).trim();
       const result = await readMemory(query);
 
-      if (result && result.summary) {
-        await postMessage(`📚 ${result.summary}`);
-      } else if (result) {
-        await postMessage(`📚 Résultat: ${JSON.stringify(result).substring(0, 100)}...`);
-      } else {
-        await postMessage('Aucun résultat trouvé.');
+      if (canPostMessage()) {
+        if (result && typeof result.result === 'string' && result.result.trim()) {
+          await postMessage(`📚 ${result.result.trim().substring(0, 1500)}`);
+        } else if (result && result.text) {
+          await postMessage(`📚 ${result.text}`);
+        } else if (result && result.summary) {
+          await postMessage(`📚 ${result.summary}`);
+        } else if (result && Object.keys(result).length > 0) {
+          // Fallback: stringify the result
+          const summary = JSON.stringify(result).substring(0, 100);
+          await postMessage(`📚 ${summary}`);
+        } else {
+          await postMessage('Aucun résultat.');
+        }
       }
     }
 
-    // Command: résume: ... (summarize)
-    else if (content.toLowerCase().startsWith('résume:')) {
+    // Command: résume: ... or resume: ... (summarize)
+    else if (normalized.startsWith('résume:') || normalized.startsWith('resume:')) {
       console.log('[ARCHIVISTE] -> Matched: résume');
       const query = content.substring(content.indexOf(':') + 1).trim();
       const result = await readMemory(query);
 
-      if (result && result.summary) {
-        await postMessage(`📊 Résumé: ${result.summary}`);
-      } else {
-        await postMessage('Impossible de générer un résumé.');
+      if (canPostMessage()) {
+        if (result && typeof result.result === 'string' && result.result.trim()) {
+          await postMessage(`📊 ${result.result.trim().substring(0, 1500)}`);
+        } else if (result && result.summary) {
+          await postMessage(`📊 ${result.summary}`);
+        } else if (result && result.text) {
+          await postMessage(`📊 ${result.text}`);
+        } else {
+          await postMessage('Pas de résumé disponible.');
+        }
       }
     }
 
-    // Help for unknown commands
-    else if (content.trim() === '?' || content.toLowerCase().includes('aide')) {
+    // Help: exact match "?" or "aide"
+    else if (content.trim() === '?' || content.trim() === 'aide') {
       console.log('[ARCHIVISTE] -> Matched: help');
-      await postMessage(
-        'Commandes:\n' +
-        '• retiens: <texte> - Enregistrer une info\n' +
-        '• cherche: <terme> - Rechercher en mémoire\n' +
-        '• résume: <sujet> - Résumer un sujet'
-      );
+      if (canPostMessage()) {
+        await postMessage(
+          'Commandes:\n' +
+          '• retiens: <texte> - Enregistrer\n' +
+          '• cherche: <terme> - Rechercher\n' +
+          '• résume: <sujet> - Résumer'
+        );
+      }
     }
 
-    // Echo for regular messages
+    // All other messages: SILENCE (no response)
     else {
-      console.log('[ARCHIVISTE] -> No match, generic response');
-      await postMessage(`✓ Compris. Tapez "?" pour l'aide.`);
+      console.log('[ARCHIVISTE] -> No command, silence');
     }
   } catch (err) {
     console.error('[ARCHIVISTE] Error in processMessage:', err.message);
+  }
+}
+
+/**
+ * Acquire PID lock - ensure only one instance runs
+ */
+function acquirePidLock() {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      const oldPid = parseInt(fs.readFileSync(PID_FILE, 'utf8'), 10);
+      if (!isNaN(oldPid) && oldPid !== process.pid) {
+        // Check if old process is still alive
+        try {
+          process.kill(oldPid, 0); // Signal 0 = check existence
+          console.error(`[ARCHIVISTE] Another instance (PID ${oldPid}) is running. Exiting.`);
+          process.exit(0);
+        } catch (err) {
+          // Old process is dead, safe to continue
+          console.log(`[ARCHIVISTE] Old PID ${oldPid} is dead, proceeding.`);
+        }
+      }
+    }
+    fs.writeFileSync(PID_FILE, process.pid.toString(), { mode: 0o600 });
+    console.log(`[ARCHIVISTE] PID lock acquired: ${process.pid}`);
+  } catch (err) {
+    console.error(`[ARCHIVISTE] Failed to acquire PID lock: ${err.message}`);
+  }
+}
+
+/**
+ * Release PID lock on shutdown
+ */
+function releasePidLock() {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      fs.unlinkSync(PID_FILE);
+      console.log('[ARCHIVISTE] PID lock released');
+    }
+  } catch (err) {
+    console.error(`[ARCHIVISTE] Failed to release PID lock: ${err.message}`);
   }
 }
 
@@ -357,24 +513,22 @@ async function mainLoop() {
     }
   }
 
-  // Post welcome message
-  try {
-    await postMessage(
-      '👋 Bienvenue! Je suis l\'Archiviste.\n' +
-      'Je construis la mémoire complète et exploitable de vos données: ' +
-      'séances de sport, poids, repas, santé.\n' +
-      'Utilisez:\n' +
-      '• retiens: <info> - Enregistrer\n' +
-      '• cherche: <terme> - Rechercher\n' +
-      '• résume: <sujet> - Résumer'
-    );
-
-    // Initialize lastProcessedMessageId by fetching current messages
-    // This ensures we skip old messages and only process new ones
-    await sleep(500);
-  } catch (err) {
-    console.error('[ARCHIVISTE] Failed to post welcome message');
+  // Post welcome message only once
+  if (!state.welcomedAt) {
+    try {
+      await postMessage(
+        '👋 Archiviste prêt.\n' +
+        'Commandes: retiens:, cherche:, résume:, ?, aide'
+      );
+      state.welcomedAt = new Date().toISOString();
+      saveState();
+    } catch (err) {
+      console.error('[ARCHIVISTE] Failed to post welcome message');
+    }
   }
+
+  // Initialize lastProcessedMessageId
+  await initializeLastMessageId();
 
   // Long-poll loop
   while (true) {
@@ -383,7 +537,8 @@ async function mainLoop() {
 
       if (messages && messages.length > 0) {
         for (const msg of messages) {
-          if (msg.id !== state.lastProcessedMessageId) {
+          // Process only if id > lastProcessedMessageId (numeric comparison)
+          if (msg.id > (state.lastProcessedMessageId || 0)) {
             state.lastProcessedMessageId = msg.id;
             saveState();
             await processMessage(msg);
@@ -402,9 +557,11 @@ async function mainLoop() {
 }
 
 // Start
+acquirePidLock();
 loadState();
 mainLoop().catch(err => {
   console.error('[ARCHIVISTE] Fatal error:', err);
+  releasePidLock();
   process.exit(1);
 });
 
@@ -412,11 +569,17 @@ mainLoop().catch(err => {
 process.on('SIGTERM', () => {
   console.log('[ARCHIVISTE] Received SIGTERM, shutting down gracefully');
   saveState();
+  releasePidLock();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('[ARCHIVISTE] Received SIGINT, shutting down gracefully');
   saveState();
+  releasePidLock();
   process.exit(0);
+});
+
+process.on('exit', () => {
+  releasePidLock();
 });
