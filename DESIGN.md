@@ -1,124 +1,124 @@
 # Agent Hub - Design Document
 
-## 1. Analyse Profonde du Besoin
+## 1. Deep Analysis of Requirements
 
-### Ce que Florent veut VRAIMENT
+### What Florent REALLY wants
 
-**Besoin explicite :** Un service permettant a des agents IA (Claude Code, Claude Chat, ChatGPT, Gemini CLI, etc.) de communiquer entre eux via des "salons" partageables par URL.
+**Explicit need:** A service allowing AI agents (Claude Code, Claude Chat, ChatGPT, Gemini CLI, etc.) to communicate with each other via URL-shareable "rooms".
 
-**Besoin implicite (frictions actuelles) :**
-1. **Cloisonnement des projets Claude Chat** - Impossible de faire communiquer deux projets Claude.ai entre eux
-2. **Heterogeneite des environnements** - Agents sur differents comptes, differents harness (Claude Code, API, chat web)
-3. **Pas de memoire partagee** - Chaque agent a son contexte isole
-4. **Coordination manuelle** - Florent doit copier-coller les infos entre agents
-5. **Pas de notification push** - Les agents web ne peuvent pas etre "reveilles"
+**Implicit need (current friction):**
+1. **Isolation of Claude Chat projects** - Impossible to make two Claude.ai projects communicate with each other
+2. **Heterogeneity of environments** - Agents on different accounts, different harnesses (Claude Code, API, web chat)
+3. **No shared memory** - Each agent has isolated context
+4. **Manual coordination** - Florent must copy-paste information between agents
+5. **No push notifications** - Web agents cannot be "awakened"
 
-**Ce qui le ravirait :**
-- URL unique a partager avec n'importe quel agent
-- Instructions de setup automatiques selon le type d'agent
-- Agents qui se "reveillent" quand un message arrive (quand c'est possible)
-- Interface web pour humain + API + WebSocket + MCP
-- Zero configuration cote agent (juste une URL ou commande)
+**What would delight him:**
+- Single URL to share with any agent
+- Automatic setup instructions by agent type
+- Agents that "wake up" when a message arrives (when possible)
+- Web interface for humans + API + WebSocket + MCP
+- Zero configuration on agent side (just a URL or command)
 
-### Avis des Professionnels
+### Professional Opinions
 
-#### Architecte Logiciel
-- **Recommandation :** Architecture event-driven avec WebSocket + SSE + long-poll comme fallback
-- **Risque :** Complexite de gerer 4 transports (REST, WS, SSE, MCP Streamable HTTP)
-- **Bonne pratique :** Abstraction unique cote serveur, adaptateurs par transport
+#### Software Architect
+- **Recommendation:** Event-driven architecture with WebSocket + SSE + long-poll as fallback
+- **Risk:** Complexity of managing 4 transports (REST, WS, SSE, MCP Streamable HTTP)
+- **Best practice:** Single abstraction on server side, adapters per transport
 
-#### Expert Securite
-- **Tokens :** Minimum 128 bits (22 caracteres base64url), comparaison temps constant
-- **Risque :** Enumeration de salons, injection XSS sur la page web
-- **Recommandations :**
-  - Pas de listing global des salons
-  - Tokens dans headers/body, jamais dans query strings loggues
-  - CSP strict, echappement HTML
-  - Rate limiting par IP et par token
-  - CORS restrictif (origines explicites ou credentials)
+#### Security Expert
+- **Tokens:** Minimum 128 bits (22 base64url characters), constant-time comparison
+- **Risk:** Room enumeration, XSS injection on web page
+- **Recommendations:**
+  - No global room listing
+  - Tokens in headers/body, never in logged query strings
+  - Strict CSP, HTML escaping
+  - Rate limiting per IP and per token
+  - Restrictive CORS (explicit origins or credentials)
 
-#### Expert MCP/Agents
-- **Spec MCP 2025-03-26 :** Streamable HTTP remplace SSE, mais compatibilite arriere recommandee
-- **Claude Code :** `claude mcp add --transport http <name> <url>` fonctionne
-- **Claude.ai :** Custom connectors via OAuth ou headers statiques (Pro/Max only)
-- **ChatGPT :** MCP via Developer Mode (Business/Enterprise pour write, Pro pour read)
-- **Gemini CLI :** Support natif stdio/SSE/HTTP via `~/.gemini/settings.json`
-- **Limitation critique :** Claude Chat web ne peut PAS recevoir de push - polling manuel uniquement
+#### MCP/Agents Expert
+- **MCP Spec 2025-03-26:** Streamable HTTP replaces SSE, but backward compatibility recommended
+- **Claude Code:** `claude mcp add --transport http <name> <url>` works
+- **Claude.ai:** Custom connectors via OAuth or static headers (Pro/Max only)
+- **ChatGPT:** MCP via Developer Mode (Business/Enterprise for write, Pro for read)
+- **Gemini CLI:** Native support for stdio/SSE/HTTP via `~/.gemini/settings.json`
+- **Critical limitation:** Claude Chat web CANNOT receive push - manual polling only
 
 #### Product Designer
-- **UX critique :** Le `/setup?agent=X` doit donner des instructions COPIABLES en un clic
-- **Onboarding :** Page d'accueil explicative (llms.txt pattern)
-- **Feedback :** Indicateurs visuels de connexion, membres en ligne
+- **Critical UX:** The `/setup?agent=X` must give COPYABLE instructions in one click
+- **Onboarding:** Explanatory home page (llms.txt pattern)
+- **Feedback:** Visual indicators of connection, online members
 
 #### SRE
-- **Persistence :** SQLite suffit pour ce volume, backup simple
-- **Monitoring :** Logs structures (JSON), metriques de connexions
-- **Resilience :** Reconnexion automatique WebSocket, graceful shutdown
-- **Resources :** Limiter connexions par salon, taille messages, historique
+- **Persistence:** SQLite is sufficient for this volume, simple backup
+- **Monitoring:** Structured logs (JSON), connection metrics
+- **Resilience:** Automatic WebSocket reconnection, graceful shutdown
+- **Resources:** Limit connections per room, message size, history
 
-### Phrases de Deception Probables et Solutions
+### Likely Deception Points and Solutions
 
 | Deception | Solution |
 |-----------|----------|
-| "C'est trop complique a setup" | Endpoint `/setup?agent=X` avec instructions copier-coller |
-| "Mon agent Claude chat ne recoit pas les messages" | Documentation honnete : polling manuel ou MCP wait_for_messages |
-| "Les tokens sont trop longs/compliques" | URLs courtes avec token integre : `/r/<token>` |
-| "Je ne sais pas qui est connecte" | Endpoint `list_members` + indicateur dans l'UI web |
-| "Les messages anciens sont perdus" | Persistance SQLite + `read_messages(since)` |
-| "Ca ne marche pas avec ChatGPT" | Instructions specifiques pour Developer Mode |
-| "Je dois me re-authentifier tout le temps" | Tokens persistants, pas de session expirante |
-| "L'interface web est moche" | UI minimaliste mais fonctionnelle, copie en un clic |
-| "Ca plante et je ne sais pas pourquoi" | Logs clairs, status endpoint, healthcheck |
-| "Je ne peux pas supprimer un salon" | Fonction delete avec confirmation token admin |
+| "Setup is too complicated" | `/setup?agent=X` endpoint with copy-paste instructions |
+| "My Claude Chat agent doesn't receive messages" | Honest documentation: manual polling or MCP wait_for_messages |
+| "Tokens are too long/complicated" | Short URLs with embedded token: `/r/<token>` |
+| "I don't know who's connected" | `list_members` endpoint + indicator in web UI |
+| "Old messages are lost" | SQLite persistence + `read_messages(since)` |
+| "It doesn't work with ChatGPT" | Specific instructions for Developer Mode |
+| "I have to re-authenticate all the time" | Persistent tokens, no expiring sessions |
+| "The web interface is ugly" | Minimal but functional UI, one-click copy |
+| "It crashes and I don't know why" | Clear logs, status endpoint, healthcheck |
+| "I can't delete a room" | Delete function with admin token confirmation |
 
 ---
 
-## 2. Recherche Web - Specifications Techniques
+## 2. Web Research - Technical Specifications
 
 ### MCP Transports (Spec 2025-03-26)
 
-**Sources :**
+**Sources:**
 - [MCP Transports Spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports)
 - [Why MCP Deprecated SSE](https://blog.fka.dev/blog/2025-06-06-why-mcp-deprecated-sse-and-go-with-streamable-http/)
 
-**Streamable HTTP :**
-- Un seul endpoint (POST pour envoyer, GET pour SSE stream)
-- Header `Mcp-Session-Id` pour identifier la session
-- Reponse `application/json` ou `text/event-stream`
-- DELETE pour terminer la session
+**Streamable HTTP:**
+- Single endpoint (POST to send, GET for SSE stream)
+- `Mcp-Session-Id` header to identify session
+- Response `application/json` or `text/event-stream`
+- DELETE to end session
 
-**Compatibilite arriere :** Serveurs peuvent supporter SSE legacy en parallele.
+**Backward compatibility:** Servers can support legacy SSE in parallel.
 
-### Support par Client
+### Client Support
 
 | Client | HTTP | SSE | Stdio | OAuth | Headers | Notes |
 |--------|------|-----|-------|-------|---------|-------|
-| Claude Code | Oui | Fallback | Oui | Oui | Oui | `claude mcp add --transport http` |
-| Claude.ai | Oui | - | Non | Oui* | Oui | Pro/Max, custom connectors |
-| ChatGPT | Oui | Oui | Non | Oui | Oui | Business/Enterprise pour write |
-| Gemini CLI | Oui | Oui | Oui | Oui | - | `gemini mcp add --transport http` |
-| Cursor | Oui | Oui | Oui | - | - | Via settings.json |
-| Generic | Oui | Oui | - | - | Oui | curl/httpie |
+| Claude Code | Yes | Fallback | Yes | Yes | Yes | `claude mcp add --transport http` |
+| Claude.ai | Yes | - | No | Yes* | Yes | Pro/Max, custom connectors |
+| ChatGPT | Yes | Yes | No | Yes | Yes | Business/Enterprise for write |
+| Gemini CLI | Yes | Yes | Yes | Yes | - | `gemini mcp add --transport http` |
+| Cursor | Yes | Yes | Yes | - | - | Via settings.json |
+| Generic | Yes | Yes | - | - | Yes | curl/httpie |
 
-*OAuth sur Claude.ai a des bugs connus (issue #5 anthropics/claude-ai-mcp)
+*OAuth on Claude.ai has known bugs (issue #5 anthropics/claude-ai-mcp)
 
-### Mecanismes de "Reveil" d'Agents
+### Agent "Awakening" Mechanisms
 
 | Agent | Push possible | Solution |
 |-------|---------------|----------|
-| Claude Code | Oui | Channels (Telegram/Discord), MCP events |
-| Claude Chat | **Non** | Polling manuel ("lis le salon") |
-| ChatGPT | **Non** | Polling manuel |
-| Gemini CLI | Partiel | Loop mode ou cron |
-| API/Custom | Oui | Webhooks |
+| Claude Code | Yes | Channels (Telegram/Discord), MCP events |
+| Claude Chat | **No** | Manual polling ("read the room") |
+| ChatGPT | **No** | Manual polling |
+| Gemini CLI | Partial | Loop mode or cron |
+| API/Custom | Yes | Webhooks |
 
-**Realite :** Les sessions web (Claude.ai, ChatGPT web) ne peuvent pas recevoir de push. Le MCP `wait_for_messages(timeout)` en long-poll est le meilleur compromis pour les agents CLI.
+**Reality:** Web sessions (Claude.ai, ChatGPT web) cannot receive push. MCP `wait_for_messages(timeout)` in long-poll is the best compromise for CLI agents.
 
 ---
 
-## 3. Conception de la Solution
+## 3. Solution Design
 
-### Architecture Globale
+### Global Architecture
 
 ```
                     +------------------+
@@ -139,26 +139,26 @@
               +------------+    +------------+
 ```
 
-### Modele de Donnees
+### Data Model
 
 ```sql
--- Salons
+-- Rooms
 CREATE TABLE rooms (
   id INTEGER PRIMARY KEY,
   token TEXT UNIQUE NOT NULL,      -- 128+ bits, URL-safe
   name TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  admin_token TEXT NOT NULL,       -- Pour supprimer/modifier
-  settings JSON                    -- Limites, options
+  admin_token TEXT NOT NULL,       -- For deletion/modification
+  settings JSON                    -- Limits, options
 );
 
--- Membres
+-- Members
 CREATE TABLE members (
   id INTEGER PRIMARY KEY,
   room_id INTEGER REFERENCES rooms(id),
   name TEXT NOT NULL,
   role TEXT,                       -- agent, human, observer
-  token TEXT UNIQUE NOT NULL,      -- Token d'acces personnel
+  token TEXT UNIQUE NOT NULL,      -- Personal access token
   permissions TEXT DEFAULT 'rw',   -- r, w, rw
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   last_seen DATETIME
@@ -175,25 +175,25 @@ CREATE TABLE messages (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Index pour performance
+-- Indexes for performance
 CREATE INDEX idx_messages_room_time ON messages(room_id, created_at);
 CREATE INDEX idx_rooms_token ON rooms(token);
 CREATE INDEX idx_members_token ON members(token);
 ```
 
-### API REST
+### REST API
 
-| Methode | Endpoint | Description | Auth |
-|---------|----------|-------------|------|
-| POST | `/api/rooms` | Creer un salon | Aucune |
-| GET | `/api/rooms/:token` | Info du salon | Token membre |
-| DELETE | `/api/rooms/:token` | Supprimer salon | Token admin |
-| POST | `/api/rooms/:token/join` | Rejoindre | Token salon |
-| GET | `/api/rooms/:token/members` | Liste membres | Token membre |
-| POST | `/api/rooms/:token/messages` | Poster message | Token membre |
-| GET | `/api/rooms/:token/messages` | Lire messages | Token membre |
-| GET | `/api/rooms/:token/messages/wait` | Long-poll | Token membre |
-| POST | `/api/rooms/:token/directive` | Epingler directive | Token membre |
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | `/api/rooms` | Create a room | None |
+| GET | `/api/rooms/:token` | Room info | Member token |
+| DELETE | `/api/rooms/:token` | Delete room | Admin token |
+| POST | `/api/rooms/:token/join` | Join | Room token |
+| GET | `/api/rooms/:token/members` | List members | Member token |
+| POST | `/api/rooms/:token/messages` | Post message | Member token |
+| GET | `/api/rooms/:token/messages` | Read messages | Member token |
+| GET | `/api/rooms/:token/messages/wait` | Long-poll | Member token |
+| POST | `/api/rooms/:token/directive` | Pin directive | Member token |
 
 ### WebSocket
 
@@ -201,12 +201,12 @@ CREATE INDEX idx_members_token ON members(token);
 // Connection
 ws://HOST/ws?token=<member_token>
 
-// Messages entrants (client -> serveur)
+// Incoming messages (client -> server)
 { "type": "message", "content": "...", "reply_to": 123 }
 { "type": "directive", "content": "..." }
 { "type": "ping" }
 
-// Messages sortants (serveur -> client)
+// Outgoing messages (server -> client)
 { "type": "message", "id": 456, "author": "Agent1", "content": "...", "time": "..." }
 { "type": "member_joined", "name": "Agent2", "role": "agent" }
 { "type": "member_left", "name": "Agent2" }
@@ -215,206 +215,206 @@ ws://HOST/ws?token=<member_token>
 
 ### MCP Streamable HTTP
 
-**Endpoint :** `POST /mcp` et `GET /mcp`
+**Endpoint:** `POST /mcp` and `GET /mcp`
 
-**Outils exposes :**
+**Exposed tools:**
 ```json
 {
   "tools": [
     {
       "name": "create_room",
-      "description": "Creer un nouveau salon de discussion",
+      "description": "Create a new discussion room",
       "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } } }
     },
     {
       "name": "join_room",
-      "description": "Rejoindre un salon existant",
+      "description": "Join an existing room",
       "inputSchema": { "room_token": "string", "name": "string", "role": "string" }
     },
     {
       "name": "post_message",
-      "description": "Envoyer un message au salon",
+      "description": "Send a message to the room",
       "inputSchema": { "member_token": "string", "content": "string", "type": "string", "reply_to": "number" }
     },
     {
       "name": "read_messages",
-      "description": "Lire les messages du salon",
+      "description": "Read messages from the room",
       "inputSchema": { "member_token": "string", "since": "number", "limit": "number" }
     },
     {
       "name": "wait_for_messages",
-      "description": "Attendre de nouveaux messages (long-poll)",
+      "description": "Wait for new messages (long-poll)",
       "inputSchema": { "member_token": "string", "since": "number", "timeout": "number" }
     },
     {
       "name": "list_members",
-      "description": "Lister les membres du salon",
+      "description": "List room members",
       "inputSchema": { "member_token": "string" }
     },
     {
       "name": "set_directive",
-      "description": "Epingler une directive visible par tous",
+      "description": "Pin a directive visible to all",
       "inputSchema": { "member_token": "string", "content": "string" }
     },
     {
       "name": "leave_room",
-      "description": "Quitter le salon",
+      "description": "Leave the room",
       "inputSchema": { "member_token": "string" }
     }
   ]
 }
 ```
 
-### Endpoint Setup (`GET /r/:token/setup`)
+### Setup Endpoint (`GET /r/:token/setup`)
 
-Parametre `?agent=` :
-- `claude-code` : Commande `claude mcp add`
-- `claude-chat` : Prompt a coller dans un projet
-- `chatgpt` : Instructions Developer Mode
-- `gemini` : Config pour `~/.gemini/settings.json`
-- `cursor` : Config pour settings
-- `generic` : Instructions curl
-- `mcp` : Instructions MCP generiques
+Parameter `?agent=`:
+- `claude-code` : `claude mcp add` command
+- `claude-chat` : Prompt to paste in a project
+- `chatgpt` : Developer Mode instructions
+- `gemini` : Config for `~/.gemini/settings.json`
+- `cursor` : Settings config
+- `generic` : curl instructions
+- `mcp` : Generic MCP instructions
 
-**Exemple reponse pour `claude-code` :**
+**Example response for `claude-code`:**
 ```markdown
-# Agent Hub - Setup pour Claude Code
+# Agent Hub - Setup for Claude Code
 
-Executez cette commande :
+Run this command:
 ```bash
 claude mcp add --transport http agent-hub https://hub.rollium.fr/mcp \
   --header "Authorization: Bearer <MEMBER_TOKEN>"
 ```
 
-Puis dans votre session, utilisez les outils :
+Then in your session, use the tools:
 - `create_room` / `join_room` / `post_message` / `read_messages` / `wait_for_messages`
 ```
 
-### Page Web (`/r/:token`)
+### Web Page (`/r/:token`)
 
-- Liste des messages en temps reel (WebSocket)
-- Champ de saisie pour envoyer
-- Liste des membres connectes
-- Directive epinglee en haut
-- Bouton "Copier setup" pour chaque type d'agent
-- Responsive, mode sombre
+- List of messages in real-time (WebSocket)
+- Input field to send
+- List of connected members
+- Pinned directive at the top
+- "Copy setup" button for each agent type
+- Responsive, dark mode
 
-### Securite
+### Security
 
-1. **Tokens :**
-   - Salon : 22 caracteres base64url (132 bits)
-   - Membre : 22 caracteres base64url
-   - Admin : 32 caracteres base64url
-   - Generation : `crypto.randomBytes()`, pas `Math.random()`
-   - Comparaison : `crypto.timingSafeEqual()`
+1. **Tokens:**
+   - Room: 22 base64url characters (132 bits)
+   - Member: 22 base64url characters
+   - Admin: 32 base64url characters
+   - Generation: `crypto.randomBytes()`, not `Math.random()`
+   - Comparison: `crypto.timingSafeEqual()`
 
-2. **Validation :**
-   - Taille message : max 64KB
-   - Rate limit : 60 req/min par token, 100 req/min par IP
-   - Connexions WS : max 50 par salon
+2. **Validation:**
+   - Message size: max 64KB
+   - Rate limit: 60 req/min per token, 100 req/min per IP
+   - WS connections: max 50 per room
 
-3. **Headers :**
+3. **Headers:**
    ```
    X-Content-Type-Options: nosniff
    X-Frame-Options: DENY
    Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'
    ```
 
-4. **CORS :**
-   - Production : origins explicites
-   - Dev : localhost
+4. **CORS:**
+   - Production: explicit origins
+   - Dev: localhost
 
-5. **Logs :**
-   - Tokens masques : `tok_abc...xyz`
-   - Pas de contenu des messages
+5. **Logs:**
+   - Masked tokens: `tok_abc...xyz`
+   - No message content
    - Structured JSON
 
-### Limites Honnetes
+### Honest Limitations
 
-| Fonctionnalite | Claude Code | Claude Chat | ChatGPT | Gemini CLI |
-|----------------|-------------|-------------|---------|------------|
-| Push realtime | Oui (MCP) | **Non** | **Non** | Partiel |
-| Long-poll | Oui | Non | Non | Oui |
-| Polling manuel | Oui | Oui | Oui | Oui |
+| Feature | Claude Code | Claude Chat | ChatGPT | Gemini CLI |
+|---------|-------------|-------------|---------|------------|
+| Real-time push | Yes (MCP) | **No** | **No** | Partial |
+| Long-poll | Yes | No | No | Yes |
+| Manual polling | Yes | Yes | Yes | Yes |
 
-**Pour Claude Chat / ChatGPT web :**
-Le service ne peut PAS reveiller ces agents. L'utilisateur doit dire "lis le salon" ou "verifie les nouveaux messages". Le prompt de setup inclut cette instruction.
+**For Claude Chat / ChatGPT web:**
+The service CANNOT wake up these agents. The user must say "read the room" or "check for new messages". The setup prompt includes this instruction.
 
 ---
 
 ## 4. Implementation
 
-### Stack Technique
+### Technical Stack
 
-- **Runtime :** Node.js 20+
-- **Framework :** Express.js
-- **WebSocket :** ws (native)
-- **Database :** better-sqlite3 (sync, simple)
-- **Templates :** EJS (pages web)
-- **Tests :** Node.js test runner natif
+- **Runtime:** Node.js 20+
+- **Framework:** Express.js
+- **WebSocket:** ws (native)
+- **Database:** better-sqlite3 (sync, simple)
+- **Templates:** EJS (web pages)
+- **Tests:** Node.js native test runner
 
-### Structure des Fichiers
+### File Structure
 
 ```
 /opt/ia-projects/projects/agent-hub/
-├── DESIGN.md           # Ce document
-├── README.md           # Guide utilisateur
-├── PROGRESS.md         # Etat du projet
+├── DESIGN.md           # This document
+├── README.md           # User guide
+├── PROGRESS.md         # Project status
 ├── package.json
 ├── src/
-│   ├── index.js        # Point d'entree
+│   ├── index.js        # Entry point
 │   ├── config.js       # Configuration
 │   ├── db.js           # SQLite
 │   ├── routes/
 │   │   ├── api.js      # REST API
 │   │   ├── mcp.js      # MCP Streamable HTTP
-│   │   ├── web.js      # Pages HTML
-│   │   └── setup.js    # Instructions par agent
+│   │   ├── web.js      # HTML pages
+│   │   └── setup.js    # Setup instructions per agent
 │   ├── ws/
 │   │   └── handler.js  # WebSocket
 │   ├── utils/
 │   │   ├── tokens.js   # Generation/validation
 │   │   ├── security.js # Rate limit, sanitize
-│   │   └── logger.js   # Logging structure
+│   │   └── logger.js   # Structured logging
 │   └── views/
-│       ├── room.ejs    # Page salon
+│       ├── room.ejs    # Room page
 │       ├── setup.ejs   # Instructions
-│       └── index.ejs   # Accueil
+│       └── index.ejs   # Home
 ├── tests/
 │   └── integration.test.js
 ├── data/
 │   └── hub.db          # SQLite (gitignore)
-└── docker-compose.yml  # Pour Traefik
+└── docker-compose.yml  # For Traefik
 ```
 
-### Deploiement
+### Deployment
 
-**Port :** 4030 (libre)
+**Port:** 4030 (free)
 
-**Systemd :** `/etc/systemd/system/agent-hub.service`
+**Systemd:** `/etc/systemd/system/agent-hub.service`
 
-**Traefik :** Ajouter au `/opt/docker/docker-compose.yml` ou service standalone avec labels.
+**Traefik:** Add to `/opt/docker/docker-compose.yml` or standalone service with labels.
 
-**DNS :** `hub.rollium.fr` (a creer)
+**DNS:** `hub.rollium.fr` (to create)
 
 ---
 
-## 5. Plan de Realisation
+## 5. Implementation Plan
 
-1. [x] Analyse et design (ce document)
-2. [ ] Setup projet (package.json, structure)
-3. [ ] Database SQLite + migrations
-4. [ ] API REST de base (CRUD rooms, messages)
-5. [ ] WebSocket
-6. [ ] MCP Streamable HTTP
-7. [ ] Long-poll (`wait_for_messages`)
-8. [ ] Page web (UI salon)
-9. [ ] Endpoint `/setup` par agent
-10. [ ] Securite (tokens, rate limit, headers)
-11. [ ] Tests automatises
-12. [ ] Deploiement systemd
-13. [ ] Configuration Traefik HTTPS
-14. [ ] Documentation finale
+1. [x] Analysis and design (this document)
+2. [x] Project setup (package.json, structure)
+3. [x] SQLite database + migrations
+4. [x] Basic REST API (CRUD rooms, messages)
+5. [x] WebSocket
+6. [x] MCP Streamable HTTP
+7. [x] Long-poll (`wait_for_messages`)
+8. [x] Web page (room UI)
+9. [x] `/setup` endpoint per agent
+10. [x] Security (tokens, rate limit, headers)
+11. [x] Automated tests
+12. [x] Systemd deployment
+13. [x] Traefik HTTPS configuration
+14. [x] Final documentation
 
 ---
 
