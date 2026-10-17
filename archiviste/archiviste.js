@@ -31,7 +31,15 @@ let state = {
   joinedAt: null,
   lastProcessedMessageId: null,
   welcomedAt: null,
+  doneIds: [],     // ids > lastProcessedMessageId already fully handled (out-of-order completion)
+  writtenIds: [],  // recent ids whose retiens: was written to memory (idempotence after a crash)
 };
+
+const CONCURRENCY = Math.max(1, parseInt(process.env.ARCHIVISTE_CONCURRENCY || '3', 10));
+const SHUTDOWN_GRACE_MS = parseInt(process.env.ARCHIVISTE_SHUTDOWN_GRACE_MS || '30000', 10);
+const MAX_ATTEMPTS = 3;
+let shuttingDown = false;
+const attempts = new Map(); // msg id -> failed attempts
 
 const PID_FILE = path.join(STATE_DIR, 'archiviste.pid');
 let messagesThisMinute = 0;
@@ -437,12 +445,16 @@ function canPostMessage() {
 /**
  * Process a single message - use author/author_role (not member_name/member_role)
  */
-async function processMessage(msg) {
+async function processMessage(msg, gate = Promise.resolve()) {
+  // gate: resolves when earlier messages have posted their reply (keeps replies in message order).
+  // Returns true when handled (reply posted or deliberately none), false when it must be retried.
+  let postFailed = false;
+  const post = async (text) => { await gate; const ok = await postMessage(text); if (!ok) postFailed = true; return ok; };
   try {
     // Ignore own messages - check author field, not member_name
     if (msg.author === AGENT_NAME) {
       console.log(`[ARCHIVISTE] Ignoring own message (author=${msg.author})`);
-      return;
+      return true;
     }
 
     // Ignore messages from other bots unless they mention Archiviste
@@ -450,7 +462,7 @@ async function processMessage(msg) {
     const messageType = msg.type || 'message';
     if (messageType === 'system') {
       console.log(`[ARCHIVISTE] Ignoring system message`);
-      return;
+      return true;
     }
 
     const content = msg.content || '';
@@ -462,16 +474,25 @@ async function processMessage(msg) {
     if (normalized.startsWith('retiens:') || normalized.startsWith('ajoute:')) {
       console.log('[ARCHIVISTE] -> Matched: retiens/ajoute');
       const memoryContent = content.substring(content.indexOf(':') + 1).trim();
-      const success = await writeMemory({
-        name: 'Note',
-        description: memoryContent,
-        date: new Date().toISOString(),
-      });
+      let success = state.writtenIds.includes(msg.id);
+      if (success) {
+        console.log(`[ARCHIVISTE] msg_id=${msg.id} already written to memory, skipping write`);
+      } else {
+        success = await writeMemory({
+          name: 'Note',
+          description: memoryContent,
+          date: new Date().toISOString(),
+        });
+        if (success) {
+          state.writtenIds = [...state.writtenIds, msg.id].slice(-200);
+          saveState();
+        }
+      }
 
-      if (success && canPostMessage()) {
-        await postMessage(`✓ Enregistré: "${memoryContent.substring(0, 40)}..."`);
-      } else if (!success && canPostMessage()) {
-        await postMessage('❌ Erreur enregistrement.');
+      if (!success && (attempts.get(msg.id) || 0) + 1 < MAX_ATTEMPTS) return false; // retry later
+      if (canPostMessage()) {
+        const ok = await post(success ? `✓ Enregistré: "${memoryContent.substring(0, 40)}..."` : '❌ Erreur enregistrement.');
+        if (!ok) return false;
       }
     }
 
@@ -483,17 +504,17 @@ async function processMessage(msg) {
 
       if (canPostMessage()) {
         if (result && typeof result.result === 'string' && result.result.trim()) {
-          await postMessage(`📚 ${result.result.trim().substring(0, 1500)}`);
+          await post(`📚 ${result.result.trim().substring(0, 1500)}`);
         } else if (result && result.text) {
-          await postMessage(`📚 ${result.text}`);
+          await post(`📚 ${result.text}`);
         } else if (result && result.summary) {
-          await postMessage(`📚 ${result.summary}`);
+          await post(`📚 ${result.summary}`);
         } else if (result && Object.keys(result).length > 0) {
           // Fallback: stringify the result
           const summary = JSON.stringify(result).substring(0, 100);
-          await postMessage(`📚 ${summary}`);
+          await post(`📚 ${summary}`);
         } else {
-          await postMessage('Aucun résultat.');
+          await post('Aucun résultat.');
         }
       }
     }
@@ -506,13 +527,13 @@ async function processMessage(msg) {
 
       if (canPostMessage()) {
         if (result && typeof result.result === 'string' && result.result.trim()) {
-          await postMessage(`📊 ${result.result.trim().substring(0, 1500)}`);
+          await post(`📊 ${result.result.trim().substring(0, 1500)}`);
         } else if (result && result.summary) {
-          await postMessage(`📊 ${result.summary}`);
+          await post(`📊 ${result.summary}`);
         } else if (result && result.text) {
-          await postMessage(`📊 ${result.text}`);
+          await post(`📊 ${result.text}`);
         } else {
-          await postMessage('Pas de résumé disponible.');
+          await post('Pas de résumé disponible.');
         }
       }
     }
@@ -521,7 +542,7 @@ async function processMessage(msg) {
     else if (content.trim() === '?' || content.trim() === 'aide') {
       console.log('[ARCHIVISTE] -> Matched: help');
       if (canPostMessage()) {
-        await postMessage(
+        await post(
           'Commandes:\n' +
           '• retiens: <texte> - Enregistrer\n' +
           '• cherche: <terme> - Rechercher\n' +
@@ -536,7 +557,7 @@ async function processMessage(msg) {
 
       if (!canPostMessage()) {
         console.warn('[ARCHIVISTE] Rate limit reached, skipping LLM');
-        return;
+        return true;
       }
 
       // Search memory for context
@@ -557,7 +578,7 @@ async function processMessage(msg) {
       if (llmResponse) {
         // Truncate to 5 lines max
         const truncated = llmResponse.split('\n').slice(0, 5).join('\n');
-        await postMessage(truncated);
+        await post(truncated);
       } else {
         console.error('[ARCHIVISTE] LLM failed, no response posted');
       }
@@ -569,7 +590,7 @@ async function processMessage(msg) {
 
       if (!canPostMessage()) {
         console.warn('[ARCHIVISTE] Rate limit reached, skipping response');
-        return;
+        return true;
       }
 
       // Check if we already replied to this author in the last 5 minutes
@@ -579,7 +600,7 @@ async function processMessage(msg) {
 
       if (now - lastResponse < fiveMinutesMs) {
         console.log(`[ARCHIVISTE] Already responded to ${author} within 5 min, skipping`);
-        return;
+        return true;
       }
 
       // Detect message language (simple heuristic: has French accents or words)
@@ -590,12 +611,14 @@ async function processMessage(msg) {
         ? 'Je suis un script relais vers la mémoire du coach (modèle Sonnet 5.5).\nCommandes: retiens:, cherche:, résume:, ?, aide'
         : 'I am a relay script to the coach\'s memory (Sonnet 5.5 model).\nCommands: retiens:, cherche:, résume:, ?, aide';
 
-      await postMessage(briefResponse);
+      await post(briefResponse);
       lastHelpResponsePerAuthor.set(author, now);
     }
   } catch (err) {
     console.error('[ARCHIVISTE] Error in processMessage:', err.message);
+    return false;
   }
+  return !postFailed;
 }
 
 /**
@@ -677,21 +700,11 @@ async function mainLoop() {
   await initializeLastMessageId();
 
   // Long-poll loop
-  while (true) {
+  while (!shuttingDown) {
     try {
       const messages = await pollMessages();
-
-      if (messages && messages.length > 0) {
-        for (const msg of messages) {
-          // Process only if id > lastProcessedMessageId (numeric comparison)
-          if (msg.id > (state.lastProcessedMessageId || 0)) {
-            state.lastProcessedMessageId = msg.id;
-            saveState();
-            await processMessage(msg);
-          }
-        }
-      }
-
+      if (shuttingDown) break;
+      await processBatch(messages);
       // Reset backoff on successful poll
       currentBackoffMs = BACKOFF_CONFIG.initialDelayMs;
     } catch (err) {
@@ -700,6 +713,91 @@ async function mainLoop() {
       currentBackoffMs = Math.min(currentBackoffMs * BACKOFF_CONFIG.multiplier, BACKOFF_CONFIG.maxDelayMs);
     }
   }
+}
+
+let inflight = 0;
+let idleWaiters = [];
+
+/**
+ * At-least-once batch processing with limited concurrency.
+ * lastProcessedMessageId only advances past a message once it is fully handled
+ * (reply posted) AND every earlier message of the batch is handled too.
+ * Replies are posted in message order even though the slow work runs concurrently.
+ */
+export async function processBatch(messages, handler = processMessage) {
+  const pending = (messages || [])
+    .filter(m => m.id > (state.lastProcessedMessageId || 0) && !state.doneIds.includes(m.id))
+    .sort((a, b) => a.id - b.id);
+  if (pending.length === 0) {
+    if (messages && messages.length > 0) await sleep(1000); // only already-done messages above a retried one
+    return;
+  }
+
+  const finished = new Map(); // id -> boolean (true = handled)
+  let failed = false;
+
+  const advance = () => {
+    // Watermark = highest id such that all pending ids <= it are handled
+    let wm = state.lastProcessedMessageId || 0;
+    const done = new Set(state.doneIds);
+    for (const m of pending) {
+      if (finished.get(m.id) === true) { done.add(m.id); }
+    }
+    for (const m of pending) {
+      if (done.has(m.id)) wm = Math.max(wm, m.id); else break;
+    }
+    state.lastProcessedMessageId = wm;
+    state.doneIds = [...done].filter(id => id > wm);
+    saveState();
+  };
+
+  // Reply turnstile: message k posts only after message k-1 finished
+  const turns = [];
+  let next = 0;
+  const worker = async () => {
+    while (!shuttingDown && !failed) {
+      const idx = next++;
+      if (idx >= pending.length) return;
+      const msg = pending[idx];
+      const gate = idx === 0 ? Promise.resolve() : turns[idx - 1];
+      let release;
+      turns[idx] = new Promise(r => { release = r; });
+      inflight++;
+      let ok = false;
+      try {
+        ok = await handler(msg, gate);
+      } catch (err) {
+        console.error(`[ARCHIVISTE] Handler error msg_id=${msg.id}: ${err.message}`);
+      }
+      inflight--;
+      if (ok) {
+        finished.set(msg.id, true);
+        attempts.delete(msg.id);
+        advance();
+      } else if (!shuttingDown) {
+        const n = (attempts.get(msg.id) || 0) + 1;
+        attempts.set(msg.id, n);
+        if (n >= MAX_ATTEMPTS) {
+          console.error(`[ARCHIVISTE] msg_id=${msg.id} failed ${n} times, giving up`);
+          finished.set(msg.id, true);
+          attempts.delete(msg.id);
+          advance();
+        } else {
+          failed = true; // stop picking up later messages; they stay > watermark
+        }
+      }
+      release();
+      if (inflight === 0) { idleWaiters.forEach(r => r()); idleWaiters = []; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pending.length) }, worker));
+  // Unblock any turn that never ran (so nothing hangs)
+  if (failed && !shuttingDown) await sleep(currentBackoffMs);
+}
+
+function waitIdle(ms) {
+  if (inflight === 0) return Promise.resolve();
+  return Promise.race([new Promise(r => idleWaiters.push(r)), sleep(ms)]);
 }
 
 // Start only when run directly (importing for tests must not join a room)
@@ -713,19 +811,20 @@ if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   });
 
   // Handle graceful shutdown
-  process.on('SIGTERM', () => {
-    console.log('[ARCHIVISTE] Received SIGTERM, shutting down gracefully');
+  // Graceful shutdown: stop taking new messages, let in-flight ones finish (bounded),
+  // never advance past an unfinished message.
+  const shutdown = async (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[ARCHIVISTE] Received ${sig}, shutting down gracefully (in-flight: ${inflight})`);
+    await waitIdle(SHUTDOWN_GRACE_MS);
+    if (inflight > 0) console.warn(`[ARCHIVISTE] ${inflight} message(s) abandoned, will be reprocessed at restart`);
     saveState();
     releasePidLock();
     process.exit(0);
-  });
-
-  process.on('SIGINT', () => {
-    console.log('[ARCHIVISTE] Received SIGINT, shutting down gracefully');
-    saveState();
-    releasePidLock();
-    process.exit(0);
-  });
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 
   process.on('exit', () => {
     releasePidLock();

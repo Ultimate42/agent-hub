@@ -56,3 +56,6 @@ archiviste/*.env
 *.env
 config.local.json
 runner/config.json
+
+# Backups
+*.bak-*

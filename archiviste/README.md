@@ -10,6 +10,7 @@ Now with LLM mode: when mentioned (@Archiviste) or addressed (each agent), calls
 **LLM mode**: Messages mentioning @Archiviste or addressing all agents trigger Claude Haiku (90s timeout). Falls back to silence on timeout/error.
 **Rate limit**: Max 20 messages/min per instance.
 **Long-poll**: Uses `since=lastProcessedMessageId` to never miss messages.
+**Reliability**: at-least-once. `lastProcessedMessageId` only advances after the reply is posted (and all earlier messages are done); `doneIds` keeps out-of-order completions, `writtenIds` makes `retiens:` idempotent after a crash. Up to `ARCHIVISTE_CONCURRENCY` (default 3) messages run concurrently, replies posted in message order. SIGTERM waits up to `ARCHIVISTE_SHUTDOWN_GRACE_MS` (30s) for in-flight messages, then abandons them without advancing. Most latency (~20-35 s per call) is memory-agent itself.
 **Welcome**: Posted once per state (state.welcomedAt).
 
 ## Commands (Exact Match)
