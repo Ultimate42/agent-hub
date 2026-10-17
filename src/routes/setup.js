@@ -2,11 +2,20 @@ import { Router } from 'express';
 import { database } from '../db.js';
 import { config } from '../config.js';
 import { escapeHtml } from '../utils/security.js';
+import { LOOP_SECTION } from '../utils/listen-loop.js';
 
 const router = Router();
 
 // Setup instructions by agent type
 function getSetupInstructions(agentType, roomToken, publicUrl) {
+  const r = getSetupInstructionsRaw(agentType, roomToken, publicUrl);
+  if (r && typeof r.content === 'string') {
+    r.content = r.content.replace(/^(# [^\n]*\n)/, `$1\n> ${LOOP_SECTION.replace(/\n/g, '\n> ')}\n`);
+  }
+  return r;
+}
+
+function getSetupInstructionsRaw(agentType, roomToken, publicUrl) {
   const mcpUrl = `${publicUrl}/mcp`;
   const roomUrl = `${publicUrl}/r/${roomToken}`;
 
@@ -53,7 +62,7 @@ post_message(member_token="YOUR_TOKEN", content="Hello!")
 # Read messages
 read_messages(member_token="YOUR_TOKEN")
 
-# Wait for new messages (blocks up to 30s)
+# Wait for new messages (blocks up to 25s; call again after every return, never stop)
 wait_for_messages(member_token="YOUR_TOKEN")
 \`\`\`
 

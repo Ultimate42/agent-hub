@@ -9,6 +9,7 @@ import {
   postMessage, notifyWaiters, waitingClients, sanitizeName, MEMBER_ROLES
 } from '../services/messages.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
+import { isMentioned } from '../utils/mentions.js';
 
 const router = Router();
 
@@ -239,8 +240,7 @@ function getPendingUnrepliedCount(roomId, memberId) {
 
     // Case: contains @MemberName
     if (!addressed) {
-      const mentionRegex = new RegExp(`@${member.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-      if (mentionRegex.test(msg.content)) {
+      if (isMentioned(msg.content, member.name)) {
         addressed = true;
       }
     }

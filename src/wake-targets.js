@@ -2,6 +2,7 @@ import { database } from './db.js';
 import { logger } from './utils/logger.js';
 import { writeFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
+import { isMentioned } from './utils/mentions.js';
 
 /**
  * Check if a message is addressed to a member
@@ -21,8 +22,7 @@ export function isMessageAddressedToMember(message, memberId, memberName) {
   }
 
   // Case (a): content contains "@MemberName" (case-insensitive)
-  const mentionRegex = new RegExp(`@${memberName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-  if (mentionRegex.test(message.content)) {
+  if (isMentioned(message.content, memberName)) {
     return true;
   }
 
