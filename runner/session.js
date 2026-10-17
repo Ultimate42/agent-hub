@@ -3,7 +3,8 @@
 export class AgentSession {
   constructor({ agent, queryFn, appendPrompt = '', env, claudeExecutable, log = () => {}, restartDelayMs = 5000, summaryMaxChars = 6000 }) {
     Object.assign(this, { agent, queryFn, appendPrompt, env, claudeExecutable, log, restartDelayMs, summaryMaxChars });
-    this.queue = [];
+    this.queue = [];         // entrées { text, resolve? } ; resolve(true|false) = message traité / non traité (ack côté hub)
+    this.inflight = [];      // entrées déjà envoyées au SDK, en attente de leur 'result' (FIFO)
     this.wake = null;
     this.turns = 0;          // tours terminés dans la session courante
     this.generation = 0;     // numéro de session (rotations incluses)
@@ -16,11 +17,15 @@ export class AgentSession {
     this.busy = false;
   }
 
+  /** Met un message en file. Retourne une Promise : true une fois traité (tour terminé), false si la session a échoué / s'est arrêtée avant. */
   push(text) {
-    this.queue.push(text);
+    const p = new Promise((resolve) => this.queue.push({ text, resolve }));
     this.busy = true;
     if (this.wake) { this.wake(); this.wake = null; }
+    return p;
   }
+  _pushInternal(text) { this.queue.push({ text }); this.busy = true; if (this.wake) { this.wake(); this.wake = null; } }
+  _failInflight() { const l = this.inflight; this.inflight = []; l.forEach((e) => e.resolve?.(false)); }
 
   start() { this.running = true; this.done = this._main(); return this.done; }
 
@@ -29,14 +34,17 @@ export class AgentSession {
     if (this.wake) { this.wake(); this.wake = null; }
     const t = setTimeout(() => { try { this.q?.close?.(); } catch {} }, graceMs);
     try { await this.done; } finally { clearTimeout(t); }
+    this._failInflight();
+    const q = this.queue; this.queue = []; q.forEach((e) => e.resolve?.(false)); // non traités : non acquittés, re-livrés au prochain démarrage
   }
 
   async *_input(ctl) {
     while (true) {
       if (ctl.closed) return;
       if (this.queue.length) {
-        const text = this.queue.shift();
-        yield { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, session_id: '' };
+        const entry = this.queue.shift();
+        this.inflight.push(entry);
+        yield { type: 'user', message: { role: 'user', content: entry.text }, parent_tool_use_id: null, session_id: '' };
         continue;
       }
       await new Promise((r) => (this.wake = r));
@@ -47,6 +55,7 @@ export class AgentSession {
     while (this.running) {
       let crashed = false;
       try { await this._runOne(); } catch (e) { crashed = true; this.log(`erreur de session : ${String(e?.message || e).slice(0, 300)}`); }
+      this._failInflight(); // messages envoyés mais sans 'result' : non traités => pas d'ack, le hub les re-livrera
       if (!this.running) break;
       if (crashed || !this.rotating) await new Promise((r) => setTimeout(r, this.restartDelayMs)); // crash ou fin inattendue
       this.rotating = false;
@@ -58,10 +67,10 @@ export class AgentSession {
     this.ctl = { closed: false }; this.lastText = '';
     const a = this.agent;
     if (this.carry) {
-      this.queue.unshift(`[Reprise après rotation] Résumé de ta session précédente (tours épuisés) :\n${this.carry}\nContinue à partir de là.`);
+      this.queue.unshift({ text: `[Reprise après rotation] Résumé de ta session précédente (tours épuisés) :\n${this.carry}\nContinue à partir de là.` });
       this.carry = '';
     } else if (this.generation === 1 || this.queue.length === 0) {
-      this.queue.unshift(`[Démarrage] Tu es ${a.name}, session continue connectée au hub. Les messages du salon arrivent étiquetés « [Hub <salon> #id de <auteur>] ». Réponds seulement quand c'est utile.`);
+      this.queue.unshift({ text: `[Démarrage] Tu es ${a.name}, session continue connectée au hub. Les messages du salon arrivent étiquetés « [Hub <salon> #id de <auteur>] ». Réponds seulement quand c'est utile.` });
     }
     this.busy = true;
     this.log(`session #${this.generation} démarrée (modèle ${a.model})`);
@@ -87,6 +96,7 @@ export class AgentSession {
       if (t) this.lastText = t;
     } else if (m.type === 'result') {
       if (this.skipTurns > 0) this.skipTurns--; else this.turns++;
+      this.inflight.shift()?.resolve?.(true); // tour terminé pour le plus ancien message envoyé => traité
       this.busy = this.queue.length > 0;
       if (this.rotating) {
         this.carry = (typeof m.result === 'string' && m.result ? m.result : this.lastText).slice(0, this.summaryMaxChars);
@@ -95,7 +105,7 @@ export class AgentSession {
         if (this.wake) { this.wake(); this.wake = null; }
       } else if (this.agent.maxTurns > 0 && this.turns >= this.agent.maxTurns && !this.queue.length) {
         this.rotating = true; this.busy = true;
-        this.push('[Rotation] Ta session va être redémarrée. Réponds UNIQUEMENT par un résumé concis (décisions, tâches en cours, points à suivre) qui servira de mémoire à la nouvelle session.');
+        this._pushInternal('[Rotation] Ta session va être redémarrée. Réponds UNIQUEMENT par un résumé concis (décisions, tâches en cours, points à suivre) qui servira de mémoire à la nouvelle session.');
       }
     }
   }

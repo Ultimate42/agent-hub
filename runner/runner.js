@@ -33,9 +33,16 @@ export class AgentBridge {
     }
     const extra = this.dropped ? `[Runner : ${this.dropped} message(s) du salon ignoré(s) (limite de débit) ; relis le salon si besoin.]` : '';
     this.dropped = 0;
-    this.session.push(formatMessage(msg, this.roomLabel, extra));
+    this.lastPush = this.session.push(formatMessage(msg, this.roomLabel, extra));
     this.stats.pushed++;
     return d;
+  }
+  /** Pour l'abonnement : résout true quand le message est traité (ou volontairement ignoré), false si la session a échoué (=> pas d'ack). */
+  async handleAsync(msg) {
+    this.lastPush = null;
+    const d = this.handle(msg);
+    if (!d.push || !this.lastPush) return true; // filtré / limité en débit : décision définitive, on peut acker
+    return (await this.lastPush) !== false;
   }
 }
 
@@ -76,14 +83,14 @@ export class Runner {
       const session = new AgentSession({ agent, queryFn: this.queryFn, appendPrompt: buildAppendPrompt(agent, cfg, roomToken), env, claudeExecutable: cfg.claudeExecutable, log });
       const bridge = new AgentBridge({ agent, peers, session, log });
       const sub = new this.SubscriptionImpl({
-        hubUrl: cfg.hubUrl, roomToken, memberToken, transport: cfg.transport, WebSocketImpl: this.WebSocketImpl, log,
-        onMessage: (m) => bridge.handle(m), onRoomName: (n) => bridge.setRoomName(n),
+        hubUrl: cfg.hubUrl, roomToken, memberToken, log,
+        onMessage: (m) => bridge.handleAsync(m), onRoomName: (n) => bridge.setRoomName(n),
       });
       this.bridges.push(bridge); this.subs.push(sub);
       session.start();
       await sub.start();
     }
-    this.log(`runner démarré : ${cfg.agents.length} agent(s), transport ${cfg.transport}`);
+    this.log(`runner démarré : ${cfg.agents.length} agent(s), curseur de lecture serveur`);
   }
 
   async stop() {
