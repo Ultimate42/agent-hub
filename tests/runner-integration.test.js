@@ -47,7 +47,7 @@ describe('runner contre un vrai hub (DB temporaire)', () => {
       const fq = makeFakeQuery();
       const runner = new Runner(cfg, { queryFn: fq.queryFn, log: () => {} });
       await runner.start();
-      await until(() => fq.calls.length === 2 && runner.subs.every((s) => s.lastId !== null));
+      await until(() => fq.calls.length === 2 && runner.subs.every((s) => s.started));
       await new Promise((r) => setTimeout(r, 300)); // WS connectée
       const tag = transport;
       const m1 = (await post('Humain', `bonjour ${tag}`)).id ?? (await api(`/api/rooms/${roomToken}/messages?limit=1`, 'GET', null, tokens.Humain)).messages.at(-1).id;
@@ -68,7 +68,7 @@ describe('runner contre un vrai hub (DB temporaire)', () => {
       assert.ok(!joined(0).includes('joined the room'));
       // Reconnexion : redémarrage du hub (même DB temporaire), message ensuite
       await stopHub(); await startHub();
-      await new Promise((r) => setTimeout(r, transport === 'ws' ? 3500 : 500));
+      await new Promise((r) => setTimeout(r, 500));
       await post('Humain', `apres redemarrage ${tag}`);
       await until(() => flat(fq.calls).filter((x) => x.includes(`apres redemarrage ${tag}`)).length === 2, 20000);
       // Arrêt propre

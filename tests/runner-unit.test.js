@@ -130,41 +130,82 @@ describe('session et rotation', () => {
   });
 });
 
-describe('abonnement hub : reconnexion WS, dédoublonnage', () => {
-  test('reconnecte après coupure et rattrape sans doublon', async () => {
-    const sockets = []; const history = [{ id: 1, content: 'a', author: 'x' }, { id: 2, content: 'b', author: 'x' }];
-    class FakeWS {
-      constructor(url) { this.url = url; this.h = {}; sockets.push(this); setTimeout(() => this.h.open?.({}), 5); }
-      addEventListener(ev, fn) { this.h[ev] = fn; }
-      close() { this.h.close?.({ code: 1006 }); }
-    }
-    const fetchImpl = async (u) => {
-      const since = Number(/since=(\d+)/.exec(u)?.[1] || 0);
-      const messages = /limit=1$/.test(u) ? history.slice(0, 1) : history.filter((x) => x.id > since);
-      return { ok: true, json: async () => ({ messages }) };
+describe('abonnement hub : curseur serveur, ack après traitement', () => {
+  // Faux hub : curseur serveur + messages ; wait renvoie les non lus (auto_ack=false => le curseur ne bouge pas).
+  const fakeHub = (msgs) => {
+    const hub = { cursor: 0, acks: [], urls: [] };
+    hub.fetchImpl = async (u, o = {}) => {
+      hub.urls.push(u);
+      if (o.method === 'POST') { const { up_to_id } = JSON.parse(o.body); hub.acks.push(up_to_id); hub.cursor = Math.max(hub.cursor, up_to_id); return { ok: true, json: async () => ({}) }; }
+      const unread = msgs.filter((m) => m.id > hub.cursor);
+      if (!unread.length) await new Promise((r) => setTimeout(r, 30));
+      return { ok: true, json: async () => ({ messages: unread }) };
     };
-    const got = [];
-    const sub = new HubSubscription({ hubUrl: 'http://h', roomToken: 'r', memberToken: 't', WebSocketImpl: FakeWS, fetchImpl, onMessage: (x) => got.push(x.id), backoffMinMs: 10, backoffMaxMs: 20 });
+    return hub;
+  };
+  const mkSub = (hub, onMessage) => new HubSubscription({ hubUrl: 'http://h', roomToken: 'r', memberToken: 't', fetchImpl: hub.fetchImpl, onMessage, backoffMinMs: 5, dupDelayMs: 10 });
+
+  test('sans since, auto_ack=false ; ack seulement après traitement', async () => {
+    const msgs = [{ id: 5, content: 'a', author: 'x' }, { id: 6, content: 'b', author: 'x' }];
+    const hub = fakeHub(msgs); const releases = {}; const got = [];
+    const sub = mkSub(hub, (m) => { got.push(m.id); return new Promise((r) => (releases[m.id] = r)); });
     await sub.start();
-    await until(() => sockets.length === 1 && got.includes(2)); // rattrapage après open (l'historique d'avant démarrage n'est pas rejoué : #1)
-    assert.deepEqual(got, [2]);
-    sockets[0].h.message({ data: JSON.stringify({ id: 3, content: 'c', author: 'x' }) });
-    sockets[0].h.message({ data: JSON.stringify({ id: 3, content: 'c', author: 'x' }) }); // doublon
-    history.push({ id: 3, content: 'c', author: 'x' }, { id: 4, content: 'd', author: 'x' });
-    sockets[0].close(); // coupure
-    await until(() => sockets.length === 2 && got.includes(4));
-    assert.deepEqual(got, [2, 3, 4]);
+    await until(() => got.length === 2);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.deepEqual(hub.acks, [], 'rien acké tant que non traité');
+    assert.deepEqual(got, [5, 6], 'pas de redélivrance locale en double');
+    assert.ok(hub.urls.every((u) => !/since=/.test(u)) && hub.urls.some((u) => /auto_ack=false/.test(u)));
+    releases[6](true); // 6 traité mais 5 non : l'ack ne doit pas dépasser 4
+    await new Promise((r) => setTimeout(r, 80));
+    assert.deepEqual(hub.acks, []);
+    releases[5](true);
+    await until(() => hub.acks.includes(6));
+    assert.deepEqual(hub.acks, [6]);
     sub.stop();
   });
-  test('repli long-poll si pas de WS', async () => {
-    let n = 0;
-    const fetchImpl = async (u) => {
-      if (/limit=1$/.test(u)) return { ok: true, json: async () => ({ messages: [] }) };
-      n++; return { ok: true, json: async () => ({ messages: n === 1 ? [{ id: 1, content: 'p', author: 'x' }] : [] }) };
-    };
-    const got = [];
-    const sub = new HubSubscription({ hubUrl: 'http://h', roomToken: 'r', memberToken: 't', transport: 'poll', fetchImpl, onMessage: (x) => got.push(x.id), backoffMinMs: 5 });
-    await sub.start(); await until(() => got.length === 1); assert.equal(sub.mode, 'poll'); sub.stop();
+  test('échec de traitement : pas d\'ack, message re-livré puis acké', async () => {
+    const hub = fakeHub([{ id: 1, content: 'a', author: 'x' }]); let n = 0;
+    const sub = mkSub(hub, async () => { n++; return n >= 2; });
+    await sub.start();
+    await until(() => hub.acks.includes(1));
+    assert.equal(n, 2); assert.equal(hub.acks.length, 1);
+    sub.stop();
+  });
+  test('rejet de onMessage = non traité ; ack en échec réessayé', async () => {
+    const hub = fakeHub([{ id: 2, content: 'a', author: 'x' }]); let n = 0, fail = 1;
+    const orig = hub.fetchImpl;
+    hub.fetchImpl = async (u, o) => (o?.method === 'POST' && fail-- > 0 ? { ok: false, status: 500 } : orig(u, o));
+    const sub = mkSub(hub, async () => { if (n++ === 0) throw new Error('boom'); return true; });
+    await sub.start();
+    await until(() => hub.acks.includes(2));
+    assert.ok(n >= 2);
+    sub.stop();
+  });
+});
+
+describe('session : promesse de traitement', () => {
+  test('push résout true après le tour ; false si la session s\'arrête avant', async () => {
+    const f = makeFakeQuery();
+    const s = new AgentSession({ agent: { ...A, maxTurns: 0 }, queryFn: f.queryFn, restartDelayMs: 10 });
+    s.start();
+    assert.equal(await s.push('un'), true);
+    const pending = s.push('jamais traité');
+    await s.stop();
+    assert.equal(await pending, false);
+  });
+  test('crash de session avant le résultat : false (non acké)', async () => {
+    let calls = 0;
+    const queryFn = ({ prompt }) => ({
+      async *[Symbol.asyncIterator]() {
+        calls++;
+        for await (const m of prompt) { if (calls === 1 && m.message.content === 'm') throw new Error('crash'); yield { type: 'result', result: 'ok' }; }
+      },
+      close() {},
+    });
+    const s = new AgentSession({ agent: { ...A, maxTurns: 0 }, queryFn, restartDelayMs: 10 });
+    s.start();
+    assert.equal(await s.push('m'), false);
+    await s.stop();
   });
 });
 
