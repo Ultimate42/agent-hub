@@ -85,6 +85,31 @@ db.exec(`
     UNIQUE(message_id, to_member_id)
   );
 
+  -- Wake targets table: stores webhook or file targets for members
+  CREATE TABLE IF NOT EXISTS wake_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    target_type TEXT NOT NULL CHECK(target_type IN ('webhook', 'file')),
+    target_url TEXT,
+    target_path TEXT,
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
+    last_error TEXT,
+    last_notification_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(member_id)
+  );
+
+  -- Wake notifications table: idempotent tracking of notifications sent
+  CREATE TABLE IF NOT EXISTS wake_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    notification_sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(member_id, message_id)
+  );
+
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_rooms_token ON rooms(token);
   CREATE INDEX IF NOT EXISTS idx_members_token ON members(token);
@@ -94,6 +119,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_directive_history_room ON directive_history(room_id, replaced_at);
   CREATE INDEX IF NOT EXISTS idx_watchdog_alerts_room ON watchdog_alerts(room_id);
   CREATE INDEX IF NOT EXISTS idx_watchdog_alerts_msg_member ON watchdog_alerts(message_id, to_member_id);
+  CREATE INDEX IF NOT EXISTS idx_wake_targets_member ON wake_targets(member_id);
+  CREATE INDEX IF NOT EXISTS idx_wake_notifications_member_msg ON wake_notifications(member_id, message_id);
 `);
 
 logger.info('Database initialized', { path: config.dbPath });
@@ -235,6 +262,35 @@ const stmts = {
   `),
   watchdogAlertExists: db.prepare(`
     SELECT 1 FROM watchdog_alerts WHERE message_id = ? AND to_member_id = ? LIMIT 1
+  `),
+
+  // Wake targets
+  setWakeTarget: db.prepare(`
+    INSERT OR REPLACE INTO wake_targets (member_id, target_type, target_url, target_path, max_retries)
+    VALUES (?, ?, ?, ?, ?)
+  `),
+  getWakeTarget: db.prepare(`
+    SELECT * FROM wake_targets WHERE member_id = ?
+  `),
+  deleteWakeTarget: db.prepare(`
+    DELETE FROM wake_targets WHERE member_id = ?
+  `),
+  updateWakeTargetError: db.prepare(`
+    UPDATE wake_targets SET last_error = ?, retry_count = 0, updated_at = CURRENT_TIMESTAMP
+    WHERE member_id = ?
+  `),
+  updateWakeTargetSuccess: db.prepare(`
+    UPDATE wake_targets SET last_error = NULL, retry_count = 0, last_notification_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+    WHERE member_id = ?
+  `),
+
+  // Wake notifications
+  createWakeNotification: db.prepare(`
+    INSERT INTO wake_notifications (member_id, message_id)
+    VALUES (?, ?)
+  `),
+  wakeNotificationExists: db.prepare(`
+    SELECT 1 FROM wake_notifications WHERE member_id = ? AND message_id = ? LIMIT 1
   `)
 };
 
@@ -408,6 +464,50 @@ export const database = {
 
   watchdogAlertExists(messageId, toMemberId) {
     return stmts.watchdogAlertExists.get(messageId, toMemberId) !== undefined;
+  },
+
+  // Wake targets operations
+  setWakeTarget(memberId, targetType, targetUrl = null, targetPath = null, maxRetries = 3) {
+    try {
+      const result = stmts.setWakeTarget.run(memberId, targetType, targetUrl, targetPath, maxRetries);
+      return result.lastInsertRowid;
+    } catch (err) {
+      logger.error('Failed to set wake target', { memberId, targetType, error: err.message });
+      throw err;
+    }
+  },
+
+  getWakeTarget(memberId) {
+    return stmts.getWakeTarget.get(memberId);
+  },
+
+  deleteWakeTarget(memberId) {
+    stmts.deleteWakeTarget.run(memberId);
+  },
+
+  updateWakeTargetError(memberId, errorMessage) {
+    stmts.updateWakeTargetError.run(errorMessage, memberId);
+  },
+
+  updateWakeTargetSuccess(memberId) {
+    stmts.updateWakeTargetSuccess.run(memberId);
+  },
+
+  wakeNotificationExists(memberId, messageId) {
+    return stmts.wakeNotificationExists.get(memberId, messageId) !== undefined;
+  },
+
+  createWakeNotification(memberId, messageId) {
+    try {
+      const result = stmts.createWakeNotification.run(memberId, messageId);
+      return result.lastInsertRowid;
+    } catch (err) {
+      // UNIQUE constraint violation means notification already exists, which is fine
+      if (err.message?.includes('UNIQUE')) {
+        return null;
+      }
+      throw err;
+    }
   },
 
   // Utility

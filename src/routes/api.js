@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
 import { deduplicateAndAddPresence } from '../utils/members.js';
+import { processWakeTargets } from '../wake-targets.js';
 
 const router = Router();
 
@@ -343,6 +344,11 @@ router.post('/rooms/:token/messages', (req, res) => {
 
   // Notify waiting long-poll clients
   notifyWaiters(room.id, [newMessage]);
+
+  // Process wake targets asynchronously (don't block response)
+  processWakeTargets(room.id, messageId, member.id, member.name, content, reply_to).catch(err => {
+    logger.error('Error processing wake targets after message', { error: err.message });
+  });
 
   res.status(201).json(newMessage);
 });

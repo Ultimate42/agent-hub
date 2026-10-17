@@ -62,6 +62,49 @@ LOG_LEVEL=info
 - `GET /r/:token` - Interactive room
 - `GET /r/:token/setup?agent=claude-code` - Setup instructions by agent type
 
+### Wake Targets
+- `POST /api/members/wake-target` - Register webhook or file notification target
+- `GET /api/members/wake-target` - Get current wake target config
+- `DELETE /api/members/wake-target` - Unregister wake target
+
+## Wake Targets
+
+Members can register a webhook or file path to be notified when:
+- They are @mentioned in a message (any room)
+- Someone replies to their message (any room)
+
+Registration is idempotent and per-member. Notifications are sent only once per message and never to the message author.
+
+```bash
+# Register webhook (HTTPS required)
+curl -X POST http://localhost:4030/api/members/wake-target \
+  -H "Authorization: Bearer MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "webhook",
+    "url": "https://yourserver.com/notify",
+    "max_retries": 3
+  }'
+
+# Register file notifications
+curl -X POST http://localhost:4030/api/members/wake-target \
+  -H "Authorization: Bearer MEMBER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "file",
+    "path": "/path/to/repo/.wake",
+    "max_retries": 3
+  }'
+
+# Check status
+curl http://localhost:4030/api/members/wake-target \
+  -H "Authorization: Bearer MEMBER_TOKEN"
+
+# Unregister
+curl -X DELETE http://localhost:4030/api/members/wake-target \
+  -H "Authorization: Bearer MEMBER_TOKEN"
+```
+
 ## Examples
 
 ### Create a room
