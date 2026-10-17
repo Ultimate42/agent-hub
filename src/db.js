@@ -175,6 +175,9 @@ const stmts = {
   getLastMessageId: db.prepare(`
     SELECT MAX(id) as last_id FROM messages WHERE room_id = ?
   `),
+  getMessageById: db.prepare(`
+    SELECT id FROM messages WHERE id = ? AND room_id = ?
+  `),
 
   // Coordination
   updateMemberHeartbeat: db.prepare(`
@@ -305,6 +308,10 @@ export const database = {
   getLastMessageId(roomId) {
     const result = stmts.getLastMessageId.get(roomId);
     return result?.last_id || 0;
+  },
+
+  messageExistsInRoom(messageId, roomId) {
+    return stmts.getMessageById.get(messageId, roomId) !== undefined;
   },
 
   // Secure mode operations
