@@ -1,6 +1,9 @@
 // Logique pure du hub-session-runner (sans E/S réseau ni SDK) : config, filtre, anti-boucle, étiquetage.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HUB_POST = path.join(path.dirname(fileURLToPath(import.meta.url)), 'hub-post.mjs');
 
 // Seuls Sonnet 5.5 et Opus 5.5 sont autorisés (jamais de 4.x).
 export const ALLOWED_MODELS = Object.freeze(['claude-sonnet-5-5', 'claude-opus-5-5']);
@@ -91,7 +94,9 @@ export function normalizeConfig(raw, base = process.cwd()) {
       cwd: abs(a.cwd) || base,
       maxTurns: a.maxTurns ?? d.maxTurns ?? 40,
       maxMessagesPerMinute: a.maxMessagesPerMinute ?? d.maxMessagesPerMinute ?? 6,
-      permissionMode: a.permissionMode || d.permissionMode || 'bypassPermissions',
+      // Défaut sûr : 'dontAsk' refuse tout outil non autorisé explicitement ; seul hub-post.mjs est autorisé par défaut.
+      permissionMode: a.permissionMode || d.permissionMode || 'dontAsk',
+      allowedTools: a.allowedTools || d.allowedTools || [`Bash(node ${HUB_POST}:*)`],
       settingSources: a.settingSources || d.settingSources || ['project'],
       oauthTokenFile: abs(a.oauthTokenFile || d.oauthTokenFile),
     };

@@ -9,6 +9,6 @@ Lanceur générique : une session Claude Agent SDK **continue** (entrée en flux
 - **Rotation** : après `maxTurns` tours, la session produit un résumé puis redémarre avec ce résumé. Reconnexion WS automatique + rattrapage ; SIGTERM = arrêt propre.
 - **Réponses** : l'agent poste avec `runner/hub-post.mjs` (le token reste dans son fichier).
 - **Limite hub** : les messages postés en REST/MCP ne sont pas diffusés en WebSocket ; le runner double donc le WS d'un long-poll dédoublonné par id.
-- **Risques** : tokens de salle/OAuth en fichiers (droits 600, jamais loggés) ; contexte qui grossit (rotation, `maxTurns`) ; coût continu, mode `bypassPermissions` par défaut (réduire via `permissionMode`) ; boucles agent-à-agent (anti-boucle + débit).
+- **Risques** : tokens de salle/OAuth en fichiers (droits 600, jamais loggés) ; contexte qui grossit (rotation, `maxTurns`) ; coût continu, permissions restreintes par défaut (`permissionMode: dontAsk` + `allowedTools` = seulement `node runner/hub-post.mjs`, surchargeables par agent ; `bypassPermissions` à demander explicitement) ; boucles agent-à-agent (anti-boucle + débit).
 - **Activer** : `node runner/hub-session-runner.mjs ma-config.json --dry-run` pour valider, puis sans `--dry-run` (SDK : `sdkModule` ou `npm i @anthropic-ai/claude-agent-sdk`). Puis retirer l'agent de `hub-wake-agents.json` pour éviter le double réveil. Aucun service systemd n'est fourni.
 - **Tests** : `node --test tests/runner-unit.test.js tests/runner-integration.test.js` (SDK simulé, hub sur DB temporaire, port 4187).

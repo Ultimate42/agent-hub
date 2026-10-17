@@ -70,6 +70,7 @@ export class AgentSession {
       options: {
         model: a.model, cwd: a.cwd,
         permissionMode: a.permissionMode,
+        ...(a.allowedTools?.length ? { allowedTools: a.allowedTools } : {}),
         ...(a.permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
         settingSources: a.settingSources,
         systemPrompt: { type: 'preset', preset: 'claude_code', append: this.appendPrompt },
