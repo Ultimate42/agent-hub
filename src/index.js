@@ -63,7 +63,7 @@ app.use((err, req, res, next) => {
 const server = createServer(app);
 
 // Setup WebSocket
-setupWebSocket(server);
+const wss = setupWebSocket(server);
 
 // Start server
 server.listen(config.port, config.host, () => {
@@ -87,18 +87,25 @@ server.listen(config.port, config.host, () => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+function shutdown() {
   logger.info('Shutting down...');
-  server.close(() => {
-    logger.info('Server closed');
-    process.exit(0);
-  });
-});
 
-process.on('SIGINT', () => {
-  logger.info('Shutting down...');
-  server.close(() => {
-    logger.info('Server closed');
-    process.exit(0);
-  });
-});
+  // Close WebSocket clients
+  if (wss?.clients) {
+    wss.clients.forEach(ws => ws.terminate());
+  }
+
+  server.close(() => process.exit(0));
+
+  // Force close idle/all connections after 2s
+  setTimeout(() => {
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+  }, 2000);
+
+  // Force exit after 5s
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
