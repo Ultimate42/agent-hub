@@ -209,9 +209,77 @@ async function postMessage(content) {
 }
 
 /**
+ * Category hint: "[Genou gauche] ..." -> existing memory path (fast path of memory-agent,
+ * ~0.6 s) or the bare label as classification hint (memory-agent then asks its LLM, ~9 s).
+ */
+const HINT_STOP = new Set(['de', 'du', 'des', 'la', 'le', 'les', 'l', 'd', 'et', 'en', 'au', 'aux', 'un', 'une', 'mi',
+  'actuel', 'actuelle', 'actuels', 'actuelles', 'janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout',
+  'septembre', 'octobre', 'novembre', 'decembre', 'debut', 'fin']);
+const HINT_SYNONYMS = { charge: 'force', poids: 'force', epaule: 'epaule', blessure: 'blessures', seance: 'seances' };
+const HINT_IGNORED_ROOTS = new Set(['archive', 'temp', 'coach', 'nutrition', 'poids']);
+let treePathsCache = { at: 0, paths: [] };
+
+function hintTokens(text) {
+  return String(text).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .split(/[^a-z0-9]+/).filter(Boolean)
+    .filter(t => !HINT_STOP.has(t) && !/^\d+$/.test(t))
+    .map(t => t.replace(/(s|x)$/, ''))
+    .map(t => HINT_SYNONYMS[t] || t);
+}
+
+function parseTreePaths(text) {
+  const paths = [], stack = [];
+  for (const line of String(text).split('\n')) {
+    const m = line.match(/^( *)(\S.*?)(?:\(\d+\))?\s*$/);
+    if (!m) continue;
+    stack.length = m[1].length;
+    stack[m[1].length] = m[2];
+    paths.push(stack.slice(0, m[1].length + 1).join('/'));
+  }
+  return paths;
+}
+
+async function getTreePaths() {
+  if (Date.now() - treePathsCache.at < 5 * 60 * 1000 && treePathsCache.paths.length) return treePathsCache.paths;
+  try {
+    const r = await fetch(`${MEMORY_API_URL}/tree/coach`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return treePathsCache.paths;
+    const paths = parseTreePaths(await r.text());
+    if (paths.length) treePathsCache = { at: Date.now(), paths };
+  } catch (err) {
+    console.error(`[ARCHIVISTE] Tree fetch failed: ${err.message}`);
+  }
+  return treePathsCache.paths;
+}
+
+/** Returns { label, hint, content } or null when the note has no leading [Category]. */
+async function deriveHint(text) {
+  const m = text.match(/^\[([^\]\n]{1,80})\]\s*([\s\S]*)$/);
+  if (!m) return null;
+  const label = m[1].trim();
+  if (!label) return null;
+  if (/^[\p{L}\p{N}_\-. ]+(\/[\p{L}\p{N}_\-. ]+)+$/u.test(label)) return { label, hint: label };
+  const want = [...new Set(hintTokens(label))];
+  let best = null;
+  if (want.length) {
+    for (const p of await getTreePaths()) {
+      const segs = p.split('/');
+      if (segs.length < 2 || HINT_IGNORED_ROOTS.has(segs[0]) || segs.some(x => /^\d/.test(x))) continue;
+      const have = new Set(segs.flatMap(hintTokens));
+      const last = new Set(hintTokens(segs[segs.length - 1]));
+      if (!want.every(t => have.has(t)) || !want.some(t => last.has(t))) continue;
+      // prefer the most specific path whose last segment covers the label, then the shortest
+      const score = (want.filter(t => last.has(t)).length * 10) - segs.length + (segs[0] === 'sport' ? 1 : 0);
+      if (!best || score > best.score) best = { p, score };
+    }
+  }
+  return { label, hint: best ? best.p : label.replace(/\//g, ' ') };
+}
+
+/**
  * Write to memory via memory-agent API
  */
-async function writeMemory(content, path = 'sante-sport-nutrition/notes') {
+async function writeMemory(content, path = 'sante-sport-nutrition/notes', hint = null) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 90000);
@@ -224,7 +292,7 @@ async function writeMemory(content, path = 'sante-sport-nutrition/notes') {
         body: JSON.stringify({
           content: content,
           tree: 'coach',
-          path: path,
+          ...(hint ? { hint } : { path }),
         }),
         signal: controller.signal,
       }
@@ -478,11 +546,13 @@ async function processMessage(msg, gate = Promise.resolve()) {
       if (success) {
         console.log(`[ARCHIVISTE] msg_id=${msg.id} already written to memory, skipping write`);
       } else {
+        const derived = await deriveHint(memoryContent);
+        if (derived) console.log(`[ARCHIVISTE] msg_id=${msg.id} category [${derived.label}] -> hint ${derived.hint}`);
         success = await writeMemory({
           name: 'Note',
           description: memoryContent,
           date: new Date().toISOString(),
-        });
+        }, undefined, derived ? derived.hint : null);
         if (success) {
           state.writtenIds = [...state.writtenIds, msg.id].slice(-200);
           saveState();
