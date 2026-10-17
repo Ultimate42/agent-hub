@@ -8,8 +8,9 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.dirname(__dirname);
 
-const dbPath = process.env.HUB_DB_PATH || path.join(projectRoot, 'data', 'hub.db');
-const backupDir = process.env.HUB_BACKUP_DIR || path.join(projectRoot, 'data', 'backups');
+const dataDir = process.env.HUB_DATA_DIR || path.join(projectRoot, 'data');
+const dbPath = process.env.HUB_DB_PATH || process.env.DB_PATH || path.join(dataDir, 'hub.db');
+const backupDir = process.env.HUB_BACKUP_DIR || path.join(dataDir, 'backups');
 
 // Ensure backup directory exists
 if (!fs.existsSync(backupDir)) {
