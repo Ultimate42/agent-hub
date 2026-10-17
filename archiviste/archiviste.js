@@ -7,7 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
@@ -16,6 +16,7 @@ const __dirname = path.dirname(__filename);
 
 // Configuration
 const ROOM_TOKEN = process.env.ROOM_TOKEN;
+const LLM_MODEL = process.env.ARCHIVISTE_MODEL || 'claude-sonnet-5-5';
 // Runtime state (member token, pid) lives outside the repo: ARCHIVISTE_STATE_DIR (default: this directory)
 const STATE_DIR = process.env.ARCHIVISTE_STATE_DIR || __dirname;
 const AGENT_HUB_URL = process.env.AGENT_HUB_URL || 'http://localhost:4030';
@@ -383,18 +384,26 @@ export function shouldCallLLM(content) {
 }
 
 /**
- * Call Claude Haiku via CLI with timeout
+ * Call Claude (ARCHIVISTE_MODEL, default Sonnet 5.5) via CLI with timeout
  * Returns the response text or null on error
  */
 async function callClaudeLLM(systemPrompt, userMessage) {
   try {
     const fullPrompt = `${systemPrompt}\n\n${userMessage}`;
 
-    // Use echo | claude to pass prompt via stdin
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', `echo "${fullPrompt.replace(/"/g, '\\"')}" | claude -p --model haiku`], {
-      timeout: 90000, // 90 seconds
-      maxBuffer: 10 * 1024 * 1024, // 10MB
-      shell: false,
+    // Prompt passed via stdin (no shell: room content is never interpreted)
+    const { stdout, stderr } = await new Promise((resolve, reject) => {
+      const child = spawn('claude', ['-p', '--model', LLM_MODEL], { stdio: ['pipe', 'pipe', 'pipe'] });
+      let out = '', errOut = '';
+      const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('Claude call timed out after 90s')); }, 90000);
+      child.stdout.on('data', d => { if (out.length < 10 * 1024 * 1024) out += d; });
+      child.stderr.on('data', d => { errOut += d; });
+      child.on('error', e => { clearTimeout(timer); reject(e); });
+      child.on('close', code => {
+        clearTimeout(timer);
+        code === 0 ? resolve({ stdout: out, stderr: errOut }) : reject(new Error(`claude exited ${code}: ${errOut}`));
+      });
+      child.stdin.end(fullPrompt);
     });
 
     if (stderr && !stderr.includes('warning')) {
@@ -578,8 +587,8 @@ async function processMessage(msg) {
                        /(que|et|le|de|est|un|une|je|tu|il|elle|nous|vous|ils|elles)\b/i.test(content);
 
       const briefResponse = isFrench
-        ? 'Je suis un script relais vers la mémoire du coach (modèle Haiku côté memory-agent).\nCommandes: retiens:, cherche:, résume:, ?, aide'
-        : 'I am a relay script to the coach\'s memory (Haiku model on memory-agent side).\nCommands: retiens:, cherche:, résume:, ?, aide';
+        ? 'Je suis un script relais vers la mémoire du coach (modèle Sonnet 5.5).\nCommandes: retiens:, cherche:, résume:, ?, aide'
+        : 'I am a relay script to the coach\'s memory (Sonnet 5.5 model).\nCommands: retiens:, cherche:, résume:, ?, aide';
 
       await postMessage(briefResponse);
       lastHelpResponsePerAuthor.set(author, now);
