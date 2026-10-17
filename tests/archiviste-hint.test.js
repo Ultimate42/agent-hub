@@ -50,6 +50,7 @@ describe('Archiviste [Categorie] -> hint', () => {
 
   test('maps labels to existing paths, falls back to label, keeps plain notes unchanged', async () => {
     const room = (await api('/api/rooms', { method: 'POST', body: JSON.stringify({ name: 'Hint test' }) })).data;
+    await api(`/api/rooms/${room.room_token}/join`, { method: 'POST', body: JSON.stringify({ name: 'Archiviste' }) });
     const tok = (await api(`/api/rooms/${room.room_token}/join`, { method: 'POST', body: JSON.stringify({ name: 'Claude (Coach sport)' }) })).data.member_token;
     const say = (c) => api(`/api/rooms/${room.room_token}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${tok}` }, body: JSON.stringify({ content: c, type: 'message' }) });
     await say('warmup');
@@ -61,7 +62,7 @@ describe('Archiviste [Categorie] -> hint', () => {
       env: { ...process.env, ROOM_TOKEN: room.room_token, AGENT_HUB_URL: BASE, MEMORY_API_URL: `http://localhost:${MEM_PORT}`, ARCHIVISTE_STATE_DIR: dir },
       stdio: 'pipe',
     });
-    procs.push(p);
+    procs.push(p); if (process.env.DBG) { p.stdout.on("data", d => process.stderr.write(d)); p.stderr.on("data", d => process.stderr.write(d)); }
     await until(() => memBodies.length >= 5);
     const by = (txt) => memBodies.find(b => b.content.description.includes(txt));
     assert.strictEqual(by('douleur').hint, 'sport/blessures/genou_gauche');

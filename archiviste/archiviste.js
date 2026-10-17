@@ -390,6 +390,34 @@ async function initializeLastMessageId() {
   }
 }
 
+let lastAckedId = 0;
+let ackInFlight = null;
+
+/**
+ * Explicit read receipt up to the local watermark (all ids <= watermark are fully handled).
+ * Best effort: on failure it is retried at the next batch / poll.
+ */
+async function ackWatermark() {
+  const id = state.lastProcessedMessageId || 0;
+  if (!state.memberToken || id <= lastAckedId) return;
+  if (ackInFlight) { await ackInFlight.catch(() => {}); if (id <= lastAckedId) return; }
+  ackInFlight = (async () => {
+    try {
+      const r = await fetch(`${AGENT_HUB_URL}/api/rooms/${ROOM_TOKEN}/ack`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${state.memberToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ up_to_id: id }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      lastAckedId = Math.max(lastAckedId, id);
+    } catch (err) {
+      console.error(`[ARCHIVISTE] Ack up_to_id=${id} failed: ${err.message}`);
+    }
+  })();
+  try { await ackInFlight; } finally { ackInFlight = null; }
+}
+
 /**
  * Poll for new messages
  */
@@ -400,9 +428,10 @@ async function pollMessages() {
   }
 
   try {
-    const sinceParam = state.lastProcessedMessageId ? `&since=${state.lastProcessedMessageId}` : '';
+    // Server-side read cursor: no `since`; auto_ack=false so a message stays unread (and is
+    // re-delivered after a crash) until we explicitly ack it once handled and answered.
     const response = await fetchWithRetry(
-      `${AGENT_HUB_URL}/api/rooms/${ROOM_TOKEN}/messages/wait?timeout=30000${sinceParam}`,
+      `${AGENT_HUB_URL}/api/rooms/${ROOM_TOKEN}/messages/wait?timeout=30000&auto_ack=false`,
       {
         method: 'GET',
         headers: {
@@ -766,8 +795,9 @@ async function mainLoop() {
     }
   }
 
-  // Initialize lastProcessedMessageId
-  await initializeLastMessageId();
+  // The hub keeps our read position (cursor): a fresh local state starts at 0, nothing to skip.
+  if (state.lastProcessedMessageId === null) { state.lastProcessedMessageId = 0; saveState(); }
+  await ackWatermark(); // re-send an ack lost in a previous run
 
   // Long-poll loop
   while (!shuttingDown) {
@@ -799,6 +829,7 @@ export async function processBatch(messages, handler = processMessage) {
     .filter(m => m.id > (state.lastProcessedMessageId || 0) && !state.doneIds.includes(m.id))
     .sort((a, b) => a.id - b.id);
   if (pending.length === 0) {
+    await ackWatermark(); // redelivered because an earlier ack was lost
     if (messages && messages.length > 0) await sleep(1000); // only already-done messages above a retried one
     return;
   }
@@ -819,6 +850,7 @@ export async function processBatch(messages, handler = processMessage) {
     state.lastProcessedMessageId = wm;
     state.doneIds = [...done].filter(id => id > wm);
     saveState();
+    ackWatermark(); // reply already posted for every id <= wm
   };
 
   // Reply turnstile: message k posts only after message k-1 finished
@@ -861,6 +893,7 @@ export async function processBatch(messages, handler = processMessage) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pending.length) }, worker));
+  await ackWatermark();
   // Unblock any turn that never ran (so nothing hangs)
   if (failed && !shuttingDown) await sleep(currentBackoffMs);
 }

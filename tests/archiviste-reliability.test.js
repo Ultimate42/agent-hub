@@ -28,6 +28,8 @@ async function until(fn, ms = 15000) {
 async function newRoom(authors) {
   const room = (await api('/api/rooms', { method: 'POST', body: JSON.stringify({ name: 'Archiviste test' }) })).data;
   const members = {};
+  // Archiviste joins first: its server-side read cursor starts before the messages posted below
+  await api(`/api/rooms/${room.room_token}/join`, { method: 'POST', body: JSON.stringify({ name: 'Archiviste' }) });
   for (const a of authors) {
     members[a] = (await api(`/api/rooms/${room.room_token}/join`, { method: 'POST', body: JSON.stringify({ name: a }) })).data.member_token;
   }
@@ -163,5 +165,29 @@ describe('Archiviste reliability', () => {
     await until(async () => (await listMsgs(room, tok)).some(x => x.author === 'Archiviste'));
     assert.strictEqual(memWrites.length, 0);
     p.kill('SIGTERM'); await exited(p);
+  });
+
+  test('server read cursor: crash before ack -> redelivered even without local state; acked after reply', async () => {
+    memDelay = 1500; memWrites = [];
+    const { room, members } = await newRoom(['Claude (Santé)']);
+    const tok = members['Claude (Santé)'];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+    seedState(dir, 0);
+    await say(room, tok, 'retiens: avant ack');
+    const p1 = startArchiviste(room, dir, { ARCHIVISTE_SHUTDOWN_GRACE_MS: '100' });
+    await until(() => /Processing msg_id=/.test(p1.out));
+    p1.kill('SIGTERM'); await exited(p1);
+    const st = readState(dir);
+    const arch = st.memberToken;
+    const peek = async () => (await api(`/api/rooms/${room}/messages?auto_ack=false`, { headers: { Authorization: `Bearer ${arch}` } })).data;
+    const before = await peek();
+    assert.ok(before.messages.some(m => m.content.includes('avant ack')) && !before.history, 'still unread on the hub (not acked)');
+    // lose the local watermark entirely: the hub cursor alone must redeliver
+    fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ ...st, lastProcessedMessageId: null, doneIds: [], writtenIds: [] }));
+    memDelay = 100;
+    const p2 = startArchiviste(room, dir);
+    await until(async () => (await listMsgs(room, tok)).some(x => x.author === 'Archiviste' && x.content.includes('avant ack')));
+    await until(async () => { const a = await peek(); return a.history === true || a.messages.length === 0; }); // nothing unread left: acked
+    p2.kill('SIGTERM'); await exited(p2);
   });
 });
