@@ -167,3 +167,16 @@ describe('abonnement hub : reconnexion WS, dédoublonnage', () => {
     await sub.start(); await until(() => got.length === 1); assert.equal(sub.mode, 'poll'); sub.stop();
   });
 });
+
+import { normalizeConfig as _nc } from '../runner/lib.js';
+import { test as _t } from 'node:test';
+import _assert from 'node:assert';
+_t('permissions : défaut sûr (dontAsk + hub-post seul), surchargeable', () => {
+  const base = { name: 'A', memberTokenFile: 'm', roomToken: 'r' };
+  const [a] = _nc({ agents: [base] }, '/tmp').agents;
+  _assert.equal(a.permissionMode, 'dontAsk');
+  _assert.equal(a.allowedTools.length, 1);
+  _assert.match(a.allowedTools[0], /^Bash\(node \/.*runner\/hub-post\.mjs:\*\)$/);
+  const [b] = _nc({ agents: [{ ...base, permissionMode: 'default', allowedTools: ['Read'] }] }, '/tmp').agents;
+  _assert.deepEqual([b.permissionMode, b.allowedTools], ['default', ['Read']]);
+});
