@@ -12,7 +12,8 @@ import designRoutes from './routes/design.js';
 import coordinationRoutes from './routes/coordination.js';
 import wakeTargetsRoutes from './routes/wake-targets.js';
 import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
-import Database from 'better-sqlite3';
+import { database } from './db.js';
+import { releaseAllWaiters } from './services/messages.js';
 
 // Initialize Express
 const app = express();
@@ -59,6 +60,11 @@ app.use(webRoutes);    // /, /r/:token, /health, /llms.txt
 
 // Error handler (MUST be after routes and other middleware)
 app.use((err, req, res, next) => {
+  // Malformed JSON body
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+
   // Handle payload too large errors from body-parser
   if (err.type === 'entity.too.large' || err.message?.includes('payload too large') || err.status === 413) {
     logger.warn('Payload too large', { error: err.message, contentLength: req.get('content-length') });
@@ -75,13 +81,9 @@ const server = createServer(app);
 // Setup WebSocket
 const wss = setupWebSocket(server);
 
-// Import database and initialize watchdog
-import('./db.js').then(({ default: db }) => {
-  // Open database connection for watchdog
-  const dbConn = new Database(config.dbPath);
-  initWatchdogDb(dbConn);
-  startWatchdog();
-});
+// Initialize watchdog on the shared DB connection
+initWatchdogDb(database.db);
+startWatchdog();
 
 // Start server
 server.listen(config.port, config.host, () => {
@@ -111,12 +113,16 @@ function shutdown() {
   // Stop watchdog
   stopWatchdog();
 
-  // Close WebSocket clients
+  // Release long-polls and close WebSocket clients
+  releaseAllWaiters();
   if (wss?.clients) {
     wss.clients.forEach(ws => ws.terminate());
   }
 
-  server.close(() => process.exit(0));
+  server.close(() => {
+    try { database.close(); } catch { /* already closed */ }
+    process.exit(0);
+  });
 
   // Force close idle/all connections after 2s
   setTimeout(() => {

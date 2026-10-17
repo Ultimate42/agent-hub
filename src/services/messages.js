@@ -1,0 +1,144 @@
+import { database } from '../db.js';
+import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
+import { processWakeTargets } from '../wake-targets.js';
+
+export const MESSAGE_TYPES = ['message', 'question', 'response', 'directive'];
+export const MEMBER_ROLES = ['agent', 'human', 'observer', 'manager', 'second'];
+export const MAX_NAME_LENGTH = 64;
+const RESERVED_NAMES = ['hubwatchdog', 'system'];
+
+// ---------------------------------------------------------------------------
+// Realtime fan-out: long-poll waiters + WebSocket clients
+// ---------------------------------------------------------------------------
+
+// Long-poll waiting clients: Map<roomId, Set<{res, since, timeout}>>
+export const waitingClients = new Map();
+
+// WebSocket broadcaster, registered by ws/handler.js (avoids a circular import)
+let wsBroadcaster = null;
+export function setWsBroadcaster(fn) {
+  wsBroadcaster = fn;
+}
+
+/**
+ * Resolve every long-poll waiting on a room with the given messages.
+ */
+export function notifyWaiters(roomId, messages) {
+  const clients = waitingClients.get(roomId);
+  if (!clients || clients.size === 0) return;
+
+  for (const client of [...clients]) {
+    clearTimeout(client.timeout);
+    clients.delete(client);
+    try {
+      if (!client.res.headersSent) client.res.json({ messages });
+    } catch (err) {
+      logger.warn('Failed to notify long-poll waiter', { error: err.message });
+    }
+  }
+  if (clients.size === 0) waitingClients.delete(roomId);
+}
+
+/**
+ * Release all pending long-polls (used on shutdown).
+ */
+export function releaseAllWaiters() {
+  for (const roomId of [...waitingClients.keys()]) notifyWaiters(roomId, []);
+}
+
+/**
+ * Publish a new message to ALL realtime channels (WebSocket + long-poll).
+ * Single entry point: every code path that creates a message must call this.
+ */
+export function publishMessage(roomId, message) {
+  try {
+    wsBroadcaster?.(roomId, message);
+  } catch (err) {
+    logger.warn('WebSocket broadcast failed', { error: err.message });
+  }
+  notifyWaiters(roomId, [message]);
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a display name. Returns the trimmed name or null.
+ */
+export function sanitizeName(name) {
+  if (typeof name !== 'string') return null;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length > MAX_NAME_LENGTH) return null;
+  if (RESERVED_NAMES.includes(trimmed.toLowerCase())) return null;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+// ---------------------------------------------------------------------------
+// Unified message posting (REST, MCP and WebSocket)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate, store and publish a message.
+ * @returns {{ok: true, message: object} | {ok: false, status: number, error: string}}
+ */
+export function postMessage(member, { content, type = 'message', reply_to, applyDirective = false } = {}) {
+  const fail = (status, error) => ({ ok: false, status, error });
+
+  if (!member.permissions.includes('w')) return fail(403, 'Write permission required');
+
+  const room = database.getRoomById(member.room_id);
+  if (!room) return fail(404, 'Room not found');
+
+  // Secure mode: only coordinators (manager/second) and agents can post
+  if (room.settings?.secure_mode) {
+    const allowedRoles = ['manager', 'second', 'agent'];
+    if (!allowedRoles.includes(member.role) && !member.coordination_role) {
+      return fail(403, 'Secure mode: Only coordinators and agents can post messages');
+    }
+  }
+
+  if (typeof content !== 'string' || !content) return fail(400, 'Content is required');
+  if (content.length > config.maxMessageSize) return fail(413, 'Message too large');
+  if (typeof type !== 'string' || !MESSAGE_TYPES.includes(type)) {
+    return fail(400, `Invalid type. Must be one of: ${MESSAGE_TYPES.join(', ')}`);
+  }
+
+  let replyTo = null;
+  if (reply_to !== undefined && reply_to !== null && reply_to !== '' && reply_to !== 0) {
+    replyTo = Number(reply_to);
+    if (!Number.isInteger(replyTo) || !database.messageExistsInRoom(replyTo, room.id)) {
+      return fail(400, 'reply_to not found');
+    }
+  }
+
+  if (applyDirective && type === 'directive') {
+    database.updateRoomDirective(room.id, content, member.name);
+  }
+
+  const messageId = Number(database.createMessage(room.id, member.id, type, content, replyTo));
+
+  const message = {
+    id: messageId,
+    type,
+    content,
+    author: member.name,
+    author_role: member.role,
+    reply_to: replyTo ?? undefined,
+    created_at: new Date().toISOString()
+  };
+
+  logger.debug('Message posted', { roomId: room.id, messageId, author: member.name });
+
+  publishMessage(room.id, message);
+
+  // Wake targets run asynchronously (don't block the caller)
+  processWakeTargets(room.id, messageId, member.id, member.name, content, replyTo).catch(err => {
+    logger.error('Error processing wake targets after message', { error: err.message });
+  });
+
+  return { ok: true, message };
+}

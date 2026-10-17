@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { database } from '../db.js';
 
 // In-memory rate limit store (per token and per IP)
 const rateLimits = new Map();
@@ -18,7 +19,34 @@ export function cleanupRateLimits() {
 }
 
 // Cleanup every 5 minutes
-setInterval(cleanupRateLimits, 5 * 60 * 1000);
+setInterval(cleanupRateLimits, 5 * 60 * 1000).unref();
+
+// Room creation limiter (per IP, per hour) shared by REST and MCP
+const roomCreations = new Map();
+
+/**
+ * @param {string} ip
+ * @returns {boolean} true if the creation is allowed (and counted)
+ */
+export function checkRoomCreationLimit(ip) {
+  const now = Date.now();
+  const key = ip || 'unknown';
+  let record = roomCreations.get(key);
+  if (!record || now - record.start > 3600000) {
+    record = { count: 0, start: now };
+    roomCreations.set(key, record);
+  }
+  if (record.count >= config.maxRoomsPerHour) return false;
+  record.count++;
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of roomCreations) if (now - v.start > 3600000) roomCreations.delete(k);
+}, 10 * 60 * 1000).unref();
+
+const MAX_RATE_KEYS = 50000;
 
 /**
  * Check rate limit for a key
@@ -31,6 +59,9 @@ export function checkRateLimit(key, limit = config.rateLimitPerMinute) {
   const windowMs = 60000;
 
   let data = rateLimits.get(key);
+
+  // Hard cap on tracked keys (memory DoS protection)
+  if (!data && rateLimits.size >= MAX_RATE_KEYS) cleanupRateLimits();
 
   if (!data || now - data.windowStart > windowMs) {
     data = { windowStart: now, count: 0 };
@@ -89,7 +120,7 @@ export function corsHandler(req, res, next) {
     res.set('Access-Control-Allow-Origin', origin);
     res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.set('Access-Control-Allow-Credentials', 'true');
+    res.set('Vary', 'Origin');
     res.set('Access-Control-Max-Age', '86400');
   }
 
@@ -110,10 +141,18 @@ export function rateLimitMiddleware(req, res, next) {
     return next();
   }
 
-  // Use token if available, otherwise IP
-  const token = req.get('Authorization')?.replace('Bearer ', '') ||
-                req.query.token;
-  const key = token || req.ip;
+  // Per-member bucket only for VALID member tokens (so agents sharing an IP do not
+  // starve each other). Unknown/forged tokens fall back to the IP bucket, otherwise
+  // an attacker could dodge the limit (and bloat memory) by rotating fake tokens.
+  const auth = req.get('Authorization');
+  const token = (auth?.startsWith('Bearer ') ? auth.slice(7) : null) ||
+                (typeof req.query.token === 'string' ? req.query.token : null);
+  let key = req.ip;
+  if (token && token.length <= 128) {
+    try {
+      if (database.getMemberByToken(token)) key = `t:${token}`;
+    } catch { /* fall back to IP */ }
+  }
 
   const { allowed, remaining, resetAt } = checkRateLimit(key);
 

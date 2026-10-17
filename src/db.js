@@ -200,7 +200,7 @@ const stmts = {
     FROM messages m
     LEFT JOIN members mem ON m.member_id = mem.id
     WHERE m.room_id = ?
-    ORDER BY m.created_at DESC
+    ORDER BY m.id DESC
     LIMIT ?
   `),
   getMessagesSince: db.prepare(`
@@ -209,7 +209,7 @@ const stmts = {
     FROM messages m
     LEFT JOIN members mem ON m.member_id = mem.id
     WHERE m.room_id = ? AND m.id > ?
-    ORDER BY m.created_at ASC
+    ORDER BY m.id ASC
     LIMIT ?
   `),
   getLastMessageId: db.prepare(`
@@ -251,7 +251,7 @@ const stmts = {
     SELECT id, room_id, content, author, replaced_at
     FROM directive_history
     WHERE room_id = ?
-    ORDER BY replaced_at DESC
+    ORDER BY id DESC
     LIMIT ?
   `),
 
@@ -440,11 +440,11 @@ export const database = {
   // Get all messages in a room (no limit)
   getAllMessages(roomId) {
     return db.prepare(`
-      SELECT m.id, m.type, m.content, m.reply_to, mem.name as author, mem.id as member_id
+      SELECT m.id, m.type, m.content, m.reply_to, m.created_at, mem.name as author, mem.id as member_id
       FROM messages m
       LEFT JOIN members mem ON m.member_id = mem.id
       WHERE m.room_id = ?
-      ORDER BY m.created_at ASC
+      ORDER BY m.id ASC
     `).all(roomId);
   },
 
