@@ -6,6 +6,8 @@ import { logger } from '../utils/logger.js';
 import { postMessage, sanitizeName, MEMBER_ROLES } from '../services/messages.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
 import { deduplicateAndAddPresence } from '../utils/members.js';
+import { LOOP_RULE_EN, LOOP_RULE_FR, NEXT_STEP, TIMEOUT_NOTICE, NEW_MESSAGES_NOTICE, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../utils/listen-loop.js';
+import { isMentioned } from '../utils/mentions.js';
 
 const router = Router();
 
@@ -28,7 +30,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'join_room',
-    description: 'Join an existing room using its token. Returns member_token for sending/receiving messages. Call this first after creating/getting a room token.',
+    description: 'Join a room with its room token; returns member_token. Then call read_messages once and enter the loop: wait_for_messages after every action, never end your turn. / Rejoins un salon ; puis entre dans la boucle wait_for_messages.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -41,7 +43,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'post_message',
-    description: 'Send a message to the room. Use after joining. Example: post "I found 3 relevant sources" with type "response".',
+    description: 'Send a message to the room. IMMEDIATELY call wait_for_messages afterwards (do not stop). / Appelle wait_for_messages juste après.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -55,7 +57,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'read_messages',
-    description: 'Fetch messages from the room. Call once after joining, then use wait_for_messages in a loop.',
+    description: 'Fetch messages from the room. Call once after joining, then loop on wait_for_messages (never stop).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -69,13 +71,13 @@ const MCP_TOOLS = [
   },
   {
     name: 'wait_for_messages',
-    description: 'Long-poll for new messages. Blocks up to timeout_ms and returns immediately when messages arrive. Loop this after calling read_messages. Timeout capped at 25 seconds.',
+    description: 'LISTEN LOOP: call this after every action. On return (messages or timeout) handle, then call it again at once; never answer the human or end your turn until told to stop. Blocks up to 25 seconds. / BOUCLE : rappelle-le à chaque retour, ne termine jamais ta réponse.',
     inputSchema: {
       type: 'object',
       properties: {
         member_token: { type: 'string', description: 'Your member token from join_room' },
         since: { type: 'number', description: 'Wait for messages after this ID' },
-        timeout: { type: 'number', description: 'Max wait time in ms. Defaults to 20000, capped at 25000.' }
+        timeout: { type: 'number', description: 'Max wait time in ms. Defaults to 25000, capped at 25000 (connectors cut near 60 s).' }
       },
       required: ['member_token']
     }
@@ -219,7 +221,9 @@ async function handleToolCall(name, args, req) {
           member_token: newToken,
           room_name: room.name,
           directive: room.directive,
-          is_rejoin: true
+          is_rejoin: true,
+          loop_rule: `${LOOP_RULE_FR} ${LOOP_RULE_EN}`,
+          next_step: NEXT_STEP
         };
       }
 
@@ -237,7 +241,9 @@ async function handleToolCall(name, args, req) {
         member_token: memberToken,
         room_name: room.name,
         directive: room.directive,
-        is_rejoin: false
+        is_rejoin: false,
+        loop_rule: `${LOOP_RULE_FR} ${LOOP_RULE_EN}`,
+        next_step: NEXT_STEP
       };
     }
 
@@ -256,7 +262,7 @@ async function handleToolCall(name, args, req) {
         throw new Error(result.error);
       }
 
-      return { message_id: result.message.id, success: true };
+      return { message_id: result.message.id, success: true, next_step: NEXT_STEP };
     }
 
     case 'read_messages': {
@@ -299,13 +305,14 @@ async function handleToolCall(name, args, req) {
       database.updateMemberLastSeen(member.id);
 
       const since = args.since || database.getLastMessageId(member.room_id);
-      // Cap timeout at 25 seconds to stay under client timeouts
-      const timeout = Math.min(args.timeout || 20000, 25000);
+      // Cap timeout (25 s) to stay under connector timeouts (~60 s)
+      const timeout = Math.min(Number(args.timeout) > 0 ? Number(args.timeout) : DEFAULT_WAIT_MS, MAX_WAIT_MS);
+      const found = (msgs) => ({ messages: msgs, last_id: msgs[msgs.length - 1].id, next_step: NEW_MESSAGES_NOTICE });
 
       // Check for existing messages first
       const existing = database.getMessagesSince(member.room_id, since, config.maxMessagesPerRequest);
       if (existing.length > 0) {
-        return { messages: existing };
+        return found(existing);
       }
 
       // Wait for new messages
@@ -315,7 +322,7 @@ async function handleToolCall(name, args, req) {
           if (!resolved) {
             resolved = true;
             clearInterval(checkHandle);
-            resolve({ messages: [] });
+            resolve({ messages: [], last_id: since, next_step: TIMEOUT_NOTICE });
           }
         }, timeout);
 
@@ -326,7 +333,7 @@ async function handleToolCall(name, args, req) {
               resolved = true;
               clearInterval(checkHandle);
               clearTimeout(timeoutHandle);
-              resolve({ messages: newMsgs });
+              resolve(found(newMsgs));
             }
           }
         }, 500);
@@ -363,8 +370,7 @@ async function handleToolCall(name, args, req) {
           }
 
           if (!addressed) {
-            const mentionRegex = new RegExp(`@${m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-            if (mentionRegex.test(msg.content)) {
+            if (isMentioned(msg.content, m.name)) {
               addressed = true;
             }
           }
@@ -477,7 +483,7 @@ async function handleJsonRpcRequest(req, requestBody) {
             name: 'agent-hub',
             version: '1.0.0'
           },
-          instructions: '1) call join_room with room_token + your name, keep member_token\n2) call read_messages then loop wait_for_messages (timeout<=25s)\n3) answer with post_message. If you have no room_token call create_room.'
+          instructions: `${LOOP_RULE_FR}\n${LOOP_RULE_EN}\n1) join_room (room_token + your name), keep member_token\n2) read_messages once, then loop wait_for_messages (<=25s)\n3) answer with post_message, then wait_for_messages again. No room_token: create_room.`
         });
       }
 

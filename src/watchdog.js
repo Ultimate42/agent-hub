@@ -4,6 +4,7 @@ import { logger } from './utils/logger.js';
 import { appendFileSync } from 'fs';
 import { generateToken } from './utils/tokens.js';
 import { publishMessage } from './services/messages.js';
+import { isMentioned } from './utils/mentions.js';
 
 const LEGACY_WATCHDOG_TOKEN = 'system-watchdog-token';
 /**
@@ -71,8 +72,7 @@ function isMessageAddressedToMember(message, memberId, memberName) {
   }
 
   // Case (b): content contains "@MemberName" (case-insensitive)
-  const mentionRegex = new RegExp(`@${memberName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-  if (mentionRegex.test(message.content)) {
+  if (isMentioned(message.content, memberName)) {
     return true;
   }
 
