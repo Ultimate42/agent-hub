@@ -57,6 +57,7 @@ export function deduplicateAndAddPresence(members) {
 
   // Convert back to array and add presence field
   return Array.from(byName.values()).map(m => ({
+    _id: m.id,
     name: m.name,
     role: m.role,
     last_seen: m.last_seen,

@@ -29,10 +29,14 @@ export function notifyWaiters(roomId, messages) {
   if (!clients || clients.size === 0) return;
 
   for (const client of [...clients]) {
+    // Cursor-mode waiters read their own unread backlog from the DB (excluding their own messages);
+    // they only resolve when something is really unread, or when released (empty list = shutdown).
+    if (client.tryDeliver && !client.tryDeliver(messages.length === 0)) continue;
     clearTimeout(client.timeout);
     clients.delete(client);
     try {
-      if (!client.res.headersSent) client.res.json({ messages });
+      if (client.tryDeliver) { /* already answered by tryDeliver */ }
+      else if (!client.res.headersSent) client.res.json({ messages });
     } catch (err) {
       logger.warn('Failed to notify long-poll waiter', { error: err.message });
     }
@@ -58,6 +62,51 @@ export function publishMessage(roomId, message) {
     logger.warn('WebSocket broadcast failed', { error: err.message });
   }
   notifyWaiters(roomId, [message]);
+}
+
+// ---------------------------------------------------------------------------
+// Server-side read cursor (per member)
+// ---------------------------------------------------------------------------
+// Each member has a persistent cursor (members.last_read_id). Without an explicit `since`, reads return
+// the member's UNREAD messages (id > cursor, own messages excluded) in id order, paginated.
+// Default ack mode "auto": the cursor advances to the last message DELIVERED in a successful response.
+// Mode "manual" (auto_ack=false): the cursor only moves on ack_messages(up_to_id) -> at-least-once.
+// With an explicit `since`, legacy behaviour (messages after since, own included); the cursor only
+// auto-advances if since <= cursor (contiguous: nothing unread can be skipped). It never moves backwards.
+
+export function parseBool(v, dflt) {
+  if (v === undefined || v === null || v === '') return dflt;
+  if (typeof v === 'boolean') return v;
+  return !['false', '0', 'no', 'off'].includes(String(v).toLowerCase());
+}
+
+/** Unread backlog page for a member (no side effect). */
+export function peekUnread(member, limit) {
+  const cursor = database.getReadCursor(member.id);
+  return database.getUnread(member.room_id, member.id, cursor, limit);
+}
+
+/**
+ * Finalize a delivery: optionally advance the cursor, and build the cursor info for the response.
+ * @param {object} opts { since: number|0 (explicit since), autoAck: boolean }
+ */
+export function settleDelivery(member, messages, { since = 0, autoAck = true } = {}) {
+  let cursor = database.getReadCursor(member.id);
+  if (autoAck && messages.length > 0 && (!since || since <= cursor)) {
+    cursor = database.ackUpTo(member.id, messages[messages.length - 1].id);
+  }
+  return {
+    last_read_id: cursor,
+    unread_remaining: database.countUnread(member.room_id, member.id, cursor)
+  };
+}
+
+/** Explicit acknowledgement. Returns { last_read_id, unread_remaining }. */
+export function ackMessages(member, upToId) {
+  const n = Number(upToId);
+  if (!Number.isInteger(n) || n < 0) throw new Error('up_to_id must be a non-negative integer');
+  const cursor = database.ackUpTo(member.id, n);
+  return { acked: true, last_read_id: cursor, unread_remaining: database.countUnread(member.room_id, member.id, cursor) };
 }
 
 // ---------------------------------------------------------------------------

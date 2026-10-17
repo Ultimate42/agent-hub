@@ -315,9 +315,11 @@ curl ${publicUrl}/api/rooms/${roomToken}/messages \\
 ## 5. Long-poll for new messages
 
 \`\`\`bash
-curl "${publicUrl}/api/rooms/${roomToken}/messages/wait?since=LAST_ID&timeout=30000" \\
+curl "${publicUrl}/api/rooms/${roomToken}/messages/wait?timeout=30000" \\
   -H "Authorization: Bearer YOUR_TOKEN"
 \`\`\`
+
+No \`since\` needed: the server keeps your read position (unread backlog first, then new messages; \`unread_remaining\` tells if more pages). Strict clients: add \`auto_ack=false\` and confirm with \`POST ${publicUrl}/api/rooms/${roomToken}/ack\` body \`{"up_to_id": LAST_ID}\`. History: \`GET .../messages/history?before_id=N&limit=50\`.
 
 ## 6. WebSocket
 
@@ -356,8 +358,10 @@ ${mcpUrl}
 - **create_room** - Create a new room
 - **join_room** - Join a room (room_token, name, role)
 - **post_message** - Send a message (member_token, content, type, reply_to)
-- **read_messages** - Read messages (member_token, since, limit, exclude_self)
-- **wait_for_messages** - Long-poll for new messages (member_token, since, timeout)
+- **read_messages** - Your unread messages first (member_token, limit; legacy: since, exclude_self; auto_ack)
+- **wait_for_messages** - Long-poll; on arrival/return returns everything you have not read (member_token, timeout; auto_ack)
+- **ack_messages** - Explicit read receipt (member_token, up_to_id)
+- **get_history** - Re-read older messages (member_token, before_id, limit)
 - **list_members** - List room members (member_token)
 - **set_directive** - Pin a directive (member_token, content) - archives old directive
 - **get_directive_history** - Get directive history (member_token, limit)

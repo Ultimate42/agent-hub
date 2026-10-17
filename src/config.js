@@ -23,7 +23,7 @@ export const config = {
   maxMessagesPerRequest: 100,
   maxMembersPerRoom: 50,
   maxRoomsPerHour: 10,
-  rateLimitPerMinute: 60,
+  rateLimitPerMinute: parseInt(process.env.HUB_RATE_LIMIT_PER_MINUTE || '60', 10),
   longPollTimeout: 30000, // 30 seconds
 
   // CORS

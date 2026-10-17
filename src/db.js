@@ -123,6 +123,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_wake_notifications_member_msg ON wake_notifications(member_id, message_id);
 `);
 
+// Migration (idempotent, no data loss): server-side read cursor per member (a member belongs to one room).
+// Existing members start at the current last message id of their room: clients that kept their own
+// since_id keep working, and nothing already delivered is replayed as "unread".
+const memberCols = db.prepare('PRAGMA table_info(members)').all().map(c => c.name);
+if (!memberCols.includes('last_read_id')) {
+  db.transaction(() => {
+    db.exec('ALTER TABLE members ADD COLUMN last_read_id INTEGER');
+    db.exec(`UPDATE members SET last_read_id =
+      COALESCE((SELECT MAX(id) FROM messages WHERE messages.room_id = members.room_id), 0)`);
+  })();
+}
+
 logger.info('Database initialized', { path: config.dbPath });
 
 // Prepared statements
@@ -147,8 +159,8 @@ const stmts = {
 
   // Members
   createMember: db.prepare(`
-    INSERT INTO members (room_id, token, name, role, permissions)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO members (room_id, token, name, role, permissions, last_read_id)
+    VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(id) FROM messages WHERE room_id = ?), 0))
   `),
   getMemberByToken: db.prepare(`
     SELECT m.*, r.token as room_token, r.id as room_id
@@ -211,6 +223,34 @@ const stmts = {
     WHERE m.room_id = ? AND m.id > ?
     ORDER BY m.id ASC
     LIMIT ?
+  `),
+  getUnread: db.prepare(`
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at,
+           mem.name as author, mem.role as author_role
+    FROM messages m
+    LEFT JOIN members mem ON m.member_id = mem.id
+    WHERE m.room_id = ? AND m.id > ? AND m.member_id IS NOT ?
+    ORDER BY m.id ASC
+    LIMIT ?
+  `),
+  countUnread: db.prepare(`
+    SELECT COUNT(*) as n FROM messages WHERE room_id = ? AND id > ? AND member_id IS NOT ?
+  `),
+  getMessagesBefore: db.prepare(`
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at,
+           mem.name as author, mem.role as author_role
+    FROM messages m
+    LEFT JOIN members mem ON m.member_id = mem.id
+    WHERE m.room_id = ? AND m.id < ?
+    ORDER BY m.id DESC
+    LIMIT ?
+  `),
+  getReadCursor: db.prepare(`SELECT COALESCE(last_read_id, 0) as c FROM members WHERE id = ?`),
+  // Monotonic: the cursor never moves backwards, never beyond the room's last message.
+  ackCursor: db.prepare(`
+    UPDATE members SET last_read_id = MAX(COALESCE(last_read_id, 0),
+      MIN(?, COALESCE((SELECT MAX(id) FROM messages WHERE room_id = members.room_id), 0)))
+    WHERE id = ?
   `),
   getLastMessageId: db.prepare(`
     SELECT MAX(id) as last_id FROM messages WHERE room_id = ?
@@ -337,7 +377,7 @@ export const database = {
 
   // Member operations
   createMember(roomId, token, name, role = 'agent', permissions = 'rw') {
-    const result = stmts.createMember.run(roomId, token, name, role, permissions);
+    const result = stmts.createMember.run(roomId, token, name, role, permissions, roomId);
     return result.lastInsertRowid;
   },
 
@@ -385,6 +425,34 @@ export const database = {
 
   getMessagesSince(roomId, sinceId, limit = 100) {
     return stmts.getMessagesSince.all(roomId, sinceId, limit);
+  },
+
+  // --- Server-side read cursor (per member; a member belongs to a single room) ---
+  getReadCursor(memberId) {
+    return stmts.getReadCursor.get(memberId)?.c || 0;
+  },
+
+  getUnread(roomId, memberId, cursor, limit = 100) {
+    return stmts.getUnread.all(roomId, cursor, memberId, limit);
+  },
+
+  countUnread(roomId, memberId, cursor = this.getReadCursor(memberId)) {
+    return stmts.countUnread.get(roomId, cursor, memberId).n;
+  },
+
+  /** Advance the cursor to upToId (clamped to the room's last id). Never goes backwards. Returns new cursor. */
+  ackUpTo(memberId, upToId) {
+    stmts.ackCursor.run(upToId, memberId);
+    return this.getReadCursor(memberId);
+  },
+
+  /** Older history (id < beforeId, newest first reversed to ascending). Does not touch any cursor. */
+  getMessagesBefore(roomId, beforeId, limit = 50) {
+    return stmts.getMessagesBefore.all(roomId, beforeId, limit).reverse();
+  },
+
+  messageExistsBefore(roomId, id) {
+    return stmts.getMessagesBefore.all(roomId, id, 1).length > 0;
   },
 
   getLastMessageId(roomId) {
