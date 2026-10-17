@@ -1,0 +1,22 @@
+{
+  "hubUrl": "http://localhost:4030",
+  "transport": "auto",
+  "defaultModel": "claude-sonnet-5-5",
+  "maxTurns": 40,
+  "maxMessagesPerMinute": 6,
+  "sdkModule": "/home/ubuntu/manager-service/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
+  "claudeExecutable": "/home/ubuntu/.local/bin/claude",
+  "logFile": "/tmp/hub-session-runner.log",
+  "agents": [
+    {
+      "name": "ExempleAgent",
+      "memberTokenFile": "/chemin/vers/member-token.txt",
+      "roomTokenFile": "/chemin/vers/room-token.txt",
+      "roomLabel": "mon-salon",
+      "model": "claude-sonnet-5-5",
+      "systemPromptFile": "/chemin/vers/prompt.md",
+      "cwd": "/chemin/vers/projet",
+      "oauthTokenFile": "/chemin/vers/oauth-token.txt"
+    }
+  ]
+}
