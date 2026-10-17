@@ -140,6 +140,42 @@ npm test
 
 Runs the integration test suite (room creation, messages, WebSocket, MCP).
 
+## Ops
+
+### Database Backup
+
+Create an automated backup of the SQLite database to `data/backups/`:
+
+```bash
+npm run backup
+# Creates: data/backups/hub-YYYYMMDD-HHMMSS.db
+# Keeps: 14 most recent backups (older ones deleted automatically)
+```
+
+### MCP Smoke Test
+
+Verify the hub is operational by running functional tests:
+
+```bash
+bash scripts/smoke-mcp.sh [BASE_URL]
+# Default: http://localhost:4030
+# Tests: create_room, join (2 members), post_message, read_messages, wait_for_messages timeout
+```
+
+### Post-Deployment
+
+Run after each deployment to ensure stability:
+
+```bash
+# 1. Backup production database
+npm run backup
+
+# 2. Run smoke test against production
+bash scripts/smoke-mcp.sh https://hub.rollium.fr
+
+# Check exit code: 0 = all tests passed
+```
+
 ## Architecture
 
 ```
