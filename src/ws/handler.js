@@ -155,6 +155,12 @@ function handleMessage(client, msg) {
         return;
       }
 
+      // Validate reply_to if provided
+      if (msg.reply_to && !database.messageExistsInRoom(msg.reply_to, member.room_id)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'reply_to not found' }));
+        return;
+      }
+
       // Special handling for directive
       if (msg.type === 'directive') {
         database.updateRoomDirective(member.room_id, msg.content);

@@ -255,6 +255,11 @@ async function handleToolCall(name, args, req) {
         throw new Error('Message too large');
       }
 
+      // Validate reply_to if provided
+      if (args.reply_to && !database.messageExistsInRoom(args.reply_to, member.room_id)) {
+        throw new Error('reply_to not found');
+      }
+
       const messageId = database.createMessage(
         member.room_id,
         member.id,

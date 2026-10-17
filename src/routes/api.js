@@ -271,6 +271,11 @@ router.post('/rooms/:token/messages', (req, res) => {
     return res.status(413).json({ error: 'Message too large' });
   }
 
+  // Validate reply_to if provided
+  if (reply_to && !database.messageExistsInRoom(reply_to, room.id)) {
+    return res.status(400).json({ error: 'reply_to not found' });
+  }
+
   const messageId = database.createMessage(room.id, member.id, type, content, reply_to);
 
   const newMessage = {
