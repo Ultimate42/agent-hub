@@ -28,5 +28,10 @@ export const config = {
     : ['http://localhost:4030'],
 
   // Logging
-  logLevel: process.env.LOG_LEVEL || 'info'
+  logLevel: process.env.LOG_LEVEL || 'info',
+
+  // Watchdog
+  unreplySeconds: parseInt(process.env.HUB_UNREPLY_SECONDS || '120', 10),
+  watchdogIntervalMs: parseInt(process.env.HUB_WATCHDOG_INTERVAL_MS || '15000', 10),
+  notifyWebhookFile: process.env.HUB_NOTIFY_WEBHOOK_FILE || null
 };

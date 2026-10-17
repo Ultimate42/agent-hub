@@ -207,6 +207,56 @@ router.post('/rooms/:token/join', (req, res) => {
 });
 
 /**
+ * Calculate pending unreplied count for a member
+ */
+function getPendingUnrepliedCount(roomId, memberId) {
+  // Get all messages without limit
+  const allMessages = database.getAllMessages(roomId);
+
+  const members = database.getMembersByRoom(roomId);
+  const member = members.find(m => m.id === memberId);
+  if (!member) return 0;
+
+  let count = 0;
+  for (const msg of allMessages) {
+    if (msg.author === 'HubWatchdog' || msg.author === 'system') continue;
+
+    // Check if message is addressed to this member
+    let addressed = false;
+
+    // Case: reply_to points to member's message
+    if (msg.reply_to) {
+      const replyToMsg = allMessages.find(m => m.id === msg.reply_to);
+      if (replyToMsg?.member_id === memberId) {
+        addressed = true;
+      }
+    }
+
+    // Case: contains @MemberName
+    if (!addressed) {
+      const mentionRegex = new RegExp(`@${member.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (mentionRegex.test(msg.content)) {
+        addressed = true;
+      }
+    }
+
+    if (!addressed) continue;
+
+    // Check if member has replied
+    const hasReply = allMessages.some(m =>
+      m.author === member.name &&
+      m.id > msg.id
+    );
+
+    if (!hasReply) {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+/**
  * GET /api/rooms/:token/members - List members
  */
 router.get('/rooms/:token/members', (req, res) => {
@@ -228,7 +278,8 @@ router.get('/rooms/:token/members', (req, res) => {
         role: m.role,
         last_seen: m.last_seen,
         presence: m.presence,
-        is_you: m.name === member.name
+        is_you: m.name === member.name,
+        pending_unreplied: getPendingUnrepliedCount(room.id, m.id)
       };
       return obj;
     })

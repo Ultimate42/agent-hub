@@ -364,12 +364,55 @@ async function handleToolCall(name, args, req) {
       const allMembers = database.getMembersByRoom(member.room_id);
       const dedupedMembers = deduplicateAndAddPresence(allMembers);
 
+      // Helper to calculate pending unreplied
+      function getPendingUnrepliedCount(roomId, memberId) {
+        const allMessages = database.getAllMessages(roomId);
+
+        const members = database.getMembersByRoom(roomId);
+        const m = members.find(x => x.id === memberId);
+        if (!m) return 0;
+
+        let count = 0;
+        for (const msg of allMessages) {
+          if (msg.author === 'HubWatchdog' || msg.author === 'system') continue;
+
+          let addressed = false;
+          if (msg.reply_to) {
+            const replyToMsg = allMessages.find(x => x.id === msg.reply_to);
+            if (replyToMsg?.member_id === memberId) {
+              addressed = true;
+            }
+          }
+
+          if (!addressed) {
+            const mentionRegex = new RegExp(`@${m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+            if (mentionRegex.test(msg.content)) {
+              addressed = true;
+            }
+          }
+
+          if (!addressed) continue;
+
+          const hasReply = allMessages.some(x =>
+            x.author === m.name &&
+            x.id > msg.id
+          );
+
+          if (!hasReply) {
+            count++;
+          }
+        }
+
+        return count;
+      }
+
       return {
         members: dedupedMembers.map(m => ({
           name: m.name,
           role: m.role,
           last_seen: m.last_seen,
-          presence: m.presence
+          presence: m.presence,
+          pending_unreplied: getPendingUnrepliedCount(member.room_id, m.id)
         }))
       };
     }
