@@ -8,101 +8,138 @@ import { deduplicateAndAddPresence } from '../utils/members.js';
 
 const router = Router();
 
+// Supported MCP protocol versions
+const SUPPORTED_PROTOCOLS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
+const DEFAULT_PROTOCOL = '2025-03-26';
+
+// Rate limiter for room creation via MCP (in-memory, per IP)
+const mcpRoomRateLimitMap = new Map();
+
+// Helper: Get client IP
+function getClientIp(req) {
+  return (
+    req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
+}
+
+// Helper: Check room creation rate limit
+function checkRoomCreationLimit(ip) {
+  const now = Date.now();
+  const key = ip;
+  let record = mcpRoomRateLimitMap.get(key);
+
+  if (!record || now - record.resetTime > 3600000) {
+    // Reset after 1 hour
+    record = { count: 0, resetTime: now };
+    mcpRoomRateLimitMap.set(key, record);
+  }
+
+  if (record.count >= config.maxRoomsPerHour) {
+    return false; // Limit exceeded
+  }
+
+  record.count++;
+  return true;
+}
+
 // MCP Tool definitions
 const MCP_TOOLS = [
   {
     name: 'create_room',
-    description: 'Create a new Agent Hub room for multi-agent communication',
+    description: 'Create a new Agent Hub room for multi-agent collaboration. Returns room_token for sharing with other agents.',
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Room name' }
-      }
+        name: { type: 'string', description: 'Room name (e.g., "Task: summarize document")' }
+      },
+      required: []
     }
   },
   {
     name: 'join_room',
-    description: 'Join an existing Agent Hub room',
+    description: 'Join an existing room using its token. Returns member_token for sending/receiving messages. Call this first after creating/getting a room token.',
     inputSchema: {
       type: 'object',
       properties: {
-        room_token: { type: 'string', description: 'Room token from URL' },
-        name: { type: 'string', description: 'Your display name' },
-        role: { type: 'string', description: 'Your role (agent, human, observer)', default: 'agent' }
+        room_token: { type: 'string', description: 'Room token (e.g., "abcdef1234567890")' },
+        name: { type: 'string', description: 'Your display name (e.g., "ResearchAgent", "Claude-Code-1")' },
+        role: { type: 'string', description: 'Your role: agent, human, or observer. Defaults to agent.', enum: ['agent', 'human', 'observer'] }
       },
       required: ['room_token', 'name']
     }
   },
   {
     name: 'post_message',
-    description: 'Send a message to the room',
+    description: 'Send a message to the room. Use after joining. Example: post "I found 3 relevant sources" with type "response".',
     inputSchema: {
       type: 'object',
       properties: {
-        member_token: { type: 'string', description: 'Your member token' },
-        content: { type: 'string', description: 'Message content' },
-        type: { type: 'string', enum: ['message', 'question', 'response', 'directive'], default: 'message' },
-        reply_to: { type: 'number', description: 'ID of message to reply to' }
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        content: { type: 'string', description: 'Message text (max 64KB)' },
+        type: { type: 'string', enum: ['message', 'question', 'response', 'directive'], description: 'Message type. Defaults to "message".', default: 'message' },
+        reply_to: { type: 'number', description: 'Message ID to reply to (optional)' }
       },
       required: ['member_token', 'content']
     }
   },
   {
     name: 'read_messages',
-    description: 'Read messages from the room',
+    description: 'Fetch messages from the room. Call once after joining, then use wait_for_messages in a loop.',
     inputSchema: {
       type: 'object',
       properties: {
-        member_token: { type: 'string', description: 'Your member token' },
-        since: { type: 'number', description: 'Get messages after this ID' },
-        limit: { type: 'number', description: 'Max messages to return', default: 50 }
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        since: { type: 'number', description: 'Return messages after this ID (optional)' },
+        limit: { type: 'number', description: 'Max messages to return. Defaults to 50, max 100.' }
       },
       required: ['member_token']
     }
   },
   {
     name: 'wait_for_messages',
-    description: 'Wait for new messages (long-poll). Blocks until new messages arrive or timeout.',
+    description: 'Long-poll for new messages. Blocks up to timeout_ms and returns immediately when messages arrive. Loop this after calling read_messages. Timeout capped at 25 seconds.',
     inputSchema: {
       type: 'object',
       properties: {
-        member_token: { type: 'string', description: 'Your member token' },
+        member_token: { type: 'string', description: 'Your member token from join_room' },
         since: { type: 'number', description: 'Wait for messages after this ID' },
-        timeout: { type: 'number', description: 'Timeout in ms (max 30000)', default: 30000 }
+        timeout: { type: 'number', description: 'Max wait time in ms. Defaults to 20000, capped at 25000.' }
       },
       required: ['member_token']
     }
   },
   {
     name: 'list_members',
-    description: 'List all members in the room',
+    description: 'List all members currently in the room with their status.',
     inputSchema: {
       type: 'object',
       properties: {
-        member_token: { type: 'string', description: 'Your member token' }
+        member_token: { type: 'string', description: 'Your member token from join_room' }
       },
       required: ['member_token']
     }
   },
   {
     name: 'set_directive',
-    description: 'Set a pinned directive visible to all members',
+    description: 'Set a pinned directive (e.g., "Summarize in < 200 words") visible to all members.',
     inputSchema: {
       type: 'object',
       properties: {
-        member_token: { type: 'string', description: 'Your member token' },
-        content: { type: 'string', description: 'Directive content' }
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        content: { type: 'string', description: 'Directive text' }
       },
       required: ['member_token', 'content']
     }
   },
   {
     name: 'leave_room',
-    description: 'Leave the room',
+    description: 'Leave the room and invalidate your member token.',
     inputSchema: {
       type: 'object',
       properties: {
-        member_token: { type: 'string', description: 'Your member token' }
+        member_token: { type: 'string', description: 'Your member token from join_room' }
       },
       required: ['member_token']
     }
@@ -122,9 +159,15 @@ function jsonRpcError(id, code, message) {
 }
 
 // Handle tool calls
-async function handleToolCall(name, args) {
+async function handleToolCall(name, args, req) {
   switch (name) {
     case 'create_room': {
+      // Rate limit check
+      const ip = getClientIp(req);
+      if (!checkRoomCreationLimit(ip)) {
+        throw new Error('Rate limit exceeded: max 10 rooms per hour');
+      }
+
       const roomToken = generateToken(config.tokenLength);
       const adminToken = generateToken(config.adminTokenLength);
       const roomId = database.createRoom(roomToken, adminToken, args.name || 'Untitled Room');
@@ -142,7 +185,7 @@ async function handleToolCall(name, args) {
     case 'join_room': {
       const room = database.getRoomByToken(args.room_token);
       if (!room) {
-        throw new Error('Room not found');
+        throw new Error('Invalid room_token. Check the room URL or create a new room with create_room.');
       }
 
       // Check if member with same name already exists (idempotent)
@@ -188,7 +231,7 @@ async function handleToolCall(name, args) {
     case 'post_message': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
-        throw new Error('Invalid member token');
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
       if (!member.permissions.includes('w')) {
@@ -223,7 +266,7 @@ async function handleToolCall(name, args) {
     case 'read_messages': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
-        throw new Error('Invalid member token');
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
       database.updateMemberLastSeen(member.id);
@@ -249,13 +292,14 @@ async function handleToolCall(name, args) {
     case 'wait_for_messages': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
-        throw new Error('Invalid member token');
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
       database.updateMemberLastSeen(member.id);
 
       const since = args.since || database.getLastMessageId(member.room_id);
-      const timeout = Math.min(args.timeout || config.longPollTimeout, config.longPollTimeout);
+      // Cap timeout at 25 seconds to stay under client timeouts
+      const timeout = Math.min(args.timeout || 20000, 25000);
 
       // Check for existing messages first
       const existing = database.getMessagesSince(member.room_id, since, config.maxMessagesPerRequest);
@@ -295,7 +339,7 @@ async function handleToolCall(name, args) {
     case 'list_members': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
-        throw new Error('Invalid member token');
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
       const allMembers = database.getMembersByRoom(member.room_id);
@@ -314,7 +358,7 @@ async function handleToolCall(name, args) {
     case 'set_directive': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
-        throw new Error('Invalid member token');
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
       if (!member.permissions.includes('w')) {
@@ -329,7 +373,7 @@ async function handleToolCall(name, args) {
     case 'leave_room': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
-        throw new Error('Invalid member token');
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
       database.deleteMember(member.id);
@@ -343,76 +387,161 @@ async function handleToolCall(name, args) {
 }
 
 /**
- * POST /mcp - MCP Streamable HTTP endpoint
+ * Handle a single JSON-RPC request
  */
-router.post('/', async (req, res) => {
-  const body = req.body;
-
-  if (!body || !body.jsonrpc) {
-    return res.status(400).json(jsonRpcError(null, -32600, 'Invalid Request'));
-  }
-
-  const { id, method, params } = body;
+async function handleJsonRpcRequest(req, requestBody) {
+  const { id, method, params } = requestBody;
 
   try {
     switch (method) {
-      case 'initialize':
-        // Get or create session
-        const sessionId = req.get('Mcp-Session-Id') || generateToken(16);
-        sessions.set(sessionId, { created: Date.now() });
+      case 'initialize': {
+        // Negotiate protocol version
+        const clientVersion = params?.protocolVersion;
+        const negotiatedVersion = clientVersion && SUPPORTED_PROTOCOLS.includes(clientVersion)
+          ? clientVersion
+          : DEFAULT_PROTOCOL;
 
-        res.set('Mcp-Session-Id', sessionId);
-        return res.json(jsonRpcResponse(id, {
-          protocolVersion: '2025-03-26',
+        const sessionId = req.get('Mcp-Session-Id') || generateToken(16);
+        sessions.set(sessionId, { created: Date.now(), version: negotiatedVersion });
+
+        req.mcpSessionId = sessionId;
+
+        return jsonRpcResponse(id, {
+          protocolVersion: negotiatedVersion,
           capabilities: {
             tools: {}
           },
           serverInfo: {
             name: 'agent-hub',
             version: '1.0.0'
-          }
-        }));
+          },
+          instructions: '1) call join_room with room_token + your name, keep member_token\n2) call read_messages then loop wait_for_messages (timeout<=25s)\n3) answer with post_message. If you have no room_token call create_room.'
+        });
+      }
+
+      case 'ping':
+        return jsonRpcResponse(id, {});
 
       case 'tools/list':
-        return res.json(jsonRpcResponse(id, { tools: MCP_TOOLS }));
+        return jsonRpcResponse(id, { tools: MCP_TOOLS });
 
-      case 'tools/call':
+      case 'tools/call': {
         const { name, arguments: args } = params || {};
 
         if (!name) {
-          return res.json(jsonRpcError(id, -32602, 'Tool name required'));
+          return jsonRpcError(id, -32602, 'Tool name required');
         }
 
         try {
-          const result = await handleToolCall(name, args || {});
-          return res.json(jsonRpcResponse(id, {
+          const result = await handleToolCall(name, args || {}, req);
+          return jsonRpcResponse(id, {
             content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
-          }));
+          });
         } catch (err) {
           logger.warn('MCP tool error', { tool: name, error: err.message });
-          return res.json(jsonRpcResponse(id, {
+          return jsonRpcResponse(id, {
             content: [{ type: 'text', text: `Error: ${err.message}` }],
             isError: true
-          }));
+          });
         }
+      }
 
-      case 'notifications/initialized':
-        // Client is ready, acknowledge
-        return res.status(204).end();
+      case 'resources/list':
+        return jsonRpcResponse(id, { resources: [] });
 
+      case 'resources/templates/list':
+        return jsonRpcResponse(id, { resourceTemplates: [] });
+
+      case 'prompts/list':
+        return jsonRpcResponse(id, { prompts: [] });
+
+      case 'logging/setLevel':
+        return jsonRpcResponse(id, {});
+
+      // Handle all notification methods (return 204 or nothing)
       default:
-        return res.json(jsonRpcError(id, -32601, `Method not found: ${method}`));
+        if (method && method.startsWith('notifications/')) {
+          return null; // Will be handled as 204
+        }
+        return jsonRpcError(id, -32601, `Method not found: ${method}`);
     }
   } catch (error) {
     logger.error('MCP error', { error: error.message });
-    return res.json(jsonRpcError(id, -32603, 'Internal error'));
+    return jsonRpcError(id, -32603, 'Internal error');
   }
+}
+
+/**
+ * POST /mcp - MCP Streamable HTTP endpoint
+ */
+router.post('/', async (req, res) => {
+  const body = req.body;
+
+  if (!body) {
+    return res.status(400).json(jsonRpcError(null, -32600, 'Invalid Request'));
+  }
+
+  // Handle batch requests (array of requests)
+  if (Array.isArray(body)) {
+    const responses = [];
+
+    for (const item of body) {
+      if (!item || !item.jsonrpc) {
+        responses.push(jsonRpcError(null, -32600, 'Invalid Request'));
+        continue;
+      }
+
+      const response = await handleJsonRpcRequest(req, item);
+      // Only include responses with an id (skip notifications)
+      if (response !== null && item.id !== undefined) {
+        // Set session header on first response
+        if (req.mcpSessionId && !res.headersSent) {
+          res.set('Mcp-Session-Id', req.mcpSessionId);
+        }
+        responses.push(response);
+      }
+    }
+
+    // Return batch response
+    if (responses.length === 0) {
+      return res.status(204).end();
+    }
+    return res.json(responses);
+  }
+
+  // Single request
+  if (!body.jsonrpc) {
+    return res.status(400).json(jsonRpcError(null, -32600, 'Invalid Request'));
+  }
+
+  const response = await handleJsonRpcRequest(req, body);
+
+  // Handle notification (no id): return 204
+  if (body.id === undefined) {
+    return res.status(204).end();
+  }
+
+  // Handle initialize or other responses that set session header
+  if (req.mcpSessionId) {
+    res.set('Mcp-Session-Id', req.mcpSessionId);
+  }
+
+  return res.json(response);
 });
 
 /**
  * GET /mcp - SSE stream for server notifications
  */
 router.get('/', (req, res) => {
+  // Check if client accepts text/event-stream
+  const accept = req.get('Accept') || '';
+  if (!accept.includes('text/event-stream')) {
+    return res.status(405).json({
+      error: 'Must accept text/event-stream',
+      acceptableMediaTypes: ['text/event-stream']
+    });
+  }
+
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -422,10 +551,10 @@ router.get('/', (req, res) => {
   // Send initial ping
   res.write('event: ping\ndata: {}\n\n');
 
-  // Keep alive
+  // Keep-alive every 15 seconds
   const keepAlive = setInterval(() => {
-    res.write('event: ping\ndata: {}\n\n');
-  }, 30000);
+    res.write(': keepalive\n\n');
+  }, 15000);
 
   req.on('close', () => {
     clearInterval(keepAlive);
