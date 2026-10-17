@@ -10,6 +10,7 @@ import webRoutes from './routes/web.js';
 import setupRoutes from './routes/setup.js';
 import designRoutes from './routes/design.js';
 import coordinationRoutes from './routes/coordination.js';
+import wakeTargetsRoutes from './routes/wake-targets.js';
 import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
 import Database from 'better-sqlite3';
 
@@ -50,6 +51,7 @@ app.use((req, res, next) => {
 // Routes
 app.use('/api', apiRoutes);
 app.use('/api', coordinationRoutes); // /api/rooms/:token/coordination/*
+app.use('/api', wakeTargetsRoutes); // /api/members/wake-target
 app.use('/mcp', mcpRoutes);
 app.use(setupRoutes);  // /r/:token/setup
 app.use(designRoutes); // /design, /r/:token/design
