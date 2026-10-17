@@ -293,6 +293,10 @@ router.post('/rooms/:token/messages', (req, res) => {
 
 /**
  * GET /api/rooms/:token/messages - Read messages
+ * Query params:
+ *   since: return messages after this ID
+ *   limit: max messages (default 50, max 100)
+ *   exclude_self: if true, exclude messages from the calling member
  */
 router.get('/rooms/:token/messages', (req, res) => {
   const member = requireMember(req, res);
@@ -305,12 +309,18 @@ router.get('/rooms/:token/messages', (req, res) => {
 
   const since = parseInt(req.query.since, 10) || 0;
   const limit = Math.min(parseInt(req.query.limit, 10) || 50, config.maxMessagesPerRequest);
+  const excludeSelf = req.query.exclude_self === 'true';
 
   let messages;
   if (since > 0) {
     messages = database.getMessagesSince(room.id, since, limit);
   } else {
     messages = database.getMessages(room.id, limit);
+  }
+
+  // Filter out self messages if exclude_self is true
+  if (excludeSelf) {
+    messages = messages.filter(msg => msg.author !== member.name);
   }
 
   res.json({
@@ -367,7 +377,7 @@ router.get('/rooms/:token/messages/wait', (req, res) => {
 });
 
 /**
- * POST /api/rooms/:token/directive - Set room directive
+ * POST /api/rooms/:token/directive - Set room directive (archives old directive)
  */
 router.post('/rooms/:token/directive', (req, res) => {
   const member = requireMember(req, res);
@@ -388,11 +398,29 @@ router.post('/rooms/:token/directive', (req, res) => {
     return res.status(400).json({ error: 'Content is required' });
   }
 
-  database.updateRoomDirective(room.id, content);
+  database.updateRoomDirective(room.id, content, member.name);
 
   logger.info('Directive updated', { roomId: room.id, by: member.name });
 
   res.json({ success: true, directive: content });
+});
+
+/**
+ * GET /api/rooms/:token/directive/history - Get directive history (read-only)
+ */
+router.get('/rooms/:token/directive/history', (req, res) => {
+  const member = requireMember(req, res);
+  if (!member) return;
+
+  const room = database.getRoomByToken(req.params.token);
+  if (!room || room.id !== member.room_id) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+  const history = database.getDirectiveHistory(room.id, limit);
+
+  res.json({ history });
 });
 
 /**

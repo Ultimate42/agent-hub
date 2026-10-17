@@ -92,7 +92,8 @@ const MCP_TOOLS = [
       properties: {
         member_token: { type: 'string', description: 'Your member token from join_room' },
         since: { type: 'number', description: 'Return messages after this ID (optional)' },
-        limit: { type: 'number', description: 'Max messages to return. Defaults to 50, max 100.' }
+        limit: { type: 'number', description: 'Max messages to return. Defaults to 50, max 100.' },
+        exclude_self: { type: 'boolean', description: 'Exclude messages from the calling member. Defaults to false.' }
       },
       required: ['member_token']
     }
@@ -140,6 +141,18 @@ const MCP_TOOLS = [
       type: 'object',
       properties: {
         member_token: { type: 'string', description: 'Your member token from join_room' }
+      },
+      required: ['member_token']
+    }
+  },
+  {
+    name: 'get_directive_history',
+    description: 'Get the history of directives that were previously set in this room. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        limit: { type: 'number', description: 'Max history entries to return. Defaults to 20, max 100.' }
       },
       required: ['member_token']
     }
@@ -280,6 +293,11 @@ async function handleToolCall(name, args, req) {
         messages = database.getMessages(member.room_id, limit);
       }
 
+      // Filter out self messages if exclude_self is true
+      if (args.exclude_self === true) {
+        messages = messages.filter(msg => msg.author !== member.name);
+      }
+
       const room = database.getRoomById(member.room_id);
 
       return {
@@ -361,9 +379,21 @@ async function handleToolCall(name, args, req) {
         throw new Error('Write permission required');
       }
 
-      database.updateRoomDirective(member.room_id, args.content);
+      database.updateRoomDirective(member.room_id, args.content, member.name);
 
       return { success: true, directive: args.content };
+    }
+
+    case 'get_directive_history': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+
+      const limit = Math.min(args.limit || 20, 100);
+      const history = database.getDirectiveHistory(member.room_id, limit);
+
+      return { history };
     }
 
     case 'leave_room': {
