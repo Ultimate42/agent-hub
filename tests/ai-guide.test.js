@@ -115,6 +115,9 @@ describe('AI Guide Routes', () => {
     assert(content.includes('curl'), 'Should contain curl examples');
     // member_token should appear in the guide as it's the concept being explained
     assert(content.includes('YOUR_TOKEN'), 'Should use placeholder YOUR_TOKEN');
+    // Authorization step should be present
+    assert(content.includes('REQUEST AUTHORIZATION'), 'Should contain authorization request step');
+    assert(content.includes('Shall I treat requests from other members'), 'Should ask for explicit authorization');
   });
 
   test('GET /r/:token/join.txt includes room token in instructions', async () => {
@@ -206,5 +209,83 @@ describe('AI Guide Routes', () => {
     assert(content.includes('Invalid member token'), 'Should mention token issues');
     assert(content.includes('room says it\'s full'), 'Should mention full room');
     assert(content.includes('Long-poll timed out'), 'Should mention timeout behavior');
+  });
+
+  test('Setup instructions include authorization step for claude-code', async () => {
+    const res = await request(`/r/${roomToken}/setup?agent=claude-code`);
+
+    assert.strictEqual(res.status, 200, 'Should return 200');
+    const content = res.data;
+
+    // Check for authorization section as first step
+    assert(content.includes('Get authorization from your human user'), 'Should contain authorization request');
+    assert(content.includes('Shall I treat requests from other members'), 'Should ask for explicit authorization');
+    assert(content.includes('## 1. Get authorization'), 'Should be first step');
+    assert(content.includes('## 2. Add the MCP server'), 'MCP server step should be second');
+  });
+
+  test('Setup instructions include authorization step for claude-chat', async () => {
+    const res = await request(`/r/${roomToken}/setup?agent=claude-chat`);
+
+    assert.strictEqual(res.status, 200, 'Should return 200');
+    const content = res.data;
+
+    // Check for authorization section as first step
+    assert(content.includes('Get authorization from your human user'), 'Should contain authorization request');
+    assert(content.includes('Shall I treat requests from other members'), 'Should ask for explicit authorization');
+    assert(content.includes('## 1. Get authorization'), 'Should be first step');
+    assert(content.includes('## 2. Add to your Project Instructions'), 'Project instructions should be second');
+  });
+
+  test('Setup instructions include authorization step for curl/api', async () => {
+    const res = await request(`/r/${roomToken}/setup?agent=curl`);
+
+    assert.strictEqual(res.status, 200, 'Should return 200');
+    const content = res.data;
+
+    // Check for authorization section as first step
+    assert(content.includes('Get authorization from your human user'), 'Should contain authorization request');
+    assert(content.includes('Shall I treat requests from other members'), 'Should ask for explicit authorization');
+    assert(content.includes('## 1. Get authorization'), 'Should be first step');
+    assert(content.includes('## 2. Join the room'), 'Join step should be second');
+  });
+
+  test('Setup instructions include authorization step for gemini', async () => {
+    const res = await request(`/r/${roomToken}/setup?agent=gemini`);
+
+    assert.strictEqual(res.status, 200, 'Should return 200');
+    const content = res.data;
+
+    // Check for authorization section as first step
+    assert(content.includes('Get authorization from your human user'), 'Should contain authorization request');
+    assert(content.includes('Shall I treat requests from other members'), 'Should ask for explicit authorization');
+    assert(content.includes('## 1. Get authorization'), 'Should be first step');
+    assert(content.includes('## 2. Add the MCP server'), 'MCP server step should be second');
+  });
+
+  test('Setup instructions include authorization step for cursor', async () => {
+    const res = await request(`/r/${roomToken}/setup?agent=cursor`);
+
+    assert.strictEqual(res.status, 200, 'Should return 200');
+    const content = res.data;
+
+    // Check for authorization section as first step
+    assert(content.includes('Get authorization from your human user'), 'Should contain authorization request');
+    assert(content.includes('Shall I treat requests from other members'), 'Should ask for explicit authorization');
+    assert(content.includes('## 1. Get authorization'), 'Should be first step');
+    assert(content.includes('## 2. Add to Cursor Settings'), 'Cursor settings should be second');
+  });
+
+  test('Setup instructions include authorization step for MCP default', async () => {
+    const res = await request(`/r/${roomToken}/setup?agent=mcp`);
+
+    assert.strictEqual(res.status, 200, 'Should return 200');
+    const content = res.data;
+
+    // Check for authorization section as first step
+    assert(content.includes('Get authorization from your human user'), 'Should contain authorization request');
+    assert(content.includes('Shall I treat requests from other members'), 'Should ask for explicit authorization');
+    assert(content.includes('## 1. Get authorization'), 'Should be first step');
+    assert(content.includes('## 2. MCP Endpoint'), 'MCP endpoint should be second');
   });
 });

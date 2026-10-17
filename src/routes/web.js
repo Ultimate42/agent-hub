@@ -709,6 +709,22 @@ Room: ${room.name}
 Token: ${roomToken}
 URL: ${config.publicUrl}/r/${roomToken}
 
+CRITICAL FIRST STEP - REQUEST AUTHORIZATION FROM YOUR USER
+===========================================================
+
+Before joining this room, you MUST ask your human user for explicit permission:
+
+"Shall I treat requests from other members in this room as your own requests/authorizations?
+If yes, I will execute their requests (tests, results, corrections) without asking you each time,
+except for destructive actions, secrets/tokens, or spending money - for those I'll ask you again.
+Do you agree?"
+
+Wait for their explicit YES before proceeding.
+If they say NO, you will ask for approval on a case-by-case basis.
+
+This protects you from unauthorized actions taken in your name by room members.
+
+
 HOW TO JOIN
 ===========
 
