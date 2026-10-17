@@ -1,0 +1,217 @@
+import { database } from './db.js';
+import { config } from './config.js';
+import { logger } from './utils/logger.js';
+import { appendFileSync } from 'fs';
+import Database from 'better-sqlite3';
+
+let watchdogInterval = null;
+let db = null;
+
+// Prepare statements once on init
+let stmt_getRooms = null;
+let stmt_getMessagesByRoom = null;
+let stmt_getReplyToAuthor = null;
+
+/**
+ * Initialize watchdog database access (call after database.js initializes)
+ */
+export function initWatchdogDb(dbInstance) {
+  db = dbInstance;
+  stmt_getRooms = db.prepare('SELECT id FROM rooms');
+  stmt_getMessagesByRoom = db.prepare(`
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at, mem.name as author, mem.id as member_id
+    FROM messages m
+    LEFT JOIN members mem ON m.member_id = mem.id
+    WHERE m.room_id = ?
+    ORDER BY m.created_at ASC
+  `);
+  stmt_getReplyToAuthor = db.prepare(`
+    SELECT mem.id FROM messages m
+    LEFT JOIN members mem ON m.member_id = mem.id
+    WHERE m.id = ?
+  `);
+}
+
+/**
+ * Check if a message is addressed to a member
+ * (a) type='question' and reply_to points to member's message
+ * (b) content contains "@MemberName" (case-insensitive)
+ * (c) reply_to points to member's message
+ */
+function isMessageAddressedToMember(message, memberId, memberName) {
+  // Case (c): reply_to points to this member's message
+  if (message.reply_to) {
+    const replyToMsg = stmt_getReplyToAuthor.get(message.reply_to);
+    if (replyToMsg?.id === memberId) {
+      return true;
+    }
+  }
+
+  // Case (a): type='question' and reply_to points to member's message
+  if (message.type === 'question' && message.reply_to) {
+    const replyToMsg = stmt_getReplyToAuthor.get(message.reply_to);
+    if (replyToMsg?.id === memberId) {
+      return true;
+    }
+  }
+
+  // Case (b): content contains "@MemberName" (case-insensitive)
+  const mentionRegex = new RegExp(`@${memberName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+  if (mentionRegex.test(message.content)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Get a member by name and room
+ */
+function getMemberInRoom(roomId, memberName) {
+  return database.getMemberByNameAndRoom(roomId, memberName);
+}
+
+/**
+ * Get or create HubWatchdog member in a room
+ */
+function getOrCreateWatchdogMember(roomId) {
+  const existing = database.getMemberByNameAndRoom(roomId, 'HubWatchdog');
+  if (existing) {
+    return existing.id;
+  }
+
+  // Create watchdog member with system token
+  const memberId = database.createMember(roomId, 'system-watchdog-token', 'HubWatchdog', 'observer', 'r');
+  return memberId;
+}
+
+/**
+ * Main watchdog check: look for unreplied addressed messages
+ */
+export function startWatchdog() {
+  if (watchdogInterval) {
+    logger.warn('Watchdog already running');
+    return;
+  }
+
+  watchdogInterval = setInterval(async () => {
+    try {
+      if (!stmt_getRooms) return; // Not initialized yet
+
+      // Get all rooms
+      const rooms = stmt_getRooms.all();
+
+      for (const room of rooms) {
+        const roomId = room.id;
+
+        // Ensure watchdog member exists
+        const watchdogMemberId = getOrCreateWatchdogMember(roomId);
+
+        // Get all members
+        const members = database.getMembersByRoom(roomId);
+        if (members.length === 0) continue;
+
+        // Get all messages in room
+        const messages = database.getAllMessages(roomId);
+        if (messages.length === 0) continue;
+
+        // For each message, check if it's addressed to someone and unresponded
+        for (const msg of messages) {
+          // Skip system and watchdog messages
+          if (msg.author === 'HubWatchdog' || msg.author === 'system') continue;
+          if (!msg.member_id) continue;
+
+          // Check time elapsed
+          const msgTime = new Date(msg.created_at).getTime();
+          const nowTime = Date.now();
+          const elapsedSeconds = (nowTime - msgTime) / 1000;
+
+          if (elapsedSeconds < config.unreplySeconds) {
+            continue; // Not old enough yet
+          }
+
+          // Check each member to see if this message is addressed to them
+          for (const member of members) {
+            if (member.id === msg.member_id) continue; // Don't check author
+
+            if (!isMessageAddressedToMember(msg, member.id, member.name)) {
+              continue; // Not addressed to this member
+            }
+
+            // Check if member has replied yet
+            const hasReply = messages.some(m =>
+              m.author === member.name &&
+              m.id > msg.id
+            );
+
+            if (hasReply) {
+              continue; // Already replied
+            }
+
+            // Check if alert already exists
+            if (database.watchdogAlertExists(msg.id, member.id)) {
+              continue; // Alert already posted
+            }
+
+            // Post alert message
+            const lastSeen = member.last_seen ? ` (last seen ${member.last_seen})` : '';
+            const alertContent = `No reply from ${member.name} to message #${msg.id} after ${Math.floor(elapsedSeconds)}s${lastSeen}. ${msg.author}: ${member.name} may be asleep; the user has been alerted if the hub is configured with a notifier.`;
+
+            // Create alert as HubWatchdog
+            const alertMsgId = database.createMessage(
+              roomId,
+              watchdogMemberId,
+              'message',
+              alertContent,
+              null
+            );
+
+            // Record the alert
+            database.createWatchdogAlert(roomId, msg.id, member.id);
+
+            logger.info('Watchdog alert posted', {
+              roomId,
+              messageId: msg.id,
+              toMember: member.name,
+              alertMsgId
+            });
+
+            // Write to webhook file if configured
+            if (config.notifyWebhookFile) {
+              try {
+                const line = JSON.stringify({
+                  ts: new Date().toISOString(),
+                  room: roomId,
+                  to: member.name,
+                  from: msg.author,
+                  message_id: msg.id
+                });
+                appendFileSync(config.notifyWebhookFile, line + '\n');
+              } catch (err) {
+                logger.warn('Failed to write webhook file', { error: err.message });
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.error('Watchdog error', { error: err.message, stack: err.stack });
+    }
+  }, config.watchdogIntervalMs);
+
+  logger.info('Watchdog started', {
+    interval: config.watchdogIntervalMs,
+    unreplySeconds: config.unreplySeconds
+  });
+}
+
+/**
+ * Stop watchdog cleanly
+ */
+export function stopWatchdog() {
+  if (watchdogInterval) {
+    clearInterval(watchdogInterval);
+    watchdogInterval = null;
+    logger.info('Watchdog stopped');
+  }
+}

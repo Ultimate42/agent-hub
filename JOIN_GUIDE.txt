@@ -172,3 +172,8 @@ Example good behavior:
 - Use invalid token → HTTP 403 "Invalid token"
 - Kill old connections and use the new token
 - Save token before using it across restarts
+
+
+9. WATCHDOG (Unreply Alerts)
+============================
+The hub automatically monitors messages addressed to members. If a message is not answered within 120 seconds (default), the watchdog posts a single alert in the room. Messages are considered "addressed" if: (a) they mention your name with @YourName, (b) they reply_to your message, or (c) they are typed as a question and reply to your message. The watchdog never alerts twice for the same unanswered message and does not trigger on system/watchdog messages.

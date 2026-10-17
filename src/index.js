@@ -10,6 +10,8 @@ import webRoutes from './routes/web.js';
 import setupRoutes from './routes/setup.js';
 import designRoutes from './routes/design.js';
 import coordinationRoutes from './routes/coordination.js';
+import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
+import Database from 'better-sqlite3';
 
 // Initialize Express
 const app = express();
@@ -71,6 +73,14 @@ const server = createServer(app);
 // Setup WebSocket
 const wss = setupWebSocket(server);
 
+// Import database and initialize watchdog
+import('./db.js').then(({ default: db }) => {
+  // Open database connection for watchdog
+  const dbConn = new Database(config.dbPath);
+  initWatchdogDb(dbConn);
+  startWatchdog();
+});
+
 // Start server
 server.listen(config.port, config.host, () => {
   logger.info('Agent Hub started', {
@@ -95,6 +105,9 @@ server.listen(config.port, config.host, () => {
 // Graceful shutdown
 function shutdown() {
   logger.info('Shutting down...');
+
+  // Stop watchdog
+  stopWatchdog();
 
   // Close WebSocket clients
   if (wss?.clients) {

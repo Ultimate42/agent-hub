@@ -11,7 +11,8 @@ if (!existsSync(dbDir)) {
 }
 
 // Initialize database
-const db = new Database(config.dbPath);
+export const dbInstance = new Database(config.dbPath);
+const db = dbInstance;
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
@@ -74,6 +75,16 @@ db.exec(`
     replaced_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
+  -- Watchdog alerts table (tracks which message addressed-to which member has already been alerted)
+  CREATE TABLE IF NOT EXISTS watchdog_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    to_member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    alert_posted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(message_id, to_member_id)
+  );
+
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_rooms_token ON rooms(token);
   CREATE INDEX IF NOT EXISTS idx_members_token ON members(token);
@@ -81,6 +92,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_room_time ON messages(room_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_coordination_events_room ON coordination_events(room_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_directive_history_room ON directive_history(room_id, replaced_at);
+  CREATE INDEX IF NOT EXISTS idx_watchdog_alerts_room ON watchdog_alerts(room_id);
+  CREATE INDEX IF NOT EXISTS idx_watchdog_alerts_msg_member ON watchdog_alerts(message_id, to_member_id);
 `);
 
 logger.info('Database initialized', { path: config.dbPath });
@@ -213,11 +226,24 @@ const stmts = {
     WHERE room_id = ?
     ORDER BY replaced_at DESC
     LIMIT ?
+  `),
+
+  // Watchdog
+  createWatchdogAlert: db.prepare(`
+    INSERT INTO watchdog_alerts (room_id, message_id, to_member_id)
+    VALUES (?, ?, ?)
+  `),
+  watchdogAlertExists: db.prepare(`
+    SELECT 1 FROM watchdog_alerts WHERE message_id = ? AND to_member_id = ? LIMIT 1
   `)
 };
 
 // Database API
 export const database = {
+  // Expose db instance for raw queries (watchdog, etc)
+  db: dbInstance,
+
+
   // Room operations
   createRoom(token, adminToken, name, settings = {}) {
     const result = stmts.createRoom.run(token, adminToken, name, JSON.stringify(settings));
@@ -353,6 +379,35 @@ export const database = {
 
   getDirectiveHistory(roomId, limit = 50) {
     return stmts.getDirectiveHistory.all(roomId, limit);
+  },
+
+  // Get all messages in a room (no limit)
+  getAllMessages(roomId) {
+    return db.prepare(`
+      SELECT m.id, m.type, m.content, m.reply_to, mem.name as author, mem.id as member_id
+      FROM messages m
+      LEFT JOIN members mem ON m.member_id = mem.id
+      WHERE m.room_id = ?
+      ORDER BY m.created_at ASC
+    `).all(roomId);
+  },
+
+  // Watchdog operations
+  createWatchdogAlert(roomId, messageId, toMemberId) {
+    try {
+      const result = stmts.createWatchdogAlert.run(roomId, messageId, toMemberId);
+      return result.lastInsertRowid;
+    } catch (err) {
+      // UNIQUE constraint violation means alert already exists, which is fine
+      if (err.message?.includes('UNIQUE')) {
+        return null;
+      }
+      throw err;
+    }
+  },
+
+  watchdogAlertExists(messageId, toMemberId) {
+    return stmts.watchdogAlertExists.get(messageId, toMemberId) !== undefined;
   },
 
   // Utility
