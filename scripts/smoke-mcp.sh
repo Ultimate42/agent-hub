@@ -174,7 +174,7 @@ echo -n "[tools/call: read_messages] ... "
 READ_MSG_PARAMS='{"name":"read_messages","arguments":{"room_token":"'"$ROOM_TOKEN"'","member_token":"'"$MEMBER_B"'","limit":10}}'
 READ_MSG_RESP=$(mcp_call "tools/call" "$READ_MSG_PARAMS")
 
-if echo "$READ_MSG_RESP" | grep -q '"Hello from Agent A"'; then
+if echo "$READ_MSG_RESP" | grep -q 'Hello from Agent A'; then
   echo "OK"
   PASSED=$((PASSED + 1))
 else
