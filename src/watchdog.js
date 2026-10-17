@@ -2,7 +2,22 @@ import { database } from './db.js';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { appendFileSync } from 'fs';
-import Database from 'better-sqlite3';
+import { generateToken } from './utils/tokens.js';
+import { publishMessage } from './services/messages.js';
+
+const LEGACY_WATCHDOG_TOKEN = 'system-watchdog-token';
+/**
+ * Parse a SQLite CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC, no zone marker)
+ * or an ISO string into epoch ms. Returns NaN if invalid.
+ */
+export function parseDbTime(value) {
+  if (typeof value !== 'string') return NaN;
+  const v = value.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(v)) {
+    return new Date(v.replace(' ', 'T') + 'Z').getTime();
+  }
+  return new Date(v).getTime();
+}
 
 let watchdogInterval = null;
 let db = null;
@@ -77,11 +92,16 @@ function getMemberInRoom(roomId, memberName) {
 function getOrCreateWatchdogMember(roomId) {
   const existing = database.getMemberByNameAndRoom(roomId, 'HubWatchdog');
   if (existing) {
+    // Legacy rows used a constant, publicly guessable token (and a UNIQUE clash for
+    // every room after the first): replace it with a random, never-disclosed one.
+    if (existing.token === LEGACY_WATCHDOG_TOKEN) {
+      database.updateMemberToken(existing.id, generateToken(32));
+    }
     return existing.id;
   }
 
-  // Create watchdog member with system token
-  const memberId = database.createMember(roomId, 'system-watchdog-token', 'HubWatchdog', 'observer', 'r');
+  // The watchdog never authenticates: give it a random token nobody receives
+  const memberId = database.createMember(roomId, generateToken(32), 'HubWatchdog', 'observer', 'r');
   return memberId;
 }
 
@@ -122,7 +142,8 @@ export function startWatchdog() {
           if (!msg.member_id) continue;
 
           // Check time elapsed
-          const msgTime = new Date(msg.created_at).getTime();
+          const msgTime = parseDbTime(msg.created_at);
+          if (Number.isNaN(msgTime)) continue; // never alert on an unparseable timestamp
           const nowTime = Date.now();
           const elapsedSeconds = (nowTime - msgTime) / 1000;
 
@@ -168,6 +189,16 @@ export function startWatchdog() {
 
             // Record the alert
             database.createWatchdogAlert(roomId, msg.id, member.id);
+
+            // Push to WebSocket + long-poll clients as well
+            publishMessage(roomId, {
+              id: Number(alertMsgId),
+              type: 'message',
+              content: alertContent,
+              author: 'HubWatchdog',
+              author_role: 'observer',
+              created_at: new Date().toISOString()
+            });
 
             logger.info('Watchdog alert posted', {
               roomId,

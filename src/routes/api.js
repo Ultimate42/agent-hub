@@ -5,26 +5,17 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
 import { deduplicateAndAddPresence } from '../utils/members.js';
-import { processWakeTargets } from '../wake-targets.js';
+import {
+  postMessage, notifyWaiters, waitingClients, sanitizeName, MEMBER_ROLES
+} from '../services/messages.js';
+import { checkRoomCreationLimit } from '../utils/security.js';
 
 const router = Router();
 
-// Long-poll waiting clients: Map<roomId, Set<{res, since, timeout}>>
-const waitingClients = new Map();
+// Re-exported for backward compatibility (implementation lives in services/messages.js)
+export { notifyWaiters };
 
-/**
- * Notify waiting clients of new messages
- */
-export function notifyWaiters(roomId, messages) {
-  const clients = waitingClients.get(roomId);
-  if (!clients || clients.size === 0) return;
-
-  for (const client of clients) {
-    clearTimeout(client.timeout);
-    client.res.json({ messages });
-    clients.delete(client);
-  }
-}
+const MAX_LONGPOLLS_PER_ROOM = 200;
 
 // Helper: Extract token from Authorization header or query
 function getToken(req) {
@@ -58,14 +49,22 @@ function requireMember(req, res) {
  */
 router.post('/rooms', (req, res) => {
   try {
-    const { name } = req.body || {};
+    if (!checkRoomCreationLimit(req.ip)) {
+      return res.status(429).json({ error: `Rate limit exceeded: max ${config.maxRoomsPerHour} rooms per hour` });
+    }
+
+    let { name } = req.body || {};
+    if (name !== undefined && name !== null && (typeof name !== 'string' || name.length > 200)) {
+      return res.status(400).json({ error: 'name must be a string of at most 200 characters' });
+    }
+    name = (typeof name === 'string' && name.trim()) ? name.trim() : null;
 
     const roomToken = generateToken(config.tokenLength);
     const adminToken = generateToken(config.adminTokenLength);
 
     const roomId = database.createRoom(roomToken, adminToken, name || 'Untitled Room');
 
-    logger.info('Room created', { roomId, name });
+    logger.info('Room created', { roomId });
 
     res.status(201).json({
       room_token: roomToken,
@@ -132,10 +131,15 @@ router.delete('/rooms/:token', (req, res) => {
  */
 router.post('/rooms/:token/join', (req, res) => {
   try {
-    const { name, role = 'agent' } = req.body || {};
+    const body = req.body || {};
+    const name = sanitizeName(body.name);
+    const role = body.role === undefined || body.role === null ? 'agent' : body.role;
 
     if (!name) {
-      return res.status(400).json({ error: 'Name is required' });
+      return res.status(400).json({ error: `Name is required (string, max 64 chars, no control characters)` });
+    }
+    if (typeof role !== 'string' || !MEMBER_ROLES.includes(role)) {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${MEMBER_ROLES.join(', ')}` });
     }
 
     const room = database.getRoomByToken(req.params.token);
@@ -299,58 +303,13 @@ router.post('/rooms/:token/messages', (req, res) => {
     return res.status(403).json({ error: 'Access denied' });
   }
 
-  if (!member.permissions.includes('w')) {
-    return res.status(403).json({ error: 'Write permission required' });
+  const { content, type, reply_to } = req.body || {};
+  const result = postMessage(member, { content, type, reply_to });
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
   }
 
-  // Secure mode: only coordinators (manager/second) and agents can post
-  if (room.settings?.secure_mode) {
-    const allowedRoles = ['manager', 'second', 'agent'];
-    const coordinationRole = member.coordination_role;
-
-    if (!allowedRoles.includes(member.role) && !coordinationRole) {
-      return res.status(403).json({ error: 'Secure mode: Only coordinators and agents can post messages' });
-    }
-  }
-
-  const { content, type = 'message', reply_to } = req.body || {};
-
-  if (!content) {
-    return res.status(400).json({ error: 'Content is required' });
-  }
-
-  if (content.length > config.maxMessageSize) {
-    return res.status(413).json({ error: 'Message too large' });
-  }
-
-  // Validate reply_to if provided
-  if (reply_to && !database.messageExistsInRoom(reply_to, room.id)) {
-    return res.status(400).json({ error: 'reply_to not found' });
-  }
-
-  const messageId = database.createMessage(room.id, member.id, type, content, reply_to);
-
-  const newMessage = {
-    id: messageId,
-    type,
-    content,
-    author: member.name,
-    author_role: member.role,
-    reply_to,
-    created_at: new Date().toISOString()
-  };
-
-  logger.debug('Message posted', { roomId: room.id, messageId, author: member.name });
-
-  // Notify waiting long-poll clients
-  notifyWaiters(room.id, [newMessage]);
-
-  // Process wake targets asynchronously (don't block response)
-  processWakeTargets(room.id, messageId, member.id, member.name, content, reply_to).catch(err => {
-    logger.error('Error processing wake targets after message', { error: err.message });
-  });
-
-  res.status(201).json(newMessage);
+  res.status(201).json(result.message);
 });
 
 /**
@@ -416,6 +375,9 @@ router.get('/rooms/:token/messages/wait', (req, res) => {
   }
 
   // Set up long-poll waiting
+  if ((waitingClients.get(room.id)?.size || 0) >= MAX_LONGPOLLS_PER_ROOM) {
+    return res.status(429).json({ error: 'Too many concurrent long-polls for this room' });
+  }
   if (!waitingClients.has(room.id)) {
     waitingClients.set(room.id, new Set());
   }
@@ -424,8 +386,10 @@ router.get('/rooms/:token/messages/wait', (req, res) => {
     res,
     since,
     timeout: setTimeout(() => {
-      waitingClients.get(room.id)?.delete(client);
-      res.json({ messages: [] });
+      const set = waitingClients.get(room.id);
+      set?.delete(client);
+      if (set && set.size === 0) waitingClients.delete(room.id);
+      if (!res.headersSent) res.json({ messages: [] });
     }, timeout)
   };
 
@@ -434,7 +398,9 @@ router.get('/rooms/:token/messages/wait', (req, res) => {
   // Clean up on disconnect
   req.on('close', () => {
     clearTimeout(client.timeout);
-    waitingClients.get(room.id)?.delete(client);
+    const set = waitingClients.get(room.id);
+    set?.delete(client);
+    if (set && set.size === 0) waitingClients.delete(room.id);
   });
 });
 
@@ -456,8 +422,11 @@ router.post('/rooms/:token/directive', (req, res) => {
 
   const { content } = req.body || {};
 
-  if (!content) {
+  if (typeof content !== 'string' || !content) {
     return res.status(400).json({ error: 'Content is required' });
+  }
+  if (content.length > config.maxMessageSize) {
+    return res.status(413).json({ error: 'Directive too large' });
   }
 
   database.updateRoomDirective(room.id, content, member.name);
@@ -561,6 +530,10 @@ router.post('/rooms/:token/members/:memberId/status', (req, res) => {
   }
 
   const memberId = parseInt(req.params.memberId, 10);
+  const target = database.getMembersByRoom(room.id).find(m => m.id === memberId);
+  if (!target) {
+    return res.status(404).json({ error: 'Member not found in this room' });
+  }
   database.updateMemberStatus(memberId, status);
 
   logger.info('Member status updated', { roomId: room.id, memberId, status });

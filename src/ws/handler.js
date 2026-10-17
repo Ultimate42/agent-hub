@@ -3,7 +3,8 @@ import { database } from '../db.js';
 import { compareTokens, maskToken } from '../utils/tokens.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
-import { notifyWaiters } from '../routes/api.js';
+import { postMessage, setWsBroadcaster } from '../services/messages.js';
+import { checkRateLimit } from '../utils/security.js';
 
 // Track connected clients by room
 const roomClients = new Map(); // roomId -> Set<{ws, member}>
@@ -14,12 +15,22 @@ const roomClients = new Map(); // roomId -> Set<{ws, member}>
 export function setupWebSocket(server) {
   const wss = new WebSocketServer({
     server,
-    path: '/ws'
+    path: '/ws',
+    maxPayload: config.maxMessageSize + 4096 // reject oversized frames before parsing
   });
+
+  // Make REST / MCP / watchdog messages reach WebSocket clients too
+  setWsBroadcaster((roomId, message) => broadcastToRoom(roomId, message));
 
   wss.on('connection', (ws, req) => {
     // Extract token from query string
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    let url;
+    try {
+      url = new URL(req.url, 'http://localhost');
+    } catch {
+      ws.close(4001, 'Bad request');
+      return;
+    }
     const token = url.searchParams.get('token');
 
     if (!token) {
@@ -41,7 +52,8 @@ export function setupWebSocket(server) {
     if (!roomClients.has(member.room_id)) {
       roomClients.set(member.room_id, new Set());
     }
-    const client = { ws, member };
+    const client = { ws, member, token, alive: true };
+    ws.on('pong', () => { client.alive = true; });
     roomClients.get(member.room_id).add(client);
 
     logger.info('WebSocket connected', {
@@ -63,13 +75,15 @@ export function setupWebSocket(server) {
         const msg = JSON.parse(data.toString());
         handleMessage(client, msg);
       } catch (err) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+        safeSend(ws, { type: 'error', message: 'Invalid JSON' });
       }
     });
 
     // Handle disconnect
     ws.on('close', () => {
-      roomClients.get(member.room_id)?.delete(client);
+      const set = roomClients.get(member.room_id);
+      set?.delete(client);
+      if (set && set.size === 0) roomClients.delete(member.room_id);
 
       logger.info('WebSocket disconnected', {
         roomId: member.room_id,
@@ -96,18 +110,23 @@ export function setupWebSocket(server) {
     }));
   });
 
-  // Ping clients periodically to keep connections alive
-  setInterval(() => {
+  // Ping clients periodically; terminate the ones that never answered the last ping
+  const pingTimer = setInterval(() => {
     for (const [roomId, clients] of roomClients.entries()) {
       for (const client of clients) {
-        if (client.ws.readyState === client.ws.OPEN) {
-          client.ws.ping();
-        } else {
+        if (client.ws.readyState !== client.ws.OPEN || !client.alive) {
           clients.delete(client);
+          client.ws.terminate();
+          continue;
         }
+        client.alive = false;
+        client.ws.ping();
       }
+      if (clients.size === 0) roomClients.delete(roomId);
     }
   }, 30000);
+  pingTimer.unref();
+  wss.on('close', () => clearInterval(pingTimer));
 
   logger.info('WebSocket server started');
 
@@ -118,7 +137,19 @@ export function setupWebSocket(server) {
  * Handle incoming WebSocket message
  */
 function handleMessage(client, msg) {
-  const { ws, member } = client;
+  const { ws } = client;
+
+  // Re-validate on every frame: the token may have been rotated (rejoin) or the member removed
+  const member = database.getMemberByToken(client.token);
+  if (!member) {
+    ws.close(4003, 'Invalid token');
+    return;
+  }
+
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    safeSend(ws, { type: 'error', message: 'Invalid message' });
+    return;
+  }
 
   // Update last seen
   database.updateMemberLastSeen(member.id);
@@ -127,83 +158,38 @@ function handleMessage(client, msg) {
     case 'message':
     case 'question':
     case 'response':
-    case 'directive':
-      if (!member.permissions.includes('w')) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Write permission required' }));
+    case 'directive': {
+      // Per-member flood control (same budget as REST)
+      if (!checkRateLimit(`ws:${member.id}`, config.rateLimitPerMinute * 2).allowed) {
+        safeSend(ws, { type: 'error', message: 'Too many messages, slow down' });
         return;
       }
 
-      // Secure mode check
-      const room = database.getRoomById(member.room_id);
-      if (room?.settings?.secure_mode) {
-        const allowedRoles = ['manager', 'second', 'agent'];
-        const coordinationRole = member.coordination_role;
-
-        if (!allowedRoles.includes(member.role) && !coordinationRole) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Secure mode: Only coordinators and agents can post messages' }));
-          return;
-        }
-      }
-
-      if (!msg.content) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Content required' }));
-        return;
-      }
-
-      if (msg.content.length > config.maxMessageSize) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Message too large' }));
-        return;
-      }
-
-      // Validate reply_to if provided
-      if (msg.reply_to && !database.messageExistsInRoom(msg.reply_to, member.room_id)) {
-        ws.send(JSON.stringify({ type: 'error', message: 'reply_to not found' }));
-        return;
-      }
-
-      // Special handling for directive
-      if (msg.type === 'directive') {
-        database.updateRoomDirective(member.room_id, msg.content);
-      }
-
-      // Save message
-      const messageId = database.createMessage(
-        member.room_id,
-        member.id,
-        msg.type,
-        msg.content,
-        msg.reply_to
-      );
-
-      const newMessage = {
-        id: messageId,
-        type: msg.type,
+      // postMessage validates, stores and broadcasts to WS + long-poll (sender included)
+      const result = postMessage(member, {
         content: msg.content,
-        author: member.name,
-        author_role: member.role,
+        type: msg.type,
         reply_to: msg.reply_to,
-        created_at: new Date().toISOString()
-      };
-
-      // Broadcast to room (including sender for confirmation)
-      broadcastToRoom(member.room_id, newMessage);
-
-      // Notify long-poll waiters
-      notifyWaiters(member.room_id, [newMessage]);
-
-      logger.debug('Message sent via WebSocket', {
-        roomId: member.room_id,
-        messageId,
-        author: member.name
+        applyDirective: true
       });
+      if (!result.ok) {
+        safeSend(ws, { type: 'error', message: result.error });
+      }
       break;
+    }
 
     case 'ping':
-      ws.send(JSON.stringify({ type: 'pong' }));
+      safeSend(ws, { type: 'pong' });
       break;
 
     default:
-      ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type' }));
+      safeSend(ws, { type: 'error', message: 'Unknown message type' });
+  }
+}
+
+function safeSend(ws, obj) {
+  if (ws.readyState === ws.OPEN) {
+    try { ws.send(JSON.stringify(obj)); } catch { /* socket closing */ }
   }
 }
 
@@ -218,7 +204,7 @@ function broadcastToRoom(roomId, message, excludeWs = null) {
 
   for (const client of clients) {
     if (client.ws !== excludeWs && client.ws.readyState === client.ws.OPEN) {
-      client.ws.send(data);
+      try { client.ws.send(data); } catch { /* socket closing */ }
     }
   }
 }

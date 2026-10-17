@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { database } from '../db.js';
 import { logger } from '../utils/logger.js';
+import { normalize } from 'path';
+import { isLoopbackIp, isPrivateHost } from '../utils/net.js';
 
 const router = Router();
 
@@ -55,23 +57,37 @@ router.post('/members/wake-target', (req, res) => {
       if (!url) {
         return res.status(400).json({ error: 'url is required for webhook type' });
       }
+      if (typeof url !== 'string' || url.length > 2000) {
+        return res.status(400).json({ error: 'url must be a valid URL' });
+      }
+      let parsed;
       try {
-        new URL(url);
+        parsed = new URL(url);
       } catch {
         return res.status(400).json({ error: 'url must be a valid URL' });
       }
-      // Allow http://localhost and http://127.0.0.1 for testing, require https elsewhere
-      const isLocalhost = url.includes('localhost') || url.includes('127.0.0.1');
-      if (!isLocalhost && !url.startsWith('https://')) {
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return res.status(400).json({ error: 'url must be a valid URL' });
+      }
+      // Internal targets (SSRF) are only allowed for requests coming from the host itself.
+      if (isPrivateHost(parsed.hostname)) {
+        if (!isLoopbackIp(req.ip)) {
+          return res.status(400).json({ error: 'url must not point to a private or local address' });
+        }
+      } else if (parsed.protocol !== 'https:') {
         return res.status(400).json({ error: 'url must use HTTPS for security (except localhost for testing)' });
       }
     }
 
     if (type === 'file') {
-      if (!path) {
+      // File targets write on the hub host: reserved to requests coming from the host itself.
+      if (!isLoopbackIp(req.ip)) {
+        return res.status(403).json({ error: 'file wake targets can only be registered from the hub host' });
+      }
+      if (typeof path !== 'string' || !path) {
         return res.status(400).json({ error: 'path is required for file type' });
       }
-      if (!path.startsWith('/')) {
+      if (!path.startsWith('/') || path.includes('\0') || normalize(path).split('/').includes('..') || path.split('/').includes('..')) {
         return res.status(400).json({ error: 'path must be absolute' });
       }
     }
@@ -80,7 +96,7 @@ router.post('/members/wake-target', (req, res) => {
       return res.status(400).json({ error: 'max_retries must be 0-10' });
     }
 
-    database.setWakeTarget(member.id, type, url, path, max_retries);
+    database.setWakeTarget(member.id, type, type === 'webhook' ? url : null, type === 'file' ? normalize(path) : null, max_retries);
 
     logger.info('Wake target registered', {
       memberId: member.id,

@@ -3,7 +3,8 @@ import { database } from '../db.js';
 import { generateToken } from '../utils/tokens.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import { notifyWaiters } from './api.js';
+import { postMessage, sanitizeName, MEMBER_ROLES } from '../services/messages.js';
+import { checkRoomCreationLimit } from '../utils/security.js';
 import { deduplicateAndAddPresence } from '../utils/members.js';
 
 const router = Router();
@@ -11,38 +12,6 @@ const router = Router();
 // Supported MCP protocol versions
 const SUPPORTED_PROTOCOLS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
 const DEFAULT_PROTOCOL = '2025-03-26';
-
-// Rate limiter for room creation via MCP (in-memory, per IP)
-const mcpRoomRateLimitMap = new Map();
-
-// Helper: Get client IP
-function getClientIp(req) {
-  return (
-    req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-    req.socket.remoteAddress ||
-    'unknown'
-  );
-}
-
-// Helper: Check room creation rate limit
-function checkRoomCreationLimit(ip) {
-  const now = Date.now();
-  const key = ip;
-  let record = mcpRoomRateLimitMap.get(key);
-
-  if (!record || now - record.resetTime > 3600000) {
-    // Reset after 1 hour
-    record = { count: 0, resetTime: now };
-    mcpRoomRateLimitMap.set(key, record);
-  }
-
-  if (record.count >= config.maxRoomsPerHour) {
-    return false; // Limit exceeded
-  }
-
-  record.count++;
-  return true;
-}
 
 // MCP Tool definitions
 const MCP_TOOLS = [
@@ -162,6 +131,21 @@ const MCP_TOOLS = [
 // Session store for MCP sessions
 const sessions = new Map();
 
+const MAX_SESSIONS = 5000;
+const SESSION_TTL_MS = 24 * 3600 * 1000;
+function pruneSessions() {
+  if (sessions.size < MAX_SESSIONS) return;
+  const now = Date.now();
+  for (const [id, sess] of sessions) {
+    if (now - sess.created > SESSION_TTL_MS) sessions.delete(id);
+  }
+  // Still full: drop oldest entries (Map preserves insertion order)
+  for (const id of sessions.keys()) {
+    if (sessions.size < MAX_SESSIONS) break;
+    sessions.delete(id);
+  }
+}
+
 // Generate JSON-RPC response
 function jsonRpcResponse(id, result) {
   return { jsonrpc: '2.0', id, result };
@@ -173,17 +157,26 @@ function jsonRpcError(id, code, message) {
 
 // Handle tool calls
 async function handleToolCall(name, args, req) {
+  if (typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error('arguments must be an object');
+  }
+  if ('member_token' in args && typeof args.member_token !== 'string') {
+    throw new Error('Invalid member_token: call join_room again to get a fresh token');
+  }
   switch (name) {
     case 'create_room': {
       // Rate limit check
-      const ip = getClientIp(req);
-      if (!checkRoomCreationLimit(ip)) {
+      // req.ip honours the single trusted proxy hop (X-Forwarded-For is client-controlled)
+      if (!checkRoomCreationLimit(req.ip)) {
         throw new Error('Rate limit exceeded: max 10 rooms per hour');
       }
 
       const roomToken = generateToken(config.tokenLength);
       const adminToken = generateToken(config.adminTokenLength);
-      const roomId = database.createRoom(roomToken, adminToken, args.name || 'Untitled Room');
+      if (args.name !== undefined && args.name !== null && (typeof args.name !== 'string' || args.name.length > 200)) {
+        throw new Error('name must be a string of at most 200 characters');
+      }
+      const roomId = database.createRoom(roomToken, adminToken, (typeof args.name === 'string' && args.name.trim()) || 'Untitled Room');
 
       logger.info('MCP: Room created', { roomId });
 
@@ -196,24 +189,31 @@ async function handleToolCall(name, args, req) {
     }
 
     case 'join_room': {
+      const name = sanitizeName(args.name);
+      if (!name) throw new Error('name is required (string, max 64 chars, no control characters)');
+      const role = args.role === undefined || args.role === null ? 'agent' : args.role;
+      if (typeof role !== 'string' || !MEMBER_ROLES.includes(role)) {
+        throw new Error(`Invalid role. Must be one of: ${MEMBER_ROLES.join(', ')}`);
+      }
+      if (typeof args.room_token !== 'string') throw new Error('room_token is required');
       const room = database.getRoomByToken(args.room_token);
       if (!room) {
         throw new Error('Invalid room_token. Check the room URL or create a new room with create_room.');
       }
 
       // Check if member with same name already exists (idempotent)
-      const existingMember = database.getMemberByNameAndRoom(room.id, args.name);
+      const existingMember = database.getMemberByNameAndRoom(room.id, name);
 
       if (existingMember) {
         // Member exists: update token and role, invalidate old token
         const newToken = generateToken(config.tokenLength);
         database.updateMemberToken(existingMember.id, newToken);
 
-        if (args.role && args.role !== 'agent') {
-          database.updateMemberRole(existingMember.id, args.role);
+        if (role !== 'agent') {
+          database.updateMemberRole(existingMember.id, role);
         }
 
-        logger.info('MCP: Member rejoined (token refreshed)', { roomId: room.id, memberId: existingMember.id, name: args.name });
+        logger.info('MCP: Member rejoined (token refreshed)', { roomId: room.id, memberId: existingMember.id, name });
 
         return {
           member_token: newToken,
@@ -229,9 +229,9 @@ async function handleToolCall(name, args, req) {
       }
 
       const memberToken = generateToken(config.tokenLength);
-      database.createMember(room.id, memberToken, args.name, args.role || 'agent');
+      database.createMember(room.id, memberToken, name, role);
 
-      logger.info('MCP: Member joined', { roomId: room.id, name: args.name });
+      logger.info('MCP: Member joined', { roomId: room.id, name });
 
       return {
         member_token: memberToken,
@@ -247,38 +247,16 @@ async function handleToolCall(name, args, req) {
         throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
-      if (!member.permissions.includes('w')) {
-        throw new Error('Write permission required');
-      }
-
-      if (args.content.length > config.maxMessageSize) {
-        throw new Error('Message too large');
-      }
-
-      // Validate reply_to if provided
-      if (args.reply_to && !database.messageExistsInRoom(args.reply_to, member.room_id)) {
-        throw new Error('reply_to not found');
-      }
-
-      const messageId = database.createMessage(
-        member.room_id,
-        member.id,
-        args.type || 'message',
-        args.content,
-        args.reply_to
-      );
-
-      const newMessage = {
-        id: messageId,
-        type: args.type || 'message',
+      const result = postMessage(member, {
         content: args.content,
-        author: member.name,
-        created_at: new Date().toISOString()
-      };
+        type: args.type,
+        reply_to: args.reply_to
+      });
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
 
-      notifyWaiters(member.room_id, [newMessage]);
-
-      return { message_id: messageId, success: true };
+      return { message_id: result.message.id, success: true };
     }
 
     case 'read_messages': {
@@ -427,6 +405,13 @@ async function handleToolCall(name, args, req) {
         throw new Error('Write permission required');
       }
 
+      if (typeof args.content !== 'string' || !args.content) {
+        throw new Error('Content is required');
+      }
+      if (args.content.length > config.maxMessageSize) {
+        throw new Error('Directive too large');
+      }
+
       database.updateRoomDirective(member.room_id, args.content, member.name);
 
       return { success: true, directive: args.content };
@@ -475,7 +460,10 @@ async function handleJsonRpcRequest(req, requestBody) {
           ? clientVersion
           : DEFAULT_PROTOCOL;
 
-        const sessionId = req.get('Mcp-Session-Id') || generateToken(16);
+        // Never trust a client-supplied id blindly: bound the store (memory DoS)
+        const supplied = req.get('Mcp-Session-Id');
+        const sessionId = (supplied && supplied.length <= 64) ? supplied : generateToken(16);
+        pruneSessions();
         sessions.set(sessionId, { created: Date.now(), version: negotiatedVersion });
 
         req.mcpSessionId = sessionId;

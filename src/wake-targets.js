@@ -38,7 +38,8 @@ async function notifyWebhook(url, payload) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      timeout: 10000
+      redirect: 'manual', // never follow redirects to internal addresses
+      signal: AbortSignal.timeout(10000)
     });
 
     if (!response.ok) {
