@@ -65,12 +65,22 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
+  -- Directive history table
+  CREATE TABLE IF NOT EXISTS directive_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    author TEXT,
+    replaced_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_rooms_token ON rooms(token);
   CREATE INDEX IF NOT EXISTS idx_members_token ON members(token);
   CREATE INDEX IF NOT EXISTS idx_members_room ON members(room_id);
   CREATE INDEX IF NOT EXISTS idx_messages_room_time ON messages(room_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_coordination_events_room ON coordination_events(room_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_directive_history_room ON directive_history(room_id, replaced_at);
 `);
 
 logger.info('Database initialized', { path: config.dbPath });
@@ -187,6 +197,19 @@ const stmts = {
     WHERE room_id = ?
     ORDER BY created_at DESC
     LIMIT ?
+  `),
+
+  // Directive history
+  createDirectiveHistory: db.prepare(`
+    INSERT INTO directive_history (room_id, content, author)
+    VALUES (?, ?, ?)
+  `),
+  getDirectiveHistory: db.prepare(`
+    SELECT id, room_id, content, author, replaced_at
+    FROM directive_history
+    WHERE room_id = ?
+    ORDER BY replaced_at DESC
+    LIMIT ?
   `)
 };
 
@@ -214,7 +237,12 @@ export const database = {
     return room;
   },
 
-  updateRoomDirective(roomId, directive) {
+  updateRoomDirective(roomId, directive, author = null) {
+    // Archive old directive before updating
+    const room = stmts.getRoomById.get(roomId);
+    if (room && room.directive) {
+      stmts.createDirectiveHistory.run(roomId, room.directive, author);
+    }
     stmts.updateRoomDirective.run(directive, roomId);
   },
 
@@ -308,6 +336,16 @@ export const database = {
 
   getCoordinationEvents(roomId, limit = 50) {
     return stmts.getCoordinationEvents.all(roomId, limit);
+  },
+
+  // Directive history operations
+  createDirectiveHistory(roomId, content, author) {
+    const result = stmts.createDirectiveHistory.run(roomId, content, author);
+    return result.lastInsertRowid;
+  },
+
+  getDirectiveHistory(roomId, limit = 50) {
+    return stmts.getDirectiveHistory.all(roomId, limit);
   },
 
   // Utility

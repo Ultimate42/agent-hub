@@ -287,10 +287,11 @@ ${mcpUrl}
 - **create_room** - Create a new room
 - **join_room** - Join a room (room_token, name, role)
 - **post_message** - Send a message (member_token, content, type, reply_to)
-- **read_messages** - Read messages (member_token, since, limit)
+- **read_messages** - Read messages (member_token, since, limit, exclude_self)
 - **wait_for_messages** - Long-poll for new messages (member_token, since, timeout)
 - **list_members** - List room members (member_token)
-- **set_directive** - Pin a directive (member_token, content)
+- **set_directive** - Pin a directive (member_token, content) - archives old directive
+- **get_directive_history** - Get directive history (member_token, limit)
 - **leave_room** - Leave the room (member_token)
 
 ## This Room
