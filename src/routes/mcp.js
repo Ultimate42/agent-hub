@@ -309,30 +309,26 @@ async function handleToolCall(name, args, req) {
 
       // Wait for new messages
       return new Promise((resolve) => {
-        const roomWaiters = new Map();
-        const waiter = {
-          resolve: (msgs) => resolve({ messages: msgs }),
-          timeout: setTimeout(() => {
+        let resolved = false;
+        const timeoutHandle = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            clearInterval(checkHandle);
             resolve({ messages: [] });
-          }, timeout)
-        };
+          }
+        }, timeout);
 
-        // Store in a simple structure for MCP long-poll
-        // Note: In production, this should be integrated with the API waiters
-        const existingCheck = setInterval(() => {
-          const newMsgs = database.getMessagesSince(member.room_id, since, config.maxMessagesPerRequest);
-          if (newMsgs.length > 0) {
-            clearInterval(existingCheck);
-            clearTimeout(waiter.timeout);
-            resolve({ messages: newMsgs });
+        const checkHandle = setInterval(() => {
+          if (!resolved) {
+            const newMsgs = database.getMessagesSince(member.room_id, since, config.maxMessagesPerRequest);
+            if (newMsgs.length > 0) {
+              resolved = true;
+              clearInterval(checkHandle);
+              clearTimeout(timeoutHandle);
+              resolve({ messages: newMsgs });
+            }
           }
         }, 500);
-
-        waiter.interval = existingCheck;
-
-        setTimeout(() => {
-          clearInterval(existingCheck);
-        }, timeout);
       });
     }
 

@@ -22,7 +22,7 @@ app.use(securityHeaders);
 app.use(corsHandler);
 app.use(rateLimitMiddleware);
 
-// Parse JSON with size limit
+// Parse JSON with size limit (64KB)
 app.use(express.json({ limit: '64kb' }));
 
 // Request logging (mask tokens in URLs)
@@ -53,8 +53,14 @@ app.use(setupRoutes);  // /r/:token/setup
 app.use(designRoutes); // /design, /r/:token/design
 app.use(webRoutes);    // /, /r/:token, /health, /llms.txt
 
-// Error handler
+// Error handler (MUST be after routes and other middleware)
 app.use((err, req, res, next) => {
+  // Handle payload too large errors from body-parser
+  if (err.type === 'entity.too.large' || err.message?.includes('payload too large') || err.status === 413) {
+    logger.warn('Payload too large', { error: err.message, contentLength: req.get('content-length') });
+    return res.status(413).json({ error: 'Message too large (max 64KB)' });
+  }
+
   logger.error('Unhandled error', { error: err.message, stack: err.stack });
   res.status(500).json({ error: 'Internal server error' });
 });
