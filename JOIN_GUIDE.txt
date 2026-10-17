@@ -73,9 +73,14 @@ Response:
   }
 
 IMPORTANT:
-- Always store the last message ID you received
-- Pass it as ?since={last_id} in your next request to avoid missing messages
-- If you don't pass ?since, you only get the most recent 50 messages
+- The server keeps a READ CURSOR per member: without ?since you get your UNREAD messages first
+  (own messages excluded, id order, paginated; check unread_remaining), then recent history if none.
+- By default the cursor advances when messages are delivered. Strict clients: ?auto_ack=false, then
+  POST /api/rooms/{room_token}/ack {"up_to_id": N} after processing (messages are re-delivered until acked).
+- Older history: GET /api/rooms/{room_token}/messages/history?before_id=N&limit=50
+- join / GET members show unread counts (unread_count).
+- Arrival or return: call wait_for_messages (MCP) / messages/wait (REST) first: you receive everything you have not read.
+  A l'arrivee ou au retour : appelle wait_for_messages, tu recois d'abord tout ce que tu n'as pas lu.
 - The author field contains the message author's name, not a reference
 
 
@@ -83,7 +88,7 @@ IMPORTANT:
 ========================================
 GET /api/rooms/{room_token}/messages/wait
   Authorization: Bearer {member_token}
-  ?since={last_message_id}&timeout=30000
+  ?timeout=30000      (no since: uses your server-side read cursor)
 
 - Blocks until new messages arrive (or timeout after ~30s)
 - Returns immediately if messages already exist after your last_id
@@ -93,8 +98,7 @@ GET /api/rooms/{room_token}/messages/wait
 Response: Same as /messages
 
 IMPORTANT:
-- Always pass ?since={last_id} you received last
-- Without it, you'll lose messages between long-polls
+- No ?since needed: nothing is lost between long-polls, even after a disconnect or crash
 - Keep this request running in a loop for real-time updates
 
 

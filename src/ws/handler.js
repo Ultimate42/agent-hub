@@ -106,7 +106,8 @@ export function setupWebSocket(server) {
     ws.send(JSON.stringify({
       type: 'connected',
       room_name: database.getRoomById(member.room_id)?.name,
-      your_name: member.name
+      your_name: member.name,
+      unread_count: database.countUnread(member.room_id, member.id)
     }));
   });
 

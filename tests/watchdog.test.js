@@ -138,9 +138,8 @@ describe('Watchdog Tests', () => {
     // Wait for first watchdog trigger
     await new Promise(r => setTimeout(r, 3000));
 
-    const { data: msgs1 } = await request(`/api/rooms/${roomToken}/messages`, {
-      headers: { 'Authorization': `Bearer ${member1Token}` },
-      limit: 100
+    const { data: msgs1 } = await request(`/api/rooms/${roomToken}/messages?mode=recent&limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
     });
     const alertCount1 = msgs1.messages.filter(m =>
       m.author === 'HubWatchdog' && m.content.includes(`message #${msgId}`)
@@ -150,9 +149,8 @@ describe('Watchdog Tests', () => {
     // Wait again
     await new Promise(r => setTimeout(r, 1000));
 
-    const { data: msgs2 } = await request(`/api/rooms/${roomToken}/messages`, {
-      headers: { 'Authorization': `Bearer ${member1Token}` },
-      limit: 100
+    const { data: msgs2 } = await request(`/api/rooms/${roomToken}/messages?mode=recent&limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
     });
     const alertCount2 = msgs2.messages.filter(m =>
       m.author === 'HubWatchdog' && m.content.includes(`message #${msgId}`)
@@ -181,9 +179,8 @@ describe('Watchdog Tests', () => {
 
     // Check messages - if Agent2 replied, watchdog might not trigger
     // This test just verifies no crash and watchdog handles replies
-    const { data: msgsData } = await request(`/api/rooms/${roomToken}/messages`, {
-      headers: { 'Authorization': `Bearer ${member1Token}` },
-      limit: 100
+    const { data: msgsData } = await request(`/api/rooms/${roomToken}/messages?mode=recent&limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
     });
 
     assert.ok(Array.isArray(msgsData.messages), 'Should return messages without error');
@@ -223,9 +220,8 @@ describe('Watchdog Tests', () => {
     await new Promise(r => setTimeout(r, 3000));
 
     // Should not have unanswered alerts in this thread
-    const { data: msgsData } = await request(`/api/rooms/${roomToken}/messages`, {
-      headers: { 'Authorization': `Bearer ${member1Token}` },
-      limit: 100
+    const { data: msgsData } = await request(`/api/rooms/${roomToken}/messages?mode=recent&limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
     });
 
     const watchdogAlerts = msgsData.messages.filter(m =>
@@ -251,9 +247,8 @@ describe('Watchdog Tests', () => {
 
   test('Watchdog does not self-trigger endlessly', async () => {
     // Get initial alert count
-    const { data: msgs1 } = await request(`/api/rooms/${roomToken}/messages`, {
-      headers: { 'Authorization': `Bearer ${member1Token}` },
-      limit: 100
+    const { data: msgs1 } = await request(`/api/rooms/${roomToken}/messages?mode=recent&limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
     });
     const alertCountBefore = msgs1.messages.filter(m => m.author === 'HubWatchdog').length;
 
@@ -268,9 +263,8 @@ describe('Watchdog Tests', () => {
     await new Promise(r => setTimeout(r, 3000));
 
     // Get alert count after
-    const { data: msgs2 } = await request(`/api/rooms/${roomToken}/messages`, {
-      headers: { 'Authorization': `Bearer ${member1Token}` },
-      limit: 100
+    const { data: msgs2 } = await request(`/api/rooms/${roomToken}/messages?mode=recent&limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
     });
     const alertCountAfter = msgs2.messages.filter(m => m.author === 'HubWatchdog').length;
 

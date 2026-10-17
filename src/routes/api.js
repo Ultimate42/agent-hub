@@ -6,7 +6,8 @@ import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
 import { deduplicateAndAddPresence } from '../utils/members.js';
 import {
-  postMessage, notifyWaiters, waitingClients, sanitizeName, MEMBER_ROLES
+  postMessage, notifyWaiters, waitingClients, sanitizeName, MEMBER_ROLES,
+  parseBool, peekUnread, settleDelivery, ackMessages
 } from '../services/messages.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
 import { isMentioned } from '../utils/mentions.js';
@@ -168,7 +169,9 @@ router.post('/rooms/:token/join', (req, res) => {
         member_token: newToken,
         room_name: room.name,
         directive: room.directive,
-        is_rejoin: true
+        is_rejoin: true,
+        unread_count: database.countUnread(room.id, existingMember.id),
+        last_read_id: database.getReadCursor(existingMember.id)
       });
     }
 
@@ -204,7 +207,9 @@ router.post('/rooms/:token/join', (req, res) => {
       member_token: memberToken,
       room_name: room.name,
       directive: room.directive,
-      is_rejoin: false
+      is_rejoin: false,
+      unread_count: 0,
+      last_read_id: database.getReadCursor(memberId)
     });
   } catch (error) {
     logger.error('Failed to join room', { error: error.message });
@@ -284,6 +289,7 @@ router.get('/rooms/:token/members', (req, res) => {
         last_seen: m.last_seen,
         presence: m.presence,
         is_you: m.name === member.name,
+        unread_count: database.countUnread(room.id, m._id),
         pending_unreplied: getPendingUnrepliedCount(room.id, m.id)
       };
       return obj;
@@ -315,9 +321,13 @@ router.post('/rooms/:token/messages', (req, res) => {
 /**
  * GET /api/rooms/:token/messages - Read messages
  * Query params:
- *   since: return messages after this ID
+ *   since: return messages after this ID (legacy; omit it to use the server-side read cursor)
  *   limit: max messages (default 50, max 100)
  *   exclude_self: if true, exclude messages from the calling member
+ *   auto_ack: default true (cursor advances on delivery); false = only POST /ack moves it
+ *   mode=recent: last N messages (history view), never touches the cursor
+ * Without since: returns the member's UNREAD messages (own excluded, id order, paginated);
+ * if nothing is unread, returns recent history (history: true).
  */
 router.get('/rooms/:token/messages', (req, res) => {
   const member = requireMember(req, res);
@@ -328,15 +338,25 @@ router.get('/rooms/:token/messages', (req, res) => {
     return res.status(403).json({ error: 'Access denied' });
   }
 
-  const since = parseInt(req.query.since, 10) || 0;
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, config.maxMessagesPerRequest);
+  const since = Math.max(parseInt(req.query.since, 10) || 0, 0);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), config.maxMessagesPerRequest);
   const excludeSelf = req.query.exclude_self === 'true';
+  const autoAck = parseBool(req.query.auto_ack, true);
+  const recentOnly = req.query.mode === 'recent';
 
   let messages;
+  let history = false;
   if (since > 0) {
     messages = database.getMessagesSince(room.id, since, limit);
-  } else {
+  } else if (recentOnly) {
+    history = true;
     messages = database.getMessages(room.id, limit);
+  } else {
+    messages = peekUnread(member, limit);
+    if (messages.length === 0) {
+      history = true;
+      messages = database.getMessages(room.id, limit);
+    }
   }
 
   // Filter out self messages if exclude_self is true
@@ -344,14 +364,56 @@ router.get('/rooms/:token/messages', (req, res) => {
     messages = messages.filter(msg => msg.author !== member.name);
   }
 
+  const info = settleDelivery(member, history ? [] : messages, { since, autoAck });
   res.json({
     messages,
-    last_id: messages.length > 0 ? messages[messages.length - 1].id : since
+    last_id: messages.length > 0 ? messages[messages.length - 1].id : (since || info.last_read_id),
+    ...info,
+    history
   });
 });
 
 /**
+ * GET /api/rooms/:token/messages/history?before_id=N&limit=50 - older messages, never touches the cursor
+ */
+router.get('/rooms/:token/messages/history', (req, res) => {
+  const member = requireMember(req, res);
+  if (!member) return;
+  const room = database.getRoomByToken(req.params.token);
+  if (!room || room.id !== member.room_id) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), config.maxMessagesPerRequest);
+  const before = parseInt(req.query.before_id, 10) > 0 ? parseInt(req.query.before_id, 10) : Number.MAX_SAFE_INTEGER;
+  const messages = database.getMessagesBefore(room.id, before, limit);
+  res.json({
+    messages,
+    oldest_id: messages.length ? messages[0].id : null,
+    has_more: messages.length === limit && database.messageExistsBefore(room.id, messages[0].id),
+    last_read_id: database.getReadCursor(member.id)
+  });
+});
+
+/**
+ * POST /api/rooms/:token/ack {up_to_id} - explicit read receipt (cursor never moves backwards)
+ */
+router.post('/rooms/:token/ack', (req, res) => {
+  const member = requireMember(req, res);
+  if (!member) return;
+  const room = database.getRoomByToken(req.params.token);
+  if (!room || room.id !== member.room_id) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  try {
+    res.json(ackMessages(member, (req.body || {}).up_to_id));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/**
  * GET /api/rooms/:token/messages/wait - Long-poll for new messages
+ * Without since: cursor mode (first returns the whole unread backlog; see GET /messages).
  */
 router.get('/rooms/:token/messages/wait', (req, res) => {
   const member = requireMember(req, res);
@@ -362,16 +424,29 @@ router.get('/rooms/:token/messages/wait', (req, res) => {
     return res.status(403).json({ error: 'Access denied' });
   }
 
-  const since = parseInt(req.query.since, 10) || database.getLastMessageId(room.id);
+  const since = Math.max(parseInt(req.query.since, 10) || 0, 0);
+  const autoAck = parseBool(req.query.auto_ack, true);
   const timeout = Math.min(
     parseInt(req.query.timeout, 10) || config.longPollTimeout,
     config.longPollTimeout
   );
+  database.updateMemberLastSeen(member.id);
+
+  const respond = (messages) => {
+    const info = settleDelivery(member, messages, { since, autoAck });
+    res.json({
+      messages,
+      last_id: messages.length > 0 ? messages[messages.length - 1].id : (since || info.last_read_id),
+      ...info
+    });
+  };
 
   // Check for existing messages first
-  const existing = database.getMessagesSince(room.id, since, config.maxMessagesPerRequest);
+  const existing = since
+    ? database.getMessagesSince(room.id, since, config.maxMessagesPerRequest)
+    : peekUnread(member, config.maxMessagesPerRequest);
   if (existing.length > 0) {
-    return res.json({ messages: existing });
+    return respond(existing);
   }
 
   // Set up long-poll waiting
@@ -389,9 +464,20 @@ router.get('/rooms/:token/messages/wait', (req, res) => {
       const set = waitingClients.get(room.id);
       set?.delete(client);
       if (set && set.size === 0) waitingClients.delete(room.id);
-      if (!res.headersSent) res.json({ messages: [] });
+      if (!res.headersSent) respond([]);
     }, timeout)
   };
+  if (!since) {
+    // Cursor mode: re-read the unread backlog from the DB when something is published
+    // (own messages are not unread, so they do not wake the waiter).
+    client.tryDeliver = (force) => {
+      if (res.headersSent) return true;
+      const msgs = peekUnread(member, config.maxMessagesPerRequest);
+      if (msgs.length === 0 && !force) return false;
+      respond(msgs);
+      return true;
+    };
+  }
 
   waitingClients.get(room.id).add(client);
 

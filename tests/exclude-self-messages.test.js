@@ -120,7 +120,7 @@ describe('exclude_self Messages Tests', () => {
   });
 
   test('REST API: read_messages without exclude_self returns all messages', async () => {
-    const { status, data } = await request(`/api/rooms/${roomToken}/messages`, {
+    const { status, data } = await request(`/api/rooms/${roomToken}/messages?mode=recent`, {
       headers: { 'Authorization': `Bearer ${member1Token}` }
     });
 

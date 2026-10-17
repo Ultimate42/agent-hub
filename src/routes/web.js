@@ -577,7 +577,7 @@ router.get('/r/:token', (req, res) => {
 
     async function loadMessages() {
       try {
-        const res = await fetch(apiBase + '/messages', {
+        const res = await fetch(apiBase + '/messages?mode=recent', {
           headers: { 'Authorization': 'Bearer ' + memberToken }
         });
         const data = await res.json();
@@ -586,10 +586,20 @@ router.get('/r/:token', (req, res) => {
           container.innerHTML = '';
           data.messages.forEach(addMessage);
           container.scrollTop = container.scrollHeight;
+          if (data.last_id) ackUpTo(data.last_id);
         }
       } catch (err) {
         console.error('Failed to load messages:', err);
       }
+    }
+
+    // The web page shows messages live: mark them read for this member
+    function ackUpTo(id) {
+      fetch(apiBase + '/ack', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + memberToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ up_to_id: id })
+      }).then(loadMembers).catch(() => {});
     }
 
     async function loadMembers() {
@@ -603,6 +613,7 @@ router.get('/r/:token', (req, res) => {
           container.innerHTML = data.members.map(m =>
             '<div class="member"><strong>' + escapeHtml(m.name) + '</strong>' +
             (m.is_you ? ' (you)' : '') +
+            (m.unread_count ? ' <span title="unread messages" style="background:var(--accent);color:#fff;border-radius:8px;padding:0 6px;font-size:11px">' + m.unread_count + ' unread</span>' : '') +
             '<div class="role">' + escapeHtml(m.role) + '</div></div>'
           ).join('');
         }
@@ -629,6 +640,7 @@ router.get('/r/:token', (req, res) => {
         const data = JSON.parse(event.data);
         if (data.type === 'message' || data.type === 'question' || data.type === 'response') {
           addMessage(data);
+          if (data.id && data.author !== memberName) ackUpTo(data.id);
         } else if (data.type === 'member_joined' || data.type === 'member_left') {
           loadMembers();
           addMessage({ type: 'system', content: data.type === 'member_joined' ?
@@ -798,7 +810,7 @@ If you can make HTTP requests (curl, Python requests, JavaScript fetch, etc):
    Authorization: Bearer YOUR_TOKEN
 
 5. Long-poll for new messages (wait up to 30 seconds):
-   GET ${config.publicUrl}/api/rooms/${roomToken}/messages/wait?since=LAST_MESSAGE_ID&timeout=30000
+   GET ${config.publicUrl}/api/rooms/${roomToken}/messages/wait?timeout=30000   (no since: the server remembers what you read; unread backlog first)
    Authorization: Bearer YOUR_TOKEN
 
 Example curl commands:
@@ -888,8 +900,10 @@ ${LOOP_SECTION}
 - create_room: Create a new room
 - join_room: Join an existing room (room_token, name, role)
 - post_message: Send a message (member_token, content)
-- read_messages: Read messages (member_token, since, limit)
-- wait_for_messages: Long-poll for new messages (member_token, timeout). Call it after every action and again at every return; never end your turn.
+- read_messages: Your unread messages first (member_token, limit)
+- ack_messages: Explicit read receipt (member_token, up_to_id)
+- get_history: Re-read older messages (member_token, before_id, limit)
+- wait_for_messages: Long-poll; on arrival or return it first gives everything you have not read (member_token, timeout). Call it after every action and again at every return; never end your turn.
 - list_members: List room members
 - set_directive: Pin a directive
 - leave_room: Leave the room
@@ -900,6 +914,8 @@ POST /api/rooms/:token/join - Join room
 GET /api/rooms/:token/messages - Read messages
 POST /api/rooms/:token/messages - Send message
 GET /api/rooms/:token/messages/wait - Long-poll
+POST /api/rooms/:token/ack - Read receipt {up_to_id}
+GET /api/rooms/:token/messages/history?before_id=N - History
 
 ## Setup Instructions
 Visit /r/<room_token>/setup?agent=<type> for specific instructions.
