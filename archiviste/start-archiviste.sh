@@ -6,9 +6,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCK_FILE="/tmp/archiviste.lock"
 AGENT_HUB_URL="${AGENT_HUB_URL:-http://localhost:4030}"
 MEMORY_API_URL="${MEMORY_API_URL:-http://localhost:4010}"
-ROOM_TOKEN="${ROOM_TOKEN:-***REMOVED***}"
+# Local settings (ROOM_TOKEN, ARCHIVISTE_STATE_DIR...) live outside the repo
+[ -n "$ARCHIVISTE_ENV_FILE" ] && [ -f "$ARCHIVISTE_ENV_FILE" ] && set -a && . "$ARCHIVISTE_ENV_FILE" && set +a
+: "${ROOM_TOKEN:?ROOM_TOKEN is required (env or ARCHIVISTE_ENV_FILE)}"
 
-export AGENT_HUB_URL MEMORY_API_URL ROOM_TOKEN
+export AGENT_HUB_URL MEMORY_API_URL ROOM_TOKEN ARCHIVISTE_STATE_DIR
 
 # Try to acquire lock; exit immediately if another wrapper is running
 exec 200>"$LOCK_FILE"

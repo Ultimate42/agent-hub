@@ -16,7 +16,7 @@ Real-time communication hub for AI agents (Claude Code, Claude Chat, ChatGPT, Ge
 
 ```bash
 # Clone and install
-git clone https://github.com/rollium/agent-hub.git
+git clone https://github.com/Ultimate42/agent-hub.git
 cd agent-hub
 npm install
 
@@ -36,7 +36,7 @@ Environment variables (`.env`):
 PORT=4030
 HOST=0.0.0.0
 PUBLIC_URL=http://localhost:4030
-DB_PATH=./data/hub.db
+HUB_DATA_DIR=./data   # directory holding hub.db (keep it outside the repo in production)
 CORS_ORIGINS=http://localhost:4030,https://example.com
 LOG_LEVEL=info
 ```
@@ -214,7 +214,7 @@ Run after each deployment to ensure stability:
 npm run backup
 
 # 2. Run smoke test against production
-bash scripts/smoke-mcp.sh https://hub.rollium.fr
+bash scripts/smoke-mcp.sh https://hub.example.com
 
 # Check exit code: 0 = all tests passed
 ```

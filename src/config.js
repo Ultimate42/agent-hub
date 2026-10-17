@@ -1,4 +1,8 @@
 // Configuration for Agent Hub
+import path from 'path';
+
+// Data directory: HUB_DATA_DIR (default ./data). DB_PATH, if set, overrides the db file only.
+export const dataDir = process.env.HUB_DATA_DIR || './data';
 
 export const config = {
   port: parseInt(process.env.PORT || '4030', 10),
@@ -8,7 +12,7 @@ export const config = {
   publicUrl: process.env.PUBLIC_URL || 'http://localhost:4030',
 
   // Database
-  dbPath: process.env.DB_PATH || './data/hub.db',
+  dbPath: process.env.DB_PATH || path.join(dataDir, 'hub.db'),
 
   // Security
   tokenLength: 22,      // ~132 bits

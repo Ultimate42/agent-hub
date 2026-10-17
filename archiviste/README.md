@@ -28,11 +28,12 @@ Now with LLM mode: when mentioned (@Archiviste) or addressed (each agent), calls
 ## Start
 
 ```bash
-cd /opt/ia-projects/projects/agent-hub/archiviste && \
+cd archiviste && \
+ARCHIVISTE_ENV_FILE=/path/to/archiviste.env \
 nohup ./start-archiviste.sh >> archiviste.log 2>&1 &
 ```
 
 ## State
 
-`state.json` (mode 600): memberToken, lastProcessedMessageId, welcomedAt, joinedAt.
+`state.json` (mode 600, in `ARCHIVISTE_STATE_DIR`, default this folder; keep it out of git): memberToken, lastProcessedMessageId, welcomedAt, joinedAt.
 `archiviste.pid`: PID file for single-instance lock.

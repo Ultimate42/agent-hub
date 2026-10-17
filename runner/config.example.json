@@ -4,8 +4,8 @@
   "defaultModel": "claude-sonnet-5-5",
   "maxTurns": 40,
   "maxMessagesPerMinute": 6,
-  "sdkModule": "/home/ubuntu/manager-service/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
-  "claudeExecutable": "/home/ubuntu/.local/bin/claude",
+  "sdkModule": "/path/to/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
+  "claudeExecutable": "/path/to/claude",
   "logFile": "/tmp/hub-session-runner.log",
   "agents": [
     {

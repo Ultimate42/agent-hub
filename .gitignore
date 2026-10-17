@@ -47,3 +47,12 @@ temp/
 
 # Database backups
 data/*.bak-*
+
+# Operational data & local config live OUTSIDE the repo (HUB_DATA_DIR, e.g. a runtime dir)
+data/
+archiviste/state.json
+archiviste/archiviste.pid
+archiviste/*.env
+*.env
+config.local.json
+runner/config.json

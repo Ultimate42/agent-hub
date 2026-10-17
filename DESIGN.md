@@ -282,7 +282,7 @@ Parameter `?agent=`:
 
 Run this command:
 ```bash
-claude mcp add --transport http agent-hub https://hub.rollium.fr/mcp \
+claude mcp add --transport http agent-hub https://hub.example.com/mcp \
   --header "Authorization: Bearer <MEMBER_TOKEN>"
 ```
 
@@ -395,7 +395,7 @@ The service CANNOT wake up these agents. The user must say "read the room" or "c
 
 **Traefik:** Add to `/opt/docker/docker-compose.yml` or standalone service with labels.
 
-**DNS:** `hub.rollium.fr` (to create)
+**DNS:** `hub.example.com` (to create)
 
 ---
 

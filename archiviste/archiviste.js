@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Archiviste Agent - Resident memory manager for Florent's health, sport, nutrition data
+ * Archiviste Agent - Resident memory manager for health, sport and nutrition data
  * Joins a room, monitors for commands, and interfaces with memory-agent API
  */
 
@@ -15,10 +15,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Configuration
-const ROOM_TOKEN = process.env.ROOM_TOKEN || '***REMOVED***';
+const ROOM_TOKEN = process.env.ROOM_TOKEN;
+// Runtime state (member token, pid) lives outside the repo: ARCHIVISTE_STATE_DIR (default: this directory)
+const STATE_DIR = process.env.ARCHIVISTE_STATE_DIR || __dirname;
 const AGENT_HUB_URL = process.env.AGENT_HUB_URL || 'http://localhost:4030';
 const MEMORY_API_URL = process.env.MEMORY_API_URL || 'http://localhost:4010';
-const STATE_FILE = path.join(__dirname, 'state.json');
+const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const AGENT_NAME = 'Archiviste';
 const AGENT_ROLE = 'agent';
 
@@ -30,7 +32,7 @@ let state = {
   welcomedAt: null,
 };
 
-const PID_FILE = path.join(__dirname, 'archiviste.pid');
+const PID_FILE = path.join(STATE_DIR, 'archiviste.pid');
 let messagesThisMinute = 0;
 let lastMinuteReset = Date.now();
 
@@ -631,6 +633,10 @@ function releasePidLock() {
  * Main loop
  */
 async function mainLoop() {
+  if (!ROOM_TOKEN) {
+    console.error('[ARCHIVISTE] ROOM_TOKEN env var is required (see archiviste/README.md)');
+    process.exit(1);
+  }
   console.log('[ARCHIVISTE] Starting main loop...');
 
   // Initial join
@@ -687,30 +693,33 @@ async function mainLoop() {
   }
 }
 
-// Start
-acquirePidLock();
-loadState();
-mainLoop().catch(err => {
-  console.error('[ARCHIVISTE] Fatal error:', err);
-  releasePidLock();
-  process.exit(1);
-});
+// Start only when run directly (importing for tests must not join a room)
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  acquirePidLock();
+  loadState();
+  mainLoop().catch(err => {
+    console.error('[ARCHIVISTE] Fatal error:', err);
+    releasePidLock();
+    process.exit(1);
+  });
 
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('[ARCHIVISTE] Received SIGTERM, shutting down gracefully');
-  saveState();
-  releasePidLock();
-  process.exit(0);
-});
+  // Handle graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('[ARCHIVISTE] Received SIGTERM, shutting down gracefully');
+    saveState();
+    releasePidLock();
+    process.exit(0);
+  });
 
-process.on('SIGINT', () => {
-  console.log('[ARCHIVISTE] Received SIGINT, shutting down gracefully');
-  saveState();
-  releasePidLock();
-  process.exit(0);
-});
+  process.on('SIGINT', () => {
+    console.log('[ARCHIVISTE] Received SIGINT, shutting down gracefully');
+    saveState();
+    releasePidLock();
+    process.exit(0);
+  });
 
-process.on('exit', () => {
-  releasePidLock();
-});
+  process.on('exit', () => {
+    releasePidLock();
+  });
+
+}
