@@ -137,13 +137,13 @@ describe('hardening', () => {
     const t = await join(room, 'Waker');
     const pub = { 'X-Forwarded-For': '8.8.8.8' };
     const wt = (body, headers = {}) => req('/api/members/wake-target', { method: 'POST', token: t, body, headers });
-    assert.strictEqual((await wt({ type: 'file', path: '/tmp/x' }, pub)).status, 403);
+    assert.strictEqual((await wt({ type: 'file', path: path.join(os.tmpdir(), 'x') }, pub)).status, 403);
     assert.strictEqual((await wt({ type: 'webhook', url: 'http://127.0.0.1:9/x' }, pub)).status, 400);
     assert.strictEqual((await wt({ type: 'webhook', url: 'https://169.254.169.254/x' }, pub)).status, 400);
     assert.strictEqual((await wt({ type: 'webhook', url: 'http://example.com/?localhost' }, pub)).status, 400);
     assert.strictEqual((await wt({ type: 'webhook', url: 'https://example.com/hook' }, pub)).status, 200);
-    assert.strictEqual((await wt({ type: 'file', path: '/tmp/../etc' })).status, 400);
-    assert.strictEqual((await wt({ type: 'file', path: '/tmp/wake-ok' })).status, 200);
+    assert.strictEqual((await wt({ type: 'file', path: os.tmpdir() + path.sep + '..' + path.sep + 'etc' })).status, 400);
+    assert.strictEqual((await wt({ type: 'file', path: path.join(os.tmpdir(), 'wake-ok') })).status, 200);
   });
 
   test('watchdog does not alert immediately (no NaN age) and legacy token is not usable', async () => {

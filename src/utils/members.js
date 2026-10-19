@@ -1,3 +1,5 @@
+import { parseDbTime } from './time.js';
+
 /**
  * Members list utilities: dedup and presence calculation
  */
@@ -12,9 +14,9 @@ export function calculatePresence(lastSeen) {
     return 'stale';
   }
 
-  const lastSeenTime = new Date(lastSeen).getTime();
-  const nowTime = Date.now();
-  const diffMs = nowTime - lastSeenTime;
+  const lastSeenTime = parseDbTime(lastSeen);
+  if (Number.isNaN(lastSeenTime)) return 'stale';
+  const diffMs = Date.now() - lastSeenTime;
 
   const fiveMinMs = 5 * 60 * 1000;      // 5 minutes
   const twentyFourHoursMs = 24 * 60 * 60 * 1000;  // 24 hours
@@ -46,8 +48,8 @@ export function deduplicateAndAddPresence(members) {
     } else {
       // Keep the one with the most recent last_seen
       const existing = byName.get(nameKey);
-      const lastSeenExisting = existing.last_seen ? new Date(existing.last_seen).getTime() : 0;
-      const lastSeenCurrent = member.last_seen ? new Date(member.last_seen).getTime() : 0;
+      const lastSeenExisting = existing.last_seen ? parseDbTime(existing.last_seen) : 0;
+      const lastSeenCurrent = member.last_seen ? parseDbTime(member.last_seen) : 0;
 
       if (lastSeenCurrent > lastSeenExisting) {
         byName.set(nameKey, member);

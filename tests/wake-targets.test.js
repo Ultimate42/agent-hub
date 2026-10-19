@@ -359,7 +359,7 @@ describe('Wake Targets Tests', () => {
       headers: { 'Authorization': `Bearer ${member2Token}` },
       body: JSON.stringify({
         type: 'file',
-        path: '/tmp/wake-notifications',
+        path: path.join(os.tmpdir(), 'wake-notifications'),
         max_retries: 3
       })
     });

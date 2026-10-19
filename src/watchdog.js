@@ -5,20 +5,10 @@ import { appendFileSync } from 'fs';
 import { generateToken } from './utils/tokens.js';
 import { publishMessage } from './services/messages.js';
 import { isMentioned } from './utils/mentions.js';
+import { parseDbTime } from './utils/time.js';
 
 const LEGACY_WATCHDOG_TOKEN = 'system-watchdog-token';
-/**
- * Parse a SQLite CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC, no zone marker)
- * or an ISO string into epoch ms. Returns NaN if invalid.
- */
-export function parseDbTime(value) {
-  if (typeof value !== 'string') return NaN;
-  const v = value.trim();
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(v)) {
-    return new Date(v.replace(' ', 'T') + 'Z').getTime();
-  }
-  return new Date(v).getTime();
-}
+export { parseDbTime };
 
 let watchdogInterval = null;
 let db = null;

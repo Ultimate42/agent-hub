@@ -9,7 +9,7 @@ import { AgentBridge } from '../runner/runner.js';
 import { HubSubscription } from '../runner/hub-client.js';
 import { makeFakeQuery, until } from './runner-helpers.js';
 
-const A = { name: 'Alpha', maxTurns: 3, maxMessagesPerMinute: 3, model: 'claude-sonnet-5-5', cwd: '/tmp', permissionMode: 'bypassPermissions', settingSources: [] };
+const A = { name: 'Alpha', maxTurns: 3, maxMessagesPerMinute: 3, model: 'claude-sonnet-5-5', cwd: os.tmpdir(), permissionMode: 'bypassPermissions', settingSources: [] };
 const peers = ['Alpha', 'Beta'];
 const m = (id, author, content, extra = {}) => ({ id, type: 'message', author, content, ...extra });
 
@@ -214,10 +214,10 @@ import { test as _t } from 'node:test';
 import _assert from 'node:assert';
 _t('permissions : défaut sûr (dontAsk + hub-post seul), surchargeable', () => {
   const base = { name: 'A', memberTokenFile: 'm', roomToken: 'r' };
-  const [a] = _nc({ agents: [base] }, '/tmp').agents;
+  const [a] = _nc({ agents: [base] }, os.tmpdir()).agents;
   _assert.equal(a.permissionMode, 'dontAsk');
   _assert.equal(a.allowedTools.length, 1);
   _assert.match(a.allowedTools[0], /^Bash\(node \/.*runner\/hub-post\.mjs:\*\)$/);
-  const [b] = _nc({ agents: [{ ...base, permissionMode: 'default', allowedTools: ['Read'] }] }, '/tmp').agents;
+  const [b] = _nc({ agents: [{ ...base, permissionMode: 'default', allowedTools: ['Read'] }] }, os.tmpdir()).agents;
   _assert.deepEqual([b.permissionMode, b.allowedTools], ['default', ['Read']]);
 });

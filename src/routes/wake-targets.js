@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import { database } from '../db.js';
 import { logger } from '../utils/logger.js';
-import { normalize } from 'path';
+import path_ from 'path';
+import { isValidWakeFilePath } from '../utils/paths.js';
+const { normalize } = path_;
 import { isDirectLocalRequest, isPrivateHost } from '../utils/net.js';
 
 const router = Router();
@@ -87,7 +89,7 @@ router.post('/members/wake-target', (req, res) => {
       if (typeof path !== 'string' || !path) {
         return res.status(400).json({ error: 'path is required for file type' });
       }
-      if (!path.startsWith('/') || path.includes('\0') || normalize(path).split('/').includes('..') || path.split('/').includes('..')) {
+      if (!isValidWakeFilePath(path)) {
         return res.status(400).json({ error: 'path must be absolute' });
       }
     }
