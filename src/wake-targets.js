@@ -1,7 +1,7 @@
 import { database } from './db.js';
 import { logger } from './utils/logger.js';
 import { writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
 import { isMentioned } from './utils/mentions.js';
 
 /**
@@ -129,7 +129,7 @@ export async function processWakeTargets(roomId, messageId, messageAuthorId, mes
         result = await notifyWebhook(wakeTarget.target_url, payload);
       } else if (wakeTarget.target_type === 'file') {
         const timestamp = Date.now();
-        const filePath = `${wakeTarget.target_path}/wake-${timestamp}-msg${messageId}.md`;
+        const filePath = join(wakeTarget.target_path, `wake-${timestamp}-msg${messageId}.md`);
         result = notifyFile(filePath, payload);
       } else {
         continue;
