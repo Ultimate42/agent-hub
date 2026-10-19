@@ -425,4 +425,25 @@ describe('Wake Targets Tests', () => {
 
     assert.strictEqual(res.status, 401);
   });
+
+  test('file wake target: direct loopback accepted, spoofed X-Forwarded-For rejected', async () => {
+    const hdr = { Authorization: `Bearer ${member1Token}` };
+    const body = JSON.stringify({ type: 'file', path: path.join(os.tmpdir(), 'wake-trustproxy-test.txt') });
+    const direct = await request('/api/members/wake-target', { method: 'POST', headers: hdr, body });
+    assert.strictEqual(direct.status, 200, JSON.stringify(direct.data));
+    const spoof = await request('/api/members/wake-target', { method: 'POST', headers: { ...hdr, 'X-Forwarded-For': '127.0.0.1' }, body });
+    assert.strictEqual(spoof.status, 403);
+  });
+});
+describe('Wake targets: direct-local check (trust proxy hardening)', () => {
+  test('isDirectLocalRequest rejects spoofed X-Forwarded-For and non-loopback sockets', async () => {
+    const { isDirectLocalRequest } = await import('../src/utils/net.js');
+    const mk = (addr, headers = {}) => ({ headers, socket: { remoteAddress: addr } });
+    assert.strictEqual(isDirectLocalRequest(mk('172.19.0.5', { 'x-forwarded-for': '127.0.0.1' })), false);
+    assert.strictEqual(isDirectLocalRequest(mk('172.19.0.5')), false);
+    assert.strictEqual(isDirectLocalRequest(mk('127.0.0.1', { 'x-forwarded-for': '1.2.3.4' })), false);
+    assert.strictEqual(isDirectLocalRequest(mk('127.0.0.1', { forwarded: 'for=1.2.3.4' })), false);
+    assert.strictEqual(isDirectLocalRequest(mk('127.0.0.1')), true);
+    assert.strictEqual(isDirectLocalRequest(mk('::ffff:127.0.0.1')), true);
+  });
 });

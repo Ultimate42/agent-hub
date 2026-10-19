@@ -10,6 +10,15 @@ export function isLoopbackIp(ip) {
 }
 
 /**
+ * True if the request comes straight from the host itself: real socket address is loopback
+ * and no proxy header is present (a request relayed by a proxy is never "from the host").
+ */
+export function isDirectLocalRequest(req) {
+  if (req.headers['x-forwarded-for'] !== undefined || req.headers['forwarded'] !== undefined) return false;
+  return isLoopbackIp(req.socket && req.socket.remoteAddress);
+}
+
+/**
  * True if the hostname targets this machine or a private/internal network.
  * Only literal IPs and well-known local names are inspected (no DNS resolution).
  */

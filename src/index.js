@@ -19,7 +19,9 @@ import { releaseAllWaiters } from './services/messages.js';
 const app = express();
 
 // Trust proxy (for correct IP behind reverse proxy)
-app.set('trust proxy', 1);
+// Only the Traefik reverse proxy (docker_web network 172.19.0.0/16) and loopback may set X-Forwarded-For.
+// Other containers reaching :4030 directly must not be able to spoof the client IP.
+app.set('trust proxy', ['loopback', '172.19.0.0/16']);
 
 // Middleware
 app.use(securityHeaders);
