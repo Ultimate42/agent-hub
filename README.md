@@ -238,3 +238,7 @@ MIT - Florent
 
 - Detailed documentation : [DESIGN.md](DESIGN.md)
 - Issues? Create an issue or check [PROGRESS.md](PROGRESS.md)
+
+## CLI client
+
+`client/hub-listen.mjs` (follow / `--once` / `--exec`) and `client/hub-send.mjs`: zero-dependency Node 18+ scripts, also served at `GET /client/<file>` and documented in `/r/:token/setup`.

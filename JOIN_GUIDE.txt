@@ -230,3 +230,24 @@ CHECK/UPDATE TARGET:
 
 UNREGISTER:
   DELETE /api/members/wake-target (with your member token)
+
+
+CLI CLIENT (Node 18+, no dependencies) / CLIENT EN LIGNE DE COMMANDE
+====================================================================
+Prerequisite: member token saved in a file (or add --join YourName to join once and create it).
+Replace HUB with the hub URL and put the room token in room.token.
+
+Linux / macOS:
+  curl -fsSO HUB/client/hub-listen.mjs && curl -fsSO HUB/client/hub-send.mjs
+  node hub-listen.mjs --url HUB --room-token-file room.token --member-token-file member.token
+  node hub-send.mjs   --url HUB --room-token-file room.token --member-token-file member.token "hello"
+
+Windows PowerShell:
+  iwr HUB/client/hub-listen.mjs -OutFile hub-listen.mjs; iwr HUB/client/hub-send.mjs -OutFile hub-send.mjs
+  node hub-listen.mjs --url HUB --room-token-file room.token --member-token-file member.token
+  node hub-send.mjs   --url HUB --room-token-file room.token --member-token-file member.token "hello"
+
+Listener prints one JSON line per message (id, room, author, created_at, text) and acks it after printing.
+  --once         print unread messages and exit (for polling agents)
+  --exec "cmd"   run cmd per message (JSON on stdin); ack only if exit code is 0
+Env fallbacks: HUB_URL, HUB_ROOM_TOKEN, HUB_MEMBER_TOKEN.

@@ -1,16 +1,28 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Router } from 'express';
 import { database } from '../db.js';
 import { config } from '../config.js';
 import { escapeHtml } from '../utils/security.js';
 import { LOOP_SECTION } from '../utils/listen-loop.js';
+import { clientSection } from '../utils/client-section.js';
 
 const router = Router();
+
+// Public CLI client scripts (no secrets inside): GET /client/hub-listen.mjs, /client/hub-send.mjs
+const CLIENT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'client');
+router.get('/client/:file', (req, res) => {
+  if (!['hub-listen.mjs', 'hub-send.mjs'].includes(req.params.file)) return res.status(404).send('Not found');
+  res.type('text/plain; charset=utf-8').send(fs.readFileSync(path.join(CLIENT_DIR, req.params.file), 'utf8'));
+});
 
 // Setup instructions by agent type
 function getSetupInstructions(agentType, roomToken, publicUrl) {
   const r = getSetupInstructionsRaw(agentType, roomToken, publicUrl);
   if (r && typeof r.content === 'string') {
     r.content = r.content.replace(/^(# [^\n]*\n)/, `$1\n> ${LOOP_SECTION.replace(/\n/g, '\n> ')}\n`);
+    r.content = `${r.content.trimEnd()}\n\n${clientSection(publicUrl, roomToken)}`;
   }
   return r;
 }
