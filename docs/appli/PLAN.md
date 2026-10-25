@@ -121,7 +121,7 @@ puis bascule premium seulement si l'éco ne tient pas ~1 s.
 
 ## 8. Questions ouvertes pour CoachManager
 
-1. Le coach peut-il streamer sa réponse (SSE/chunks) ? Sinon, faut-il le migrer vers `hub-session-runner` ?
-2. Garder Telegram en parallèle ou le couper après le MVP ?
+1. ~~Le coach peut-il streamer ?~~ Oui : CoachManager ajoute `POST /message?stream=1` (SSE) côté VPS ; l'appli code contre cette interface.
+2. ~~Garder Telegram ?~~ Oui, Telegram reste en parallèle.
 3. iOS est-il prioritaire (push PWA seulement si installée sur l'écran d'accueil) ?
 4. Langue et voix TTS souhaitées (voix française naturelle, clonage ?).
