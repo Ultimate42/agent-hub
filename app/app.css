@@ -102,6 +102,8 @@ button { font: inherit; cursor: pointer; }
   min-width: 22px; padding: 2px 7px; border-radius: 11px;
   background: var(--accent); color: var(--accent-fg); font-size: .75rem; text-align: center;
 }
+.sidebar-foot { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.hint { font-size: .8rem; margin: 4px 8px; }
 .sidebar-foot { padding: 8px 12px; padding-bottom: max(8px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); }
 .empty-list { padding: 24px 16px; color: var(--muted); }
 

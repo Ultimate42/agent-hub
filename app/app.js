@@ -10,6 +10,7 @@ const els = {
   chatName: $('chat-name'), chatMe: $('chat-me'),
   messages: $('messages'), list: $('message-list'), more: $('more-btn'),
   composer: $('composer'), input: $('input'), send: $('send-btn'),
+  pushBtn: $('push-btn'), pushHint: $('push-hint'),
   dialog: $('add-dialog'), addForm: $('add-form'), addToken: $('add-token'), addError: $('add-error')
 };
 
@@ -225,6 +226,7 @@ async function openThread(id) {
   renderMessages();
   renderThreads();
   history.replaceState(null, '', `#t=${id}`);
+  clearNotifications(id);
 
   const data = await api(`/threads/${id}/messages?limit=${PAGE}`);
   if (state.current !== id) return;
@@ -314,6 +316,7 @@ function connect() {
   ws.onopen = () => {
     state.wsRetry = 0;
     setConn('on');
+    sendVisibility();
     catchUp();
   };
   ws.onmessage = (ev) => {
@@ -328,6 +331,13 @@ function connect() {
     const delay = Math.min(30000, 1000 * 2 ** state.wsRetry++);
     setTimeout(connect, delay);
   };
+}
+
+// The hub sends Web Push only to sessions with no app visible on screen
+function sendVisibility() {
+  if (state.ws?.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: 'visibility', visible: document.visibilityState === 'visible' }));
+  }
 }
 
 function reconnect() {
@@ -360,7 +370,6 @@ function onLiveMessage(msg) {
     }
   } else if (!mine) {
     t.unread += 1;
-    notify(t, message);
   }
   renderThreads();
 }
@@ -382,11 +391,87 @@ async function catchUp() {
   }
 }
 
-// In-app notification while the app is open in the background (Web Push comes in step 2).
-function notify(t, m) {
-  if (document.visibilityState === 'visible' || !('Notification' in window) || Notification.permission !== 'granted') return;
-  const n = new Notification(t.room_name || 'Agent Hub', { body: `${m.author} : ${m.content}`.slice(0, 200), tag: `thread-${t.id}` });
-  n.onclick = () => { window.focus(); openThread(t.id); n.close(); };
+// --- Web Push ---------------------------------------------------------------------------
+// While the app is hidden or closed, the hub sends a Web Push; sw.js shows it and opens the thread on click.
+
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIos = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+function urlBase64ToUint8Array(b64) {
+  const s = atob((b64 + '='.repeat((4 - b64.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(s, c => c.charCodeAt(0));
+}
+
+async function currentSubscription() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+async function refreshPushButton() {
+  const btn = els.pushBtn;
+  const hint = els.pushHint;
+  btn.hidden = true;
+  hint.hidden = true;
+  if (state.threads.size === 0) return;
+  if (!pushSupported()) {
+    // iOS only offers Web Push to apps installed on the home screen
+    if (isIos() && !isStandalone()) {
+      hint.textContent = 'Pour les notifications : Partager › « Sur l\'écran d\'accueil », puis ouvre l\'appli depuis l\'icône.';
+      hint.hidden = false;
+    }
+    return;
+  }
+  btn.hidden = false;
+  btn.disabled = false;
+  if (Notification.permission === 'denied') {
+    btn.textContent = 'Notifications bloquées (réglages du navigateur)';
+    btn.disabled = true;
+    return;
+  }
+  const sub = await currentSubscription().catch(() => null);
+  btn.textContent = sub ? 'Désactiver les notifications' : 'Activer les notifications';
+  btn.dataset.on = sub ? '1' : '';
+}
+
+async function enablePush() {
+  if (await Notification.requestPermission() !== 'granted') return;
+  const reg = await navigator.serviceWorker.ready;
+  const { public_key } = await api('/push/key');
+  let sub = await reg.pushManager.getSubscription();
+  // A subscription made with another server key cannot be reused
+  if (sub && sub.options?.applicationServerKey) {
+    const current = new Uint8Array(sub.options.applicationServerKey).join();
+    if (current !== urlBase64ToUint8Array(public_key).join()) { await sub.unsubscribe(); sub = null; }
+  }
+  // subscribe() talks to the browser vendor's push service: never leave the button hanging
+  sub ||= await Promise.race([
+    reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(public_key) }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('le service de notifications ne répond pas')), 20000))
+  ]);
+  await api('/push/subscribe', { method: 'POST', body: sub.toJSON() });
+}
+
+async function disablePush() {
+  const sub = await currentSubscription();
+  if (!sub) return;
+  await api('/push/unsubscribe', { method: 'POST', body: { endpoint: sub.endpoint } }).catch(() => {});
+  await sub.unsubscribe();
+}
+
+// Re-register an existing subscription (new session, rotated server key, expired endpoint…)
+async function syncPush() {
+  const sub = await currentSubscription().catch(() => null);
+  if (sub && Notification.permission === 'granted' && state.threads.size) {
+    await api('/push/subscribe', { method: 'POST', body: sub.toJSON() }).catch(() => {});
+  }
+}
+
+async function clearNotifications(threadId) {
+  if (!pushSupported()) return;
+  const reg = await navigator.serviceWorker.getRegistration();
+  for (const n of await reg?.getNotifications({ tag: `thread-${threadId}` }) || []) n.close();
 }
 
 // --- Adding a thread ----------------------------------------------------------------
@@ -454,7 +539,7 @@ els.addForm.addEventListener('submit', async (e) => {
     const t = await addThread(els.addToken.value.trim());
     els.dialog.close();
     openThread(t.id);
-    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+    refreshPushButton();
   } catch (err) {
     els.addError.textContent = err.status === 403 ? 'Jeton invalide ou membre non humain.' : err.message;
     els.addError.hidden = false;
@@ -472,14 +557,33 @@ $('remove-btn').addEventListener('click', async () => {
 
 $('logout-btn').addEventListener('click', async () => {
   if (!confirm('Se déconnecter de cet appareil ?')) return;
+  await disablePush().catch(() => {});
   await api('/logout', { method: 'POST', body: {} }).catch(() => {});
   location.replace(location.pathname);
 });
 
+els.pushBtn.addEventListener('click', async () => {
+  els.pushBtn.disabled = true;
+  try {
+    if (els.pushBtn.dataset.on) await disablePush();
+    else await enablePush();
+  } catch (err) {
+    alert(`Notifications indisponibles : ${err.message}`);
+  }
+  refreshPushButton();
+});
+
 document.addEventListener('visibilitychange', () => {
+  sendVisibility();
   if (document.visibilityState !== 'visible') return;
   markRead();
+  if (state.current) clearNotifications(state.current);
   if (!state.ws) connect();
+});
+
+// Click on a notification while the app is already open (sw.js posts the thread to open)
+navigator.serviceWorker?.addEventListener('message', (e) => {
+  if (e.data?.type === 'open-thread' && state.threads.has(e.data.thread)) openThread(e.data.thread);
 });
 window.addEventListener('online', () => { if (!state.ws) connect(); });
 
@@ -506,6 +610,8 @@ async function start() {
   }
   if (state.threads.size === 0 && !els.dialog.open) showAddDialog();
   connect();
+  refreshPushButton();
+  syncPush();
   if (openId && state.threads.has(openId)) openThread(openId);
   else if (!matchMedia('(max-width: 720px)').matches && state.threads.size) openThread(sortedThreads()[0].id);
 }

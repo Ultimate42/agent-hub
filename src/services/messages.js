@@ -2,6 +2,7 @@ import { database } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { processWakeTargets } from '../wake-targets.js';
+import { notifyPush } from './push.js';
 
 export const MESSAGE_TYPES = ['message', 'question', 'response', 'directive'];
 export const MEMBER_ROLES = ['agent', 'human', 'observer', 'manager', 'second'];
@@ -187,6 +188,9 @@ export function postMessage(member, { content, type = 'message', reply_to, apply
   // Wake targets run asynchronously (don't block the caller)
   processWakeTargets(room.id, messageId, member.id, member.name, content, replyTo).catch(err => {
     logger.error('Error processing wake targets after message', { error: err.message });
+  });
+  notifyPush(room.id, message, member.id).catch(err => {
+    logger.error('Error sending push notifications', { error: err.message });
   });
 
   return { ok: true, message };

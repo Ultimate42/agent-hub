@@ -6,9 +6,11 @@ import { config } from '../config.js';
 import { postMessage, setWsBroadcaster } from '../services/messages.js';
 import { checkRateLimit } from '../utils/security.js';
 import { APP_COOKIE, getAppSession, getThreads, readCookie, isSameOrigin } from '../services/app-sessions.js';
+import { setAppPresenceChecker } from '../services/push.js';
 
 // Track connected clients by room
 const roomClients = new Map(); // roomId -> Set<{ws, member}>
+const appSockets = new Map(); // app sessionId -> Set<{visible}> (one entry per open app socket)
 
 /**
  * Set up WebSocket server on existing HTTP server
@@ -22,6 +24,8 @@ export function setupWebSocket(server) {
 
   // Make REST / MCP / watchdog messages reach WebSocket clients too
   setWsBroadcaster((roomId, message) => broadcastToRoom(roomId, message));
+  // A session with a visible app on screen sees messages live: no Web Push for it
+  setAppPresenceChecker((sessionId) => [...(appSockets.get(sessionId) || [])].some(s => s.visible));
 
   wss.on('connection', (ws, req) => {
     // Extract token from query string
@@ -220,7 +224,8 @@ function broadcastToRoom(roomId, message, excludeWs = null) {
 
 /**
  * App (PWA) connection: authenticated by the HttpOnly session cookie, subscribed to every thread
- * of the session. Receive-only (the app posts over REST); presence is not announced.
+ * of the session. The app posts over REST: this socket only takes ping and visibility frames
+ * (visibility decides between live delivery and Web Push). Presence is not announced to the room.
  */
 function handleAppConnection(ws, req) {
   if (!isSameOrigin(req)) {
@@ -243,14 +248,23 @@ function handleAppConnection(ws, req) {
   }
   ws.on('pong', () => { for (const c of clients) c.alive = true; });
 
+  // Visible until the app says otherwise (it reports document.visibilityState changes)
+  const presence = { visible: true };
+  if (!appSockets.has(sessionId)) appSockets.set(sessionId, new Set());
+  appSockets.get(sessionId).add(presence);
+
   ws.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { msg = null; }
     if (msg?.type === 'ping') safeSend(ws, { type: 'pong' });
+    else if (msg?.type === 'visibility') presence.visible = msg.visible === true;
     else safeSend(ws, { type: 'error', message: 'App socket is receive-only; post over /app/api' });
   });
 
   ws.on('close', () => {
+    const sockets = appSockets.get(sessionId);
+    sockets?.delete(presence);
+    if (sockets && sockets.size === 0) appSockets.delete(sessionId);
     for (const c of clients) {
       const set = roomClients.get(c.member.room_id);
       set?.delete(c);
