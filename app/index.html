@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1f6feb">
+  <meta name="color-scheme" content="light dark">
+  <title>Agent Hub</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div id="app" class="layout" data-view="list">
+    <aside class="sidebar" aria-label="Fils">
+      <header class="bar">
+        <h1>Agent Hub</h1>
+        <span id="conn" class="conn" title="Connexion temps réel" data-state="off"></span>
+        <button id="add-btn" class="icon-btn" type="button" title="Ajouter un fil" aria-label="Ajouter un fil">+</button>
+      </header>
+      <ul id="threads" class="threads"></ul>
+      <footer class="sidebar-foot">
+        <button id="logout-btn" class="link-btn" type="button">Se déconnecter</button>
+      </footer>
+    </aside>
+
+    <main class="chat" aria-live="polite">
+      <header class="bar">
+        <button id="back-btn" class="icon-btn back" type="button" aria-label="Retour aux fils">‹</button>
+        <div class="chat-title">
+          <h2 id="chat-name"></h2>
+          <span id="chat-me" class="muted"></span>
+        </div>
+        <button id="remove-btn" class="link-btn" type="button" title="Retirer ce fil de l'appli">Retirer</button>
+      </header>
+      <div id="messages" class="messages">
+        <button id="more-btn" class="link-btn more" type="button" hidden>Messages plus anciens</button>
+        <ol id="message-list"></ol>
+      </div>
+      <form id="composer" class="composer" autocomplete="off">
+        <textarea id="input" rows="1" placeholder="Message" aria-label="Message" maxlength="65536"></textarea>
+        <button id="send-btn" type="submit" aria-label="Envoyer">➤</button>
+      </form>
+      <p id="empty-chat" class="empty">Choisis un fil.</p>
+    </main>
+  </div>
+
+  <dialog id="add-dialog">
+    <form id="add-form" method="dialog">
+      <h2>Ajouter un fil</h2>
+      <p class="muted">Colle ton jeton de membre (rôle <em>human</em>) pour ce salon. Il reste sur le serveur&nbsp;: l'appli ne le garde pas.</p>
+      <input id="add-token" name="token" type="password" autocomplete="off" spellcheck="false" placeholder="Jeton de membre" required>
+      <p id="add-error" class="error" hidden></p>
+      <div class="actions">
+        <button id="add-cancel" type="button" class="link-btn">Annuler</button>
+        <button type="submit">Ajouter</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -110,6 +110,23 @@ db.exec(`
     UNIQUE(member_id, message_id)
   );
 
+  -- App (PWA) sessions: one HttpOnly cookie gives access to several threads (one member per room).
+  -- Only hashes are stored; a thread stays valid while its member token is unchanged (rotation revokes it).
+  CREATE TABLE IF NOT EXISTS app_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT UNIQUE NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS app_session_threads (
+    session_id INTEGER NOT NULL REFERENCES app_sessions(id) ON DELETE CASCADE,
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    member_token_hash TEXT NOT NULL,
+    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, member_id)
+  );
+
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_rooms_token ON rooms(token);
   CREATE INDEX IF NOT EXISTS idx_members_token ON members(token);

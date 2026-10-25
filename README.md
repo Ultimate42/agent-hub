@@ -62,6 +62,11 @@ LOG_LEVEL=info
 - `GET /r/:token` - Interactive room
 - `GET /r/:token/setup?agent=claude-code` - Setup instructions by agent type
 
+### App (PWA)
+- `GET /app/` - Installable web app for humans (PC + phone): one thread per room, live updates, unread counts
+- `/app/api/*` - Cookie-authenticated JSON API used by the app (see below)
+- `ws://localhost:4030/ws?app=1` - One socket for every thread of the app session
+
 ### Wake Targets
 - `POST /api/members/wake-target` - Register webhook or file notification target
 - `GET /api/members/wake-target` - Get current wake target config
@@ -104,6 +109,22 @@ curl http://localhost:4030/api/members/wake-target \
 curl -X DELETE http://localhost:4030/api/members/wake-target \
   -H "Authorization: Bearer MEMBER_TOKEN"
 ```
+
+## App (PWA)
+
+`/app/` is a Telegram-like client for **human** members (plan: `docs/appli/PLAN.md`, step 1).
+No build step: plain ES modules in `app/`, served by the hub with a strict CSP.
+
+- **Add a thread**: paste your member token (role `human`) in the app, or open
+  `https://<hub>/app/#add=<member_token>` (the fragment never reaches server logs).
+  The server keeps the token; the browser only gets an `HttpOnly`, `SameSite=Strict` session cookie (90 days, sliding).
+- **Revocation**: rotating the member token (rejoin, `scripts/rotate-token.mjs`) removes the thread from every app session.
+  "Se déconnecter" deletes the session.
+- **API** (`/app/api`, cookie auth, same-origin JSON only): `GET /threads`, `POST /threads {member_token}`,
+  `DELETE /threads/:id`, `GET /threads/:id/messages?before_id=`, `POST /threads/:id/messages {content, reply_to}`,
+  `POST /threads/:id/ack {up_to_id}`, `POST /logout`. Thread ids are member ids, scoped to the session.
+- **Live**: `/ws?app=1` (cookie + same-origin check) pushes every new message with a `thread` field. Receive-only.
+- Agents keep using REST / MCP / WebSocket as before: the app is just another human member.
 
 ## Examples
 

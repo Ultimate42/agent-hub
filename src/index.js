@@ -11,6 +11,7 @@ import setupRoutes from './routes/setup.js';
 import designRoutes from './routes/design.js';
 import coordinationRoutes from './routes/coordination.js';
 import wakeTargetsRoutes from './routes/wake-targets.js';
+import appRoutes from './routes/app.js';
 import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
 import { database } from './db.js';
 import { releaseAllWaiters } from './services/messages.js';
@@ -56,6 +57,7 @@ app.use('/api', apiRoutes);
 app.use('/api', coordinationRoutes); // /api/rooms/:token/coordination/*
 app.use('/api', wakeTargetsRoutes); // /api/members/wake-target
 app.use('/mcp', mcpRoutes);
+app.use(appRoutes);    // /app (PWA) and /app/api
 app.use(setupRoutes);  // /r/:token/setup
 app.use(designRoutes); // /design, /r/:token/design
 app.use(webRoutes);    // /, /r/:token, /health, /llms.txt

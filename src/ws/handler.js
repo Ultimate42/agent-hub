@@ -5,6 +5,7 @@ import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import { postMessage, setWsBroadcaster } from '../services/messages.js';
 import { checkRateLimit } from '../utils/security.js';
+import { APP_COOKIE, getAppSession, getThreads, readCookie, isSameOrigin } from '../services/app-sessions.js';
 
 // Track connected clients by room
 const roomClients = new Map(); // roomId -> Set<{ws, member}>
@@ -32,6 +33,11 @@ export function setupWebSocket(server) {
       return;
     }
     const token = url.searchParams.get('token');
+
+    if (!token && url.searchParams.get('app') === '1') {
+      handleAppConnection(ws, req);
+      return;
+    }
 
     if (!token) {
       ws.close(4001, 'Token required');
@@ -115,7 +121,7 @@ export function setupWebSocket(server) {
   const pingTimer = setInterval(() => {
     for (const [roomId, clients] of roomClients.entries()) {
       for (const client of clients) {
-        if (client.ws.readyState !== client.ws.OPEN || !client.alive) {
+        if (client.ws.readyState !== client.ws.OPEN || !client.alive || (client.app && !appClientValid(client))) {
           clients.delete(client);
           client.ws.terminate();
           continue;
@@ -205,8 +211,64 @@ function broadcastToRoom(roomId, message, excludeWs = null) {
 
   for (const client of clients) {
     if (client.ws !== excludeWs && client.ws.readyState === client.ws.OPEN) {
-      try { client.ws.send(data); } catch { /* socket closing */ }
+      // App clients get every room on one socket: tag each event with its thread (member id)
+      const payload = client.app ? JSON.stringify({ ...message, thread: client.member.id }) : data;
+      try { client.ws.send(payload); } catch { /* socket closing */ }
     }
+  }
+}
+
+/**
+ * App (PWA) connection: authenticated by the HttpOnly session cookie, subscribed to every thread
+ * of the session. Receive-only (the app posts over REST); presence is not announced.
+ */
+function handleAppConnection(ws, req) {
+  if (!isSameOrigin(req)) {
+    ws.close(4003, 'Cross-origin refused');
+    return;
+  }
+  const sessionId = getAppSession(readCookie(req.headers.cookie, APP_COOKIE));
+  if (!sessionId) {
+    ws.close(4001, 'No app session');
+    return;
+  }
+
+  const clients = [];
+  for (const member of getThreads(sessionId)) {
+    database.updateMemberLastSeen(member.id);
+    if (!roomClients.has(member.room_id)) roomClients.set(member.room_id, new Set());
+    const client = { ws, member, token: member.token, alive: true, app: true, sessionId };
+    roomClients.get(member.room_id).add(client);
+    clients.push(client);
+  }
+  ws.on('pong', () => { for (const c of clients) c.alive = true; });
+
+  ws.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { msg = null; }
+    if (msg?.type === 'ping') safeSend(ws, { type: 'pong' });
+    else safeSend(ws, { type: 'error', message: 'App socket is receive-only; post over /app/api' });
+  });
+
+  ws.on('close', () => {
+    for (const c of clients) {
+      const set = roomClients.get(c.member.room_id);
+      set?.delete(c);
+      if (set && set.size === 0) roomClients.delete(c.member.room_id);
+    }
+  });
+  ws.on('error', (err) => logger.error('WebSocket error', { error: err.message }));
+
+  logger.info('App WebSocket connected', { sessionId, threads: clients.length });
+  safeSend(ws, { type: 'connected', threads: clients.map(c => c.member.id) });
+}
+
+/** An app client stays subscribed only while its session exists and its member token was not rotated. */
+function appClientValid(client) {
+  try {
+    return getThreads(client.sessionId).some(m => m.id === client.member.id && m.token === client.token);
+  } catch {
+    return false;
   }
 }
 
