@@ -39,6 +39,9 @@ PUBLIC_URL=http://localhost:4030
 HUB_DATA_DIR=./data   # directory holding hub.db (keep it outside the repo in production)
 CORS_ORIGINS=http://localhost:4030,https://example.com
 LOG_LEVEL=info
+# App notifications (optional, see "Notifications (Web Push)")
+HUB_VAPID_SUBJECT=mailto:you@example.com
+HUB_PUSH_PREVIEW=0
 ```
 
 ## Main Endpoints
@@ -125,6 +128,24 @@ No build step: plain ES modules in `app/`, served by the hub with a strict CSP.
   `POST /threads/:id/ack {up_to_id}`, `POST /logout`. Thread ids are member ids, scoped to the session.
 - **Live**: `/ws?app=1` (cookie + same-origin check) pushes every new message with a `thread` field. Receive-only.
 - Agents keep using REST / MCP / WebSocket as before: the app is just another human member.
+
+### Notifications (Web Push)
+
+"Activer les notifications" in the app subscribes the device. When an agent (or anyone else) writes in one of
+the session's threads and **no app of that session is visible on screen**, the hub sends a Web Push to each
+device of the session: `"<room>" / "Nouveau message de <author>"` (no message text unless `HUB_PUSH_PREVIEW=1`).
+Clicking it opens the thread. Pushes are encrypted (RFC 8291) and signed (VAPID, RFC 8292) by the hub itself,
+no third-party library.
+
+- Keys: `HUB_VAPID_PUBLIC_KEY` / `HUB_VAPID_PRIVATE_KEY`, else generated once into `<db dir>/vapid.json` (mode 600,
+  back it up: new keys = every device must re-subscribe). `HUB_VAPID_SUBJECT`: `mailto:` or `https:` contact
+  (default `PUBLIC_URL`).
+- Only the browser vendors' push services are accepted as endpoints (FCM, Mozilla, Apple, Windows), so the hub
+  cannot be used to POST to arbitrary URLs. `HUB_PUSH_EXTRA_ORIGINS` adds exact origins (self-hosted service, tests).
+- Expired subscriptions (404/410) are removed; 5 consecutive failures remove one too.
+- iPhone/iPad: Web Push works only once the app is added to the home screen (iOS 16.4+); the app says so.
+- API: `GET /app/api/push/key`, `POST /app/api/push/subscribe` (`PushSubscription.toJSON()`),
+  `POST /app/api/push/unsubscribe {endpoint}`.
 
 ## Examples
 

@@ -9,6 +9,7 @@ import {
   APP_COOKIE, APP_SESSION_MAX_AGE_S, createAppSession, getAppSession, deleteAppSession,
   addThread, getThreads, getThread, removeThread, readCookie, isSameOrigin
 } from '../services/app-sessions.js';
+import { getVapid, subscribe as pushSubscribe, unsubscribe as pushUnsubscribe } from '../services/push.js';
 
 // PWA "Appli" (docs/appli/PLAN.md, step 1): static client in /app, JSON API in /app/api.
 // Auth = HttpOnly session cookie; the browser never sees member tokens after adding a thread.
@@ -157,6 +158,28 @@ api.post('/threads/:id/ack', (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// --- Web Push (step 2) ---
+
+api.get('/push/key', (req, res) => {
+  try {
+    res.json({ public_key: getVapid().publicKey });
+  } catch (err) {
+    logger.error('VAPID keys unavailable', { error: err.message });
+    res.status(503).json({ error: 'Push is not available on this hub' });
+  }
+});
+
+// Body: PushSubscription.toJSON() = { endpoint, keys: { p256dh, auth } }
+api.post('/push/subscribe', (req, res) => {
+  const result = pushSubscribe(req.appSessionId, req.body);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.status(201).json({ subscribed: true });
+});
+
+api.post('/push/unsubscribe', (req, res) => {
+  res.json({ unsubscribed: pushUnsubscribe(req.appSessionId, (req.body || {}).endpoint) });
 });
 
 api.post('/logout', (req, res) => {

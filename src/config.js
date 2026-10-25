@@ -37,5 +37,13 @@ export const config = {
   // Watchdog
   unreplySeconds: parseInt(process.env.HUB_UNREPLY_SECONDS || '120', 10),
   watchdogIntervalMs: parseInt(process.env.HUB_WATCHDOG_INTERVAL_MS || '15000', 10),
-  notifyWebhookFile: process.env.HUB_NOTIFY_WEBHOOK_FILE || null
+  notifyWebhookFile: process.env.HUB_NOTIFY_WEBHOOK_FILE || null,
+
+  // Web Push (app). Keys: env, else generated once into <db dir>/vapid.json (mode 600).
+  vapidPublicKey: process.env.HUB_VAPID_PUBLIC_KEY || null,
+  vapidPrivateKey: process.env.HUB_VAPID_PRIVATE_KEY || null,
+  vapidSubject: process.env.HUB_VAPID_SUBJECT || null, // mailto: or https: URL; defaults to PUBLIC_URL
+  pushPreview: process.env.HUB_PUSH_PREVIEW === '1',   // include a text excerpt in notifications
+  // Extra push service origins allowed besides the browser vendors' (self-hosted services, tests)
+  pushExtraOrigins: (process.env.HUB_PUSH_EXTRA_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
 };

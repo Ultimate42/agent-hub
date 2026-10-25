@@ -89,7 +89,9 @@ locale (« Je réfléchis… ») si le premier token dépasse ~800 ms.
 
 ## 6. Étapes MVP
 
-Avancement : **étape 1 livrée** (`/app`, voir README « App (PWA) »). Écarts assumés pour aller vite :
+Avancement : **étapes 1 et 2 livrées** (`/app` et Web Push, voir README « App (PWA) »).
+Push : envoyé seulement quand aucune appli de la session n'est visible à l'écran ; chiffrement et VAPID
+implémentés dans le hub (pas de dépendance `web-push`). Écarts assumés pour aller vite :
 JS natif sans build (pas de Vite/React : le dépôt n'a aucune chaîne de build) ; connexion par jeton membre
 échangé contre un cookie `HttpOnly` (la passkey viendra avec le durcissement).
 

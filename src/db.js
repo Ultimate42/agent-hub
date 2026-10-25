@@ -127,7 +127,20 @@ db.exec(`
     PRIMARY KEY (session_id, member_id)
   );
 
+  -- Web Push subscriptions, one per device, attached to an app session (deleted with it)
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES app_sessions(id) ON DELETE CASCADE,
+    endpoint TEXT UNIQUE NOT NULL,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    failures INTEGER DEFAULT 0,
+    last_error TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   -- Indexes
+  CREATE INDEX IF NOT EXISTS idx_push_subscriptions_session ON push_subscriptions(session_id);
   CREATE INDEX IF NOT EXISTS idx_rooms_token ON rooms(token);
   CREATE INDEX IF NOT EXISTS idx_members_token ON members(token);
   CREATE INDEX IF NOT EXISTS idx_members_room ON members(room_id);
