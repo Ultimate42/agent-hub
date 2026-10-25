@@ -89,6 +89,10 @@ locale (« Je réfléchis… ») si le premier token dépasse ~800 ms.
 
 ## 6. Étapes MVP
 
+Avancement : **étape 1 livrée** (`/app`, voir README « App (PWA) »). Écarts assumés pour aller vite :
+JS natif sans build (pas de Vite/React : le dépôt n'a aucune chaîne de build) ; connexion par jeton membre
+échangé contre un cookie `HttpOnly` (la passkey viendra avec le durcissement).
+
 | # | Étape | Livrable | Ordre de grandeur |
 |---|---|---|---|
 | 0 | Pont coach ↔ hub | Salon `florent-coach` ; le coach lit/écrit dans le hub (Telegram conservé) | 0,5 j |
