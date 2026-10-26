@@ -423,13 +423,17 @@ router.get('/r/:token', (req, res) => {
       gap: 10px;
       border-top: 1px solid var(--code-bg);
     }
-    .input-area textarea {
-      resize: none;
+    #message-input {
       max-height: 160px;
-      font-family: inherit;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
       line-height: 1.4;
+      outline: none;
+      cursor: text;
     }
-    .input-area input, .input-area textarea {
+    #message-input.empty::before { content: attr(data-placeholder); color: #888; pointer-events: none; }
+    .input-area input, #message-input {
       flex: 1;
       padding: 12px;
       border: 1px solid var(--accent);
@@ -580,7 +584,7 @@ router.get('/r/:token', (req, res) => {
         <input type="file" id="file-input" multiple style="display:none" onchange="addPendingFiles(this.files); this.value=''">
         <button type="button" class="attach-btn" title="Attach files (or paste / drop them)" onclick="document.getElementById('file-input').click()">&#128206;</button>
         <button type="button" class="attach-btn" id="record-btn" title="Record a voice message" onclick="RoomUI.toggleRecording(this, f => addPendingFiles([f]))">&#127908;</button>
-        <textarea id="message-input" rows="1" placeholder="Type a message... (Markdown, @ to mention, Shift+Enter for a new line)"></textarea>
+        <div id="message-input" data-placeholder="Type a message... (Markdown, @ to mention, Shift+Enter for a new line)"></div>
         <button onclick="sendMessage()">Send</button>
       </div>
     </div>
@@ -606,7 +610,9 @@ router.get('/r/:token', (req, res) => {
     let replyTo = null;
 
     // Textarea: Enter sends, Shift+Enter new line, @ opens the member menu
-    const messageInput = document.getElementById('message-input');
+    const messageInput = RoomUI.createPlainEditor(document.getElementById('message-input'), {
+      onFiles: (files) => addPendingFiles(files)
+    });
     const mentionKey = RoomUI.attachMentionAutocomplete(messageInput, () => memberNames);
     messageInput.addEventListener('keydown', (e) => {
       if (mentionKey(e)) return;
@@ -614,10 +620,6 @@ router.get('/r/:token', (req, res) => {
         e.preventDefault();
         sendMessage();
       }
-    });
-    messageInput.addEventListener('input', () => {
-      messageInput.style.height = 'auto';
-      messageInput.style.height = messageInput.scrollHeight + 'px';
     });
 
     function snippet(msg) {
@@ -1117,6 +1119,7 @@ router.get('/r/:token', (req, res) => {
 
     // Paste (screenshots) and drag & drop
     document.addEventListener('paste', (e) => {
+      if (e.defaultPrevented) return; // already handled by the message editor
       const files = Array.from(e.clipboardData?.files || []);
       if (files.length) { e.preventDefault(); addPendingFiles(files); }
     });
@@ -1124,9 +1127,10 @@ router.get('/r/:token', (req, res) => {
     dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
     dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
     dropZone.addEventListener('drop', (e) => {
+      const handled = e.defaultPrevented; // dropped on the message editor, already taken
       e.preventDefault();
       dropZone.classList.remove('dragover');
-      if (e.dataTransfer?.files?.length) addPendingFiles(e.dataTransfer.files);
+      if (!handled && e.dataTransfer?.files?.length) addPendingFiles(e.dataTransfer.files);
     });
 
     async function uploadFile(file) {
@@ -1145,7 +1149,7 @@ router.get('/r/:token', (req, res) => {
     }
 
     async function sendMessage() {
-      const input = document.getElementById('message-input');
+      const input = messageInput;
       const content = input.value.trim();
       if (!content && pendingFiles.length === 0) return;
 
@@ -1166,7 +1170,6 @@ router.get('/r/:token', (req, res) => {
 
         if (res.ok) {
           input.value = '';
-          input.style.height = 'auto';
           pendingFiles = [];
           renderPendingFiles();
           cancelReply();
