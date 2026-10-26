@@ -90,7 +90,10 @@ export function countPendingUnreplied(messages, members, reacted = new Set()) {
       const msg = messages[i];
       if (msg.author === 'HubWatchdog' || msg.author === 'system' || msg.author === 'Transcription') continue;
       if (msg.deleted_at || reacted.has(`${msg.id}:${member.id}`)) continue;
-      if ((msg.reply_to && authorOf.get(msg.reply_to) === member.id) || isMentioned(msg.content, member.name)) {
+      const mentioned = isMentioned(msg.content, member.name);
+      const repliedTo = msg.reply_to && authorOf.get(msg.reply_to) === member.id &&
+        !members.some(o => o.id !== member.id && isMentioned(msg.content, o.name));
+      if (mentioned || repliedTo) {
         count++;
       }
     }

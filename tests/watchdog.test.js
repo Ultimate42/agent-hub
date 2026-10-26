@@ -244,6 +244,31 @@ describe('Watchdog Tests', () => {
     assert.strictEqual(alerts.length, 1, `expected a single alert, got: ${alerts.map(a => a.content).join(' | ')}`);
   });
 
+  test('A reply that @mentions someone else is not addressed to the replied-to author', async () => {
+    // Agent1 asks a question; Agent2 replies to it but addresses Florent (ignored member)
+    const { data: q } = await request(`/api/rooms/${roomToken}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${member1Token}` },
+      body: JSON.stringify({ content: 'status?' })
+    });
+    // Agent1 comes back so a previous absence report does not mask the result
+    await request(`/api/rooms/${roomToken}/messages/history?limit=1`, { headers: { 'Authorization': `Bearer ${member1Token}` } });
+    await new Promise(r => setTimeout(r, 1100));
+    const { data: reply } = await request(`/api/rooms/${roomToken}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${member2Token}` },
+      body: JSON.stringify({ content: '@Florent FYI, see above', reply_to: q.id })
+    });
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    const { data } = await request(`/api/rooms/${roomToken}/messages/history?limit=100`, {
+      headers: { 'Authorization': `Bearer ${member2Token}` }
+    });
+    const alert = data.messages.find(m => m.author === 'HubWatchdog' && m.content.includes(`message #${reply.id} `));
+    assert.strictEqual(alert, undefined, 'Agent1 was replied to but not addressed');
+  });
+
   test('No alert if addressee replies quickly', async () => {
     // Agent1 mentions Agent2
     const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
