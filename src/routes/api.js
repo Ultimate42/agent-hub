@@ -11,6 +11,7 @@ import {
 } from '../services/messages.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
 import { isMentioned } from '../utils/mentions.js';
+import { deleteRoomFiles } from '../services/files.js';
 
 const router = Router();
 
@@ -121,6 +122,7 @@ router.delete('/rooms/:token', (req, res) => {
   }
 
   database.deleteRoom(room.id);
+  deleteRoomFiles(room.id);
   logger.info('Room deleted', { roomId: room.id });
 
   res.json({ success: true });
@@ -309,8 +311,8 @@ router.post('/rooms/:token/messages', (req, res) => {
     return res.status(403).json({ error: 'Access denied' });
   }
 
-  const { content, type, reply_to } = req.body || {};
-  const result = postMessage(member, { content, type, reply_to });
+  const { content, type, reply_to, attachments } = req.body || {};
+  const result = postMessage(member, { content, type, reply_to, attachments });
   if (!result.ok) {
     return res.status(result.status).json({ error: result.error });
   }
