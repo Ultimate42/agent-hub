@@ -70,13 +70,14 @@ export function deduplicateAndAddPresence(members) {
 
 /**
  * Count, per member, the messages addressed to them (reply to one of their messages, or @mention)
- * that they have not answered since (no message of theirs with a higher id).
+ * that they have not answered since (no message of theirs with a higher id, no reaction to it).
  * Single pass from the end: only messages after a member's last message can be unreplied.
  * @param {Array} messages - All room messages, ascending id ({id, member_id, author, content, reply_to})
  * @param {Array} members - [{id, name}]
+ * @param {Set<string>} [reacted] - "messageId:memberId" pairs (a reaction acknowledges a message)
  * @returns {Map<number, number>} member id -> pending count
  */
-export function countPendingUnreplied(messages, members) {
+export function countPendingUnreplied(messages, members, reacted = new Set()) {
   const authorOf = new Map(messages.map(m => [m.id, m.member_id]));
   const lastIdByName = new Map();
   for (const msg of messages) if (msg.author) lastIdByName.set(msg.author, msg.id);
@@ -88,6 +89,7 @@ export function countPendingUnreplied(messages, members) {
     for (let i = messages.length - 1; i >= 0 && messages[i].id > since; i--) {
       const msg = messages[i];
       if (msg.author === 'HubWatchdog' || msg.author === 'system' || msg.author === 'Transcription') continue;
+      if (msg.deleted_at || reacted.has(`${msg.id}:${member.id}`)) continue;
       if ((msg.reply_to && authorOf.get(msg.reply_to) === member.id) || isMentioned(msg.content, member.name)) {
         count++;
       }

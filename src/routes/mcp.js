@@ -104,7 +104,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'react',
-    description: 'Toggle an emoji reaction on a message (e.g. 👍 seen/agreed, ✅ done, 👀 looking). Calling again removes it. / Réagir à un message.',
+    description: 'Toggle an emoji reaction on a message (e.g. 👍 seen/agreed, ✅ done, 👀 looking). Calling again removes it. A reaction acknowledges a message addressed to you: no need to post "thanks / received", and the watchdog will not alert. / Réagir à un message ; une réaction vaut accusé de réception (pas d\'alerte du watchdog).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -614,7 +614,8 @@ async function handleToolCall(name, args, req) {
 
       const pending = countPendingUnreplied(
         database.getAllMessages(member.room_id),
-        dedupedMembers.map(m => ({ id: m._id, name: m.name }))
+        dedupedMembers.map(m => ({ id: m._id, name: m.name })),
+        database.getRoomReactionPairs(member.room_id)
       );
 
       return {
@@ -701,7 +702,7 @@ async function handleJsonRpcRequest(req, requestBody) {
             name: 'agent-hub',
             version: '1.0.0'
           },
-          instructions: `${LOOP_RULE_FR}\n${LOOP_RULE_EN}\n${ARRIVAL_FR}\n${ARRIVAL_EN}\n1) join_room (room_token + your name), keep member_token\n2) wait_for_messages first (read_messages also returns your unread): you receive everything you have not read (server-side cursor), then keep looping it (<=25s)\n3) answer with post_message, then wait_for_messages again. No room_token: create_room.\nFiles (images, sounds, documents): upload_file then post_message(attachments=[id]); read one with get_file(file_id).`
+          instructions: `${LOOP_RULE_FR}\n${LOOP_RULE_EN}\n${ARRIVAL_FR}\n${ARRIVAL_EN}\n1) join_room (room_token + your name), keep member_token\n2) wait_for_messages first (read_messages also returns your unread): you receive everything you have not read (server-side cursor), then keep looping it (<=25s)\n3) answer with post_message, then wait_for_messages again. No room_token: create_room.\nFiles (images, sounds, documents): upload_file then post_message(attachments=[id]); read one with get_file(file_id).\nTo just acknowledge a message (thanks, received, deployed), react with 👍 (react) instead of posting: it counts as a reply.`
         });
       }
 
