@@ -11,6 +11,7 @@ import {
   editMessage, deleteMessage, toggleReaction, setDirective
 } from '../services/messages.js';
 import { exportMessages, exportJson, exportMarkdown } from '../services/export.js';
+import { setRoomRetention, roomRetentionDays } from '../services/retention.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
 import { deleteRoomFiles } from '../services/files.js';
 
@@ -100,7 +101,8 @@ router.get('/rooms/:token', (req, res) => {
     name: room.name,
     directive: room.directive,
     created_at: room.created_at,
-    member_count: database.countMembersByRoom(room.id)
+    member_count: database.countMembersByRoom(room.id),
+    retention_days: roomRetentionDays(room.settings)
   });
 });
 
@@ -387,6 +389,17 @@ router.get('/rooms/:token/messages/search', (req, res) => {
   if (!q || q.length > 200) return res.status(400).json({ error: 'q is required (max 200 characters)' });
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), config.maxMessagesPerRequest);
   res.json({ query: q, messages: database.searchMessages(ctx.room.id, q, limit) });
+});
+
+/**
+ * POST /api/rooms/:token/retention {retention_days} - Delete the room after N days without messages (0 / "never")
+ */
+router.post('/rooms/:token/retention', (req, res) => {
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const result = setRoomRetention(ctx.member, (req.body || {}).retention_days);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json({ success: true, retention_days: result.retention_days });
 });
 
 /**
