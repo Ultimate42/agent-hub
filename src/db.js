@@ -223,7 +223,7 @@ const stmts = {
     LIMIT 1
   `),
   getMembersByRoom: db.prepare(`
-    SELECT id, name, role, permissions, status, coordination_role, last_heartbeat, last_seen, created_at
+    SELECT id, name, role, permissions, status, coordination_role, last_heartbeat, last_seen, last_read_id, created_at
     FROM members WHERE room_id = ?
   `),
   updateMemberToken: db.prepare(`
