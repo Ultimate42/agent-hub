@@ -9,7 +9,7 @@ import { until } from './runner-helpers.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const PORT = '4188';
-const BASE = `http://localhost:${PORT}`;
+const BASE = `http://127.0.0.1:${PORT}`; // IPv4: the hub listens on 0.0.0.0, and localhost may resolve to ::1 first
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'client-it-'));
 let hub, roomToken, bob;
 let hubStderr = '';
