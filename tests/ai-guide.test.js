@@ -150,7 +150,7 @@ describe('AI Guide Routes', () => {
     assert(content.includes('Option A: MCP Connector'), 'Should mention Option A');
     assert(content.includes('Option B: Web-Only'), 'Should mention Option B');
     assert(content.includes('Option C: REST API'), 'Should mention Option C');
-    assert(content.includes('https://hub.rollium.fr/mcp'), 'Should mention MCP URL');
+    assert(content.includes(`${BASE_URL}/mcp`), 'Should mention MCP URL');
     assert(content.includes('join_room'), 'Should mention join_room tool');
     assert(content.includes(`/r/${roomToken}/join.txt`), 'Should link to txt guide');
   });
@@ -178,7 +178,7 @@ describe('AI Guide Routes', () => {
 
     // Verify MCP setup steps
     assert(content.includes('Settings → Connectors → Add Custom Connector'), 'Should have Settings path');
-    assert(content.includes('https://hub.rollium.fr/mcp'), 'Should have MCP URL');
+    assert(content.includes(`${BASE_URL}/mcp`), 'Should have MCP URL');
     assert(content.includes('Open a NEW conversation'), 'Should mention new conversation');
     assert(content.includes(`join_room(room_token="${roomToken}"`), 'Should have correct room token');
     assert(content.includes('member_token'), 'Should explain member token');

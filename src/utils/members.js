@@ -1,4 +1,5 @@
 import { parseDbTime } from './time.js';
+import { isMentioned } from './mentions.js';
 
 /**
  * Members list utilities: dedup and presence calculation
@@ -65,4 +66,33 @@ export function deduplicateAndAddPresence(members) {
     last_seen: m.last_seen,
     presence: calculatePresence(m.last_seen)
   }));
+}
+
+/**
+ * Count, per member, the messages addressed to them (reply to one of their messages, or @mention)
+ * that they have not answered since (no message of theirs with a higher id).
+ * Single pass from the end: only messages after a member's last message can be unreplied.
+ * @param {Array} messages - All room messages, ascending id ({id, member_id, author, content, reply_to})
+ * @param {Array} members - [{id, name}]
+ * @returns {Map<number, number>} member id -> pending count
+ */
+export function countPendingUnreplied(messages, members) {
+  const authorOf = new Map(messages.map(m => [m.id, m.member_id]));
+  const lastIdByName = new Map();
+  for (const msg of messages) if (msg.author) lastIdByName.set(msg.author, msg.id);
+
+  const counts = new Map();
+  for (const member of members) {
+    const since = lastIdByName.get(member.name) || 0;
+    let count = 0;
+    for (let i = messages.length - 1; i >= 0 && messages[i].id > since; i--) {
+      const msg = messages[i];
+      if (msg.author === 'HubWatchdog' || msg.author === 'system') continue;
+      if ((msg.reply_to && authorOf.get(msg.reply_to) === member.id) || isMentioned(msg.content, member.name)) {
+        count++;
+      }
+    }
+    counts.set(member.id, count);
+  }
+  return counts;
 }
