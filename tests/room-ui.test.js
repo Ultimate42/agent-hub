@@ -52,6 +52,8 @@ describe('countPendingUnreplied', () => {
     const c = countPendingUnreplied(messages, members);
     assert.strictEqual(c.get(1), 2);
     assert.strictEqual(c.get(2), 0);
+    // A reaction from Alice to #2 acknowledges it
+    assert.strictEqual(countPendingUnreplied(messages, members, new Set(['2:1'])).get(1), 1);
     messages.push({ id: 5, member_id: 1, author: 'Alice', content: 'done', reply_to: null });
     assert.strictEqual(countPendingUnreplied(messages, members).get(1), 0);
   });

@@ -236,7 +236,8 @@ router.get('/rooms/:token/members', (req, res) => {
   const dedupedMembers = deduplicateAndAddPresence(allMembers);
   const pending = countPendingUnreplied(
     database.getAllMessages(room.id),
-    dedupedMembers.map(m => ({ id: m._id, name: m.name }))
+    dedupedMembers.map(m => ({ id: m._id, name: m.name })),
+    database.getRoomReactionPairs(room.id)
   );
 
   res.json({

@@ -147,6 +147,27 @@ describe('Watchdog Tests', () => {
     assert.strictEqual(alert, undefined, 'Ignored member must not trigger an alert');
   });
 
+  test('A reaction from the addressee acknowledges the message (no alert)', async () => {
+    const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${member1Token}` },
+      body: JSON.stringify({ content: '@Agent2 deployed, thanks' })
+    });
+    await request(`/api/rooms/${roomToken}/messages/${msgRes.id}/reactions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${member2Token}` },
+      body: JSON.stringify({ emoji: '👍' })
+    });
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    const { data } = await request(`/api/rooms/${roomToken}/messages/history?limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
+    });
+    const alert = data.messages.find(m => m.author === 'HubWatchdog' && m.content.includes(`message #${msgRes.id}`));
+    assert.strictEqual(alert, undefined, 'Reacted message must not trigger an alert');
+  });
+
   test('No second alert for same unanswered message', async () => {
     // Post another mention to Agent2
     const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
