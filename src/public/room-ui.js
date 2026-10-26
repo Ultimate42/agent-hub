@@ -215,5 +215,139 @@
     } catch { /* audio unavailable */ }
   }
 
-  window.RoomUI = { renderMarkdown, attachMentionAutocomplete, toggleRecording, beep };
+  // ---------------------------------------------------------------------------
+  // Plain-text editor on a contenteditable element.
+  // Android keyboards (Gboard) insert clipboard images as "rich content", which Chrome refuses in a
+  // <textarea> ("Chrome doesn't allow pasting images here"). A contenteditable accepts them: images
+  // (paste, keyboard, drop) go to onFiles, everything else is inserted as plain text.
+  // Returns a textarea-like object (value, selectionStart/End, focus, addEventListener, parentNode).
+  // ---------------------------------------------------------------------------
+  const ZWSP = '​';
+
+  function createPlainEditor(el, { onFiles }) {
+    el.setAttribute('contenteditable', 'true');
+    el.setAttribute('role', 'textbox');
+    el.setAttribute('aria-multiline', 'true');
+
+    const text = () => el.textContent.replace(/​/g, '');
+
+    function caretOffset() {
+      const sel = window.getSelection();
+      if (!sel || !sel.rangeCount || !el.contains(sel.focusNode)) return text().length;
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.setEnd(sel.focusNode, sel.focusOffset);
+      return range.toString().replace(/​/g, '').length;
+    }
+
+    function setCaret(offset) {
+      // Walk text nodes, skipping zero-width spaces, to place the caret at a character offset
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      let node;
+      let left = offset;
+      while ((node = walker.nextNode())) {
+        const visible = node.data.replace(/​/g, '').length;
+        if (left <= visible) {
+          let i = 0;
+          for (let seen = 0; i < node.data.length && seen < left; i++) if (node.data[i] !== ZWSP) seen++;
+          const range = document.createRange();
+          range.setStart(node, i);
+          range.collapse(true);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          return;
+        }
+        left -= visible;
+      }
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+
+    // Insert plain text at the caret as a text node (execCommand would turn "\n" into <br>)
+    function insertText(str) {
+      if (!str) return;
+      const sel = window.getSelection();
+      if (!sel || !sel.rangeCount || !el.contains(sel.anchorNode)) setCaret(text().length);
+      const range = window.getSelection().getRangeAt(0);
+      range.deleteContents();
+      const start = caretOffset();
+      range.insertNode(document.createTextNode(str));
+      el.normalize();
+      el.classList.toggle('empty', !text());
+      setCaret(start + str.replace(/\u200B/g, '').length);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function insertNewline() {
+      // A trailing "\n" is not rendered in pre-wrap: follow it by a zero-width space
+      const atEnd = caretOffset() === text().length;
+      insertText(atEnd ? '\n' + ZWSP : '\n');
+    }
+
+    function takeFiles(dt) {
+      const files = Array.from(dt?.files || []);
+      if (files.length) onFiles(files);
+      return files.length > 0;
+    }
+
+    el.addEventListener('paste', (e) => {
+      e.preventDefault();
+      if (takeFiles(e.clipboardData)) return;
+      insertText(e.clipboardData?.getData('text/plain') || '');
+    });
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (takeFiles(e.dataTransfer)) return;
+      insertText(e.dataTransfer?.getData('text/plain') || '');
+    });
+    // Keyboard rich content and other HTML insertions
+    el.addEventListener('beforeinput', (e) => {
+      if (e.dataTransfer && takeFiles(e.dataTransfer)) { e.preventDefault(); return; }
+      if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
+        e.preventDefault();
+        insertNewline();
+      }
+    });
+    // Anything that still became an element: images -> files, the rest -> plain text
+    new MutationObserver(() => {
+      for (const img of el.querySelectorAll('img')) {
+        const src = img.getAttribute('src') || '';
+        img.remove();
+        if (/^(blob:|data:image\/)/.test(src)) {
+          fetch(src).then(r => r.blob()).then(blob => {
+            const ext = (blob.type.split('/')[1] || 'png').replace(/[^\w]/g, '');
+            onFiles([new File([blob], 'pasted-' + Date.now() + '.' + ext, { type: blob.type || 'image/png' })]);
+          }).catch(() => {});
+        }
+      }
+      if (el.querySelector('*')) {
+        const at = caretOffset();
+        el.textContent = el.innerText;
+        setCaret(at);
+      }
+      el.classList.toggle('empty', !text());
+    }).observe(el, { childList: true, subtree: true, characterData: true });
+    el.classList.add('empty');
+
+    return {
+      el,
+      get value() { return text(); },
+      set value(v) { el.textContent = v; el.classList.toggle('empty', !v); },
+      get selectionStart() { return caretOffset(); },
+      set selectionStart(n) { setCaret(n); },
+      get selectionEnd() { return caretOffset(); },
+      set selectionEnd(n) { setCaret(n); },
+      get parentNode() { return el.parentNode; },
+      style: el.style,
+      focus() { el.focus(); },
+      addEventListener(...args) { el.addEventListener(...args); }
+    };
+  }
+
+  window.RoomUI = { renderMarkdown, attachMentionAutocomplete, toggleRecording, beep, createPlainEditor };
 })();
