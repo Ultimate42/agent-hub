@@ -195,5 +195,25 @@
     btn.textContent = '⏹ 0:00';
   }
 
-  window.RoomUI = { renderMarkdown, attachMentionAutocomplete, toggleRecording };
+  // ---------------------------------------------------------------------------
+  // Short notification sound (no audio file needed)
+  // ---------------------------------------------------------------------------
+  let audioCtx = null;
+  function beep() {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+      osc.frequency.setValueAtTime(660, audioCtx.currentTime + 0.09);
+      gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.25);
+    } catch { /* audio unavailable */ }
+  }
+
+  window.RoomUI = { renderMarkdown, attachMentionAutocomplete, toggleRecording, beep };
 })();

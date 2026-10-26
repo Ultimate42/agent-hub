@@ -359,6 +359,25 @@ router.get('/r/:token', (req, res) => {
     .reply-btn:hover { color: var(--accent); }
     .reply-quote { font-size: 0.85em; color: #999; border-left: 3px solid #666; padding-left: 6px; margin-bottom: 6px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .message.flash { outline: 2px solid var(--accent); }
+    .header-btn { background: none; border: 1px solid var(--accent); color: var(--accent); border-radius: 5px; padding: 3px 8px; cursor: pointer; margin-right: 6px; font-size: 0.85em; }
+    .msg-actions { float: right; }
+    .msg-actions button { background: none; border: none; color: #888; cursor: pointer; margin-left: 6px; font-size: 0.95em; padding: 0; }
+    .msg-actions button:hover { color: var(--accent); }
+    .edited { font-size: 0.75em; color: #888; font-style: italic; margin-left: 4px; }
+    .message-body.deleted { color: #888; font-style: italic; }
+    .reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+    .reaction { background: var(--code-bg); border: 1px solid transparent; border-radius: 10px; padding: 1px 7px; cursor: pointer; color: var(--text); font-size: 0.85em; }
+    .reaction.mine { border-color: var(--accent); }
+    .emoji-picker { display: flex; gap: 4px; margin-top: 6px; }
+    .emoji-picker button { background: var(--code-bg); border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; padding: 2px 6px; }
+    .edit-box textarea { width: 100%; min-height: 60px; background: var(--code-bg); color: var(--text); border: 1px solid var(--accent); border-radius: 5px; padding: 6px; font-family: inherit; }
+    .edit-box button { margin: 4px 6px 0 0; background: var(--accent); color: var(--bg); border: none; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
+    .history-marker { text-align: center; color: #888; font-size: 0.8em; margin: 6px 0 12px; }
+    #search-input { width: 100%; padding: 6px 8px; margin-bottom: 8px; background: var(--code-bg); color: var(--text); border: 1px solid var(--accent); border-radius: 5px; }
+    #search-results { margin-bottom: 15px; }
+    .search-result { padding: 6px 0; border-bottom: 1px solid var(--code-bg); font-size: 0.8em; cursor: pointer; }
+    .search-result:hover { color: var(--accent); }
+    .search-result .meta { color: #888; }
     #reply-bar { display: none; padding: 6px 15px; font-size: 0.85em; color: #aaa; background: var(--card); border-top: 1px solid var(--code-bg); }
     #reply-bar button { background: none; border: none; color: var(--text); cursor: pointer; margin-left: 8px; }
     .mention-menu { position: absolute; bottom: 100%; left: 60px; background: var(--card); border: 1px solid var(--accent); border-radius: 6px; min-width: 180px; max-height: 220px; overflow-y: auto; z-index: 10; }
@@ -478,6 +497,9 @@ router.get('/r/:token', (req, res) => {
       <span id="status" class="disconnected">Disconnected</span>
     </div>
     <div>
+      <button type="button" class="header-btn" id="notify-btn" title="Notifications for mentions and replies" onclick="toggleNotifications()">&#128277;</button>
+      <button type="button" class="header-btn" title="Export the conversation (Markdown)" onclick="exportConversation('md')">Export .md</button>
+      <button type="button" class="header-btn" title="Export the conversation (JSON)" onclick="exportConversation('json')">.json</button>
       <a href="/r/${escapeHtml(roomToken)}/setup">Setup Guide</a>
       <a href="/">Home</a>
     </div>
@@ -563,6 +585,9 @@ router.get('/r/:token', (req, res) => {
       </div>
     </div>
     <div class="sidebar">
+      <h3>Search</h3>
+      <input type="search" id="search-input" placeholder="Search messages..." onkeydown="if(event.key==='Enter')searchMessages()">
+      <div id="search-results"></div>
       <h3>Members</h3>
       <div id="members"></div>
     </div>
@@ -632,6 +657,224 @@ router.get('/r/:token', (req, res) => {
       return content.toLowerCase().includes('@' + memberName.toLowerCase());
     }
 
+    const baseTitle = document.title;
+    let unseenCount = 0;
+    let oldestId = null;
+    let hasMoreHistory = true;
+    let loadingHistory = false;
+    const EMOJIS = ['\u{1F44D}', '\u2705', '\u{1F440}', '\u2764\uFE0F', '\u{1F602}', '\u{1F389}', '\u{1F914}', '\u274C'];
+
+    function authHeaders(json) {
+      const h = { 'Authorization': 'Bearer ' + memberToken };
+      if (json) h['Content-Type'] = 'application/json';
+      return h;
+    }
+
+    // ---- Notifications: tab title counter + desktop notification and sound on mentions/replies
+    function notificationsOn() {
+      try { return localStorage.getItem('agent-hub-notify') === 'on'; } catch { return false; }
+    }
+    function updateNotifyButton() {
+      document.getElementById('notify-btn').innerHTML = notificationsOn() ? '&#128276;' : '&#128277;';
+    }
+    async function toggleNotifications() {
+      const on = !notificationsOn();
+      if (on && 'Notification' in window && Notification.permission === 'default') {
+        await Notification.requestPermission();
+      }
+      try { localStorage.setItem('agent-hub-notify', on ? 'on' : 'off'); } catch { /* private mode */ }
+      updateNotifyButton();
+      if (on) RoomUI.beep();
+    }
+    updateNotifyButton();
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) { unseenCount = 0; document.title = baseTitle; }
+    });
+
+    function onIncoming(msg) {
+      if (!msg.author || msg.author === memberName) return;
+      if (document.hidden) {
+        unseenCount++;
+        document.title = '(' + unseenCount + ') ' + baseTitle;
+      }
+      const parent = messagesById.get(Number(msg.reply_to) || 0);
+      const forMe = mentionsMe(msg.content) || (parent && parent.author === memberName);
+      if (!forMe || !notificationsOn()) return;
+      RoomUI.beep();
+      if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+        const n = new Notification(msg.author + ' \u2014 ' + baseTitle, { body: snippet(msg), tag: 'agent-hub-' + msg.id });
+        n.onclick = () => { window.focus(); scrollToMessage(msg.id); n.close(); };
+      }
+    }
+
+    // ---- Directive (pinned), live
+    function showDirective(text) {
+      const el = document.getElementById('directive');
+      el.textContent = text ? '\u{1F4CC} ' + text : '';
+      el.style.display = text ? 'block' : 'none';
+    }
+    async function loadRoomInfo() {
+      try {
+        const res = await fetch(apiBase, { headers: authHeaders() });
+        if (res.ok) showDirective((await res.json()).directive);
+      } catch { /* offline */ }
+    }
+
+    // ---- Older history on scroll up
+    async function loadOlder() {
+      if (loadingHistory || !hasMoreHistory || !oldestId) return false;
+      loadingHistory = true;
+      try {
+        const res = await fetch(apiBase + '/messages/history?limit=50&before_id=' + oldestId, { headers: authHeaders() });
+        const data = await res.json();
+        if (!res.ok) return false;
+        const container = document.getElementById('messages');
+        const prevHeight = container.scrollHeight;
+        for (let i = data.messages.length - 1; i >= 0; i--) addMessage(data.messages[i], true);
+        if (data.messages.length) oldestId = data.messages[0].id;
+        hasMoreHistory = data.has_more;
+        if (!hasMoreHistory) markHistoryStart();
+        container.scrollTop += container.scrollHeight - prevHeight;
+        return data.messages.length > 0;
+      } catch {
+        return false;
+      } finally {
+        loadingHistory = false;
+      }
+    }
+    function markHistoryStart() {
+      const container = document.getElementById('messages');
+      if (container.querySelector('.history-marker')) return;
+      const el = document.createElement('div');
+      el.className = 'history-marker';
+      el.textContent = 'Beginning of the conversation';
+      container.insertBefore(el, container.firstChild);
+    }
+    document.getElementById('messages').addEventListener('scroll', (e) => {
+      if (e.target.scrollTop < 80) loadOlder();
+    });
+
+    // Scroll to a message, loading older pages if needed
+    async function jumpToMessage(id) {
+      for (let i = 0; i < 40 && !document.getElementById('msg-' + id) && hasMoreHistory; i++) {
+        if (!(await loadOlder())) break;
+      }
+      scrollToMessage(id);
+    }
+
+    // ---- Search
+    async function searchMessages() {
+      const q = document.getElementById('search-input').value.trim();
+      const box = document.getElementById('search-results');
+      if (!q) { box.innerHTML = ''; return; }
+      const res = await fetch(apiBase + '/messages/search?limit=30&q=' + encodeURIComponent(q), { headers: authHeaders() });
+      const data = await res.json();
+      if (!res.ok) { box.textContent = data.error; return; }
+      box.innerHTML = data.messages.length ? data.messages.map(m =>
+        '<div class="search-result" onclick="jumpToMessage(' + Number(m.id) + ')">' +
+        '<div class="meta">' + escapeHtml(m.author || 'system') + ' \u00B7 ' + escapeHtml(new Date(m.created_at).toLocaleString()) + '</div>' +
+        escapeHtml(snippet(m)) + '</div>'
+      ).join('') : '<div class="search-result">No results</div>';
+    }
+
+    // ---- Export
+    async function exportConversation(format) {
+      const res = await fetch(apiBase + '/export?format=' + format, { headers: authHeaders() });
+      if (!res.ok) { alert('Export failed'); return; }
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = (baseTitle.split(' - ')[0] || 'room') + '.' + format;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    // ---- Edit / delete / reactions
+    function startEdit(id) {
+      const msg = messagesById.get(id);
+      const el = document.getElementById('msg-' + id);
+      if (!msg || !el) return;
+      let body = el.querySelector('.message-body');
+      if (!body) {
+        body = document.createElement('div');
+        body.className = 'message-body';
+        el.querySelector('.message-header').after(body);
+      }
+      body.innerHTML = '<div class="edit-box"><textarea></textarea><button data-act="save">Save</button><button data-act="cancel">Cancel</button></div>';
+      const ta = body.querySelector('textarea');
+      ta.value = msg.content || '';
+      ta.focus();
+      body.querySelector('[data-act=cancel]').onclick = () => rerender(id);
+      body.querySelector('[data-act=save]').onclick = async () => {
+        const res = await fetch(apiBase + '/messages/' + id, { method: 'PATCH', headers: authHeaders(true), body: JSON.stringify({ content: ta.value }) });
+        const data = await res.json();
+        if (!res.ok) { alert(data.error); return; }
+        updateMessage(data);
+      };
+    }
+
+    async function removeMessage(id) {
+      if (!confirm('Delete this message?')) return;
+      const res = await fetch(apiBase + '/messages/' + id, { method: 'DELETE', headers: authHeaders() });
+      if (!res.ok) { alert((await res.json()).error); return; }
+      markDeleted(id);
+    }
+
+    async function react(id, emoji) {
+      const res = await fetch(apiBase + '/messages/' + id + '/reactions', { method: 'POST', headers: authHeaders(true), body: JSON.stringify({ emoji }) });
+      const data = await res.json();
+      if (res.ok) setReactions(id, data.reactions);
+    }
+
+    function toggleEmojiPicker(id) {
+      const el = document.getElementById('msg-' + id);
+      if (!el) return;
+      const open = el.querySelector('.emoji-picker');
+      if (open) { open.remove(); return; }
+      const picker = document.createElement('div');
+      picker.className = 'emoji-picker';
+      picker.innerHTML = EMOJIS.map(e => '<button data-react="' + e + '">' + e + '</button>').join('');
+      el.appendChild(picker);
+    }
+
+    // Delegated clicks: reaction chips and picker buttons
+    document.getElementById('messages').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-react]');
+      if (!btn) return;
+      const id = Number(btn.closest('.message').id.slice(4));
+      react(id, btn.dataset.react);
+      const picker = btn.closest('.emoji-picker');
+      if (picker) picker.remove();
+    });
+
+    function rerender(id) {
+      const el = document.getElementById('msg-' + id);
+      const msg = messagesById.get(id);
+      if (el && msg) renderMessageInto(el, msg);
+    }
+    function updateMessage(msg) {
+      const prev = messagesById.get(msg.id) || {};
+      messagesById.set(msg.id, Object.assign(prev, msg));
+      rerender(msg.id);
+    }
+    function markDeleted(id) {
+      const msg = messagesById.get(id);
+      if (!msg) return;
+      msg.deleted = true;
+      msg.content = '';
+      delete msg.attachments;
+      delete msg.reactions;
+      rerender(id);
+    }
+    function setReactions(id, reactions) {
+      const msg = messagesById.get(id);
+      if (!msg) return;
+      msg.reactions = reactions;
+      rerender(id);
+    }
+
     // Check if already have a token
     if (memberToken && memberName) {
       document.getElementById('join-form').style.display = 'none';
@@ -662,10 +905,6 @@ router.get('/r/:token', (req, res) => {
           localStorage.setItem('agent-hub-token-' + roomToken, memberToken);
           localStorage.setItem('agent-hub-name-' + roomToken, memberName);
           document.getElementById('join-form').style.display = 'none';
-          if (data.directive) {
-            document.getElementById('directive').textContent = data.directive;
-            document.getElementById('directive').style.display = 'block';
-          }
           connect();
         } else {
           errorEl.textContent = data.error;
@@ -676,6 +915,7 @@ router.get('/r/:token', (req, res) => {
     }
 
     function connect() {
+      loadRoomInfo();
       loadMessages();
       loadMembers();
       connectWs();
@@ -690,7 +930,10 @@ router.get('/r/:token', (req, res) => {
         if (res.ok) {
           const container = document.getElementById('messages');
           container.innerHTML = '';
-          data.messages.forEach(addMessage);
+          data.messages.forEach(m => addMessage(m));
+          oldestId = data.messages.length ? data.messages[0].id : null;
+          hasMoreHistory = data.messages.length >= 50;
+          if (!hasMoreHistory) markHistoryStart();
           container.scrollTop = container.scrollHeight;
           if (data.last_id) ackUpTo(data.last_id);
         }
@@ -745,9 +988,19 @@ router.get('/r/:token', (req, res) => {
 
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        if (data.type === 'message' || data.type === 'question' || data.type === 'response') {
+        if (['message', 'question', 'response', 'directive'].includes(data.type)) {
           addMessage(data);
+          onIncoming(data);
           if (data.id && data.author !== memberName) ackUpTo(data.id);
+        } else if (data.type === 'message_updated') {
+          updateMessage(data.message);
+        } else if (data.type === 'message_deleted') {
+          markDeleted(data.id);
+        } else if (data.type === 'reaction') {
+          setReactions(data.message_id, data.reactions);
+        } else if (data.type === 'directive_updated') {
+          showDirective(data.directive);
+          addMessage({ type: 'system', content: (data.author || 'Someone') + ' updated the directive' });
         } else if (data.type === 'member_joined' || data.type === 'member_left') {
           loadMembers();
           addMessage({ type: 'system', content: data.type === 'member_joined' ?
@@ -756,42 +1009,71 @@ router.get('/r/:token', (req, res) => {
       };
     }
 
-    function addMessage(msg) {
+    function addMessage(msg, prepend) {
       const container = document.getElementById('messages');
+      if (msg.id && document.getElementById('msg-' + msg.id)) return;
       const div = document.createElement('div');
+      renderMessageInto(div, msg);
+      if (prepend) {
+        const marker = container.querySelector('.history-marker');
+        container.insertBefore(div, marker ? marker.nextSibling : container.firstChild);
+        return;
+      }
+      const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+      container.appendChild(div);
+      if (nearBottom || msg.author === memberName) container.scrollTop = container.scrollHeight;
+    }
+
+    function renderReactions(msg) {
+      if (!msg.reactions || !msg.reactions.length) return '';
+      return '<div class="reactions">' + msg.reactions.map(r =>
+        '<button class="reaction' + (r.members && r.members.includes(memberName) ? ' mine' : '') + '" data-react="' + escapeHtml(r.emoji) + '"' +
+        ' title="' + escapeHtml((r.members || []).join(', ')) + '">' + escapeHtml(r.emoji) + ' ' + Number(r.count) + '</button>'
+      ).join('') + '</div>';
+    }
+
+    function renderMessageInto(div, msg) {
       const isOwn = msg.author === memberName;
       div.className = 'message ' + (msg.type === 'system' ? 'system' : (isOwn ? 'own' : 'other'));
 
-      if (msg.type !== 'system') {
-        const time = msg.created_at ? new Date(msg.created_at).toLocaleTimeString() : '';
-        const id = Number(msg.id) || 0;
-        if (id) {
-          messagesById.set(id, msg);
-          div.id = 'msg-' + id;
-        }
-        if (!isOwn && mentionsMe(msg.content)) div.className += ' mentioned';
-        let quote = '';
-        const parentId = Number(msg.reply_to) || 0;
-        if (parentId) {
-          const parent = messagesById.get(parentId);
-          quote = '<div class="reply-quote" onclick="scrollToMessage(' + parentId + ')">&#8618; ' +
-            (parent ? '<strong>' + escapeHtml(parent.author) + '</strong>: ' + escapeHtml(snippet(parent)) : 'message #' + parentId) +
-            '</div>';
-        }
-        div.innerHTML =
-          '<div class="message-header">' +
-          '<strong>' + escapeHtml(msg.author || 'Unknown') + '</strong>' +
-          (id ? '<button class="reply-btn" title="Reply" onclick="setReply(' + id + ')">&#8617;</button>' : '') +
-          '<span class="message-time">' + time + '</span>' +
-          '</div>' + quote +
-          (msg.content ? '<div class="message-body">' + RoomUI.renderMarkdown(msg.content) + '</div>' : '') +
-          renderAttachments(msg.attachments);
-      } else {
+      if (msg.type === 'system') {
         div.textContent = msg.content;
+        return;
       }
-
-      container.appendChild(div);
-      container.scrollTop = container.scrollHeight;
+      const time = msg.created_at ? new Date(msg.created_at).toLocaleTimeString() : '';
+      const id = Number(msg.id) || 0;
+      if (id) {
+        messagesById.set(id, msg);
+        div.id = 'msg-' + id;
+      }
+      if (!isOwn && mentionsMe(msg.content)) div.className += ' mentioned';
+      let quote = '';
+      const parentId = Number(msg.reply_to) || 0;
+      if (parentId) {
+        const parent = messagesById.get(parentId);
+        quote = '<div class="reply-quote" onclick="jumpToMessage(' + parentId + ')">&#8618; ' +
+          (parent ? '<strong>' + escapeHtml(parent.author) + '</strong>: ' + escapeHtml(parent.deleted ? 'message deleted' : snippet(parent)) : 'message #' + parentId) +
+          '</div>';
+      }
+      let actions = '';
+      if (id && !msg.deleted) {
+        actions = '<span class="msg-actions">' +
+          '<button title="React" onclick="toggleEmojiPicker(' + id + ')">&#9786;</button>' +
+          '<button title="Reply" onclick="setReply(' + id + ')">&#8617;</button>' +
+          (isOwn ? '<button title="Edit" onclick="startEdit(' + id + ')">&#9998;</button>' +
+                   '<button title="Delete" onclick="removeMessage(' + id + ')">&#128465;</button>' : '') +
+          '</span>';
+      }
+      const body = msg.deleted
+        ? '<div class="message-body deleted">Message deleted</div>'
+        : (msg.content ? '<div class="message-body">' + RoomUI.renderMarkdown(msg.content) + '</div>' : '');
+      div.innerHTML =
+        '<div class="message-header">' +
+        '<strong>' + escapeHtml(msg.author || 'Unknown') + '</strong>' +
+        actions +
+        '<span class="message-time">' + time + (msg.edited_at && !msg.deleted ? '<span class="edited">(edited)</span>' : '') + '</span>' +
+        '</div>' + quote + body +
+        (msg.deleted ? '' : renderAttachments(msg.attachments) + renderReactions(msg));
     }
 
     function formatSize(n) {

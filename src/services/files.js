@@ -141,6 +141,17 @@ export function stopFileSweeper() {
   sweepTimer = null;
 }
 
+/** Remove some attachments' bytes from disk (rows already deleted). */
+export function deleteAttachmentFiles(attachments) {
+  for (const att of attachments) {
+    try {
+      rmSync(attachmentPath(att), { force: true });
+    } catch (err) {
+      logger.warn('Failed to delete file', { attachmentId: att.id, error: err.message });
+    }
+  }
+}
+
 /** Remove a room's files from disk (rows go with ON DELETE CASCADE). */
 export function deleteRoomFiles(roomId) {
   const dir = roomDir(roomId);
