@@ -7,8 +7,10 @@ import { checkMemberContext } from '../utils/security-check.js';
 import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import {
   postMessage, notifyWaiters, waitingClients, sanitizeName, MEMBER_ROLES,
-  parseBool, peekUnread, settleDelivery, ackMessages
+  parseBool, peekUnread, settleDelivery, ackMessages,
+  editMessage, deleteMessage, toggleReaction, setDirective
 } from '../services/messages.js';
+import { exportMessages, exportJson, exportMarkdown } from '../services/export.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
 import { deleteRoomFiles } from '../services/files.js';
 
@@ -329,6 +331,79 @@ router.get('/rooms/:token/messages', (req, res) => {
   });
 });
 
+// Resolve the calling member and check it belongs to :token (sends the error response otherwise)
+function requireRoomMember(req, res) {
+  const member = requireMember(req, res);
+  if (!member) return null;
+  const room = database.getRoomByToken(req.params.token);
+  if (!room || room.id !== member.room_id) {
+    res.status(403).json({ error: 'Access denied' });
+    return null;
+  }
+  return { member, room };
+}
+
+/**
+ * PATCH /api/rooms/:token/messages/:id {content} - Edit one of your messages
+ */
+router.patch('/rooms/:token/messages/:id', (req, res) => {
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const result = editMessage(ctx.member, req.params.id, (req.body || {}).content);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json(result.message);
+});
+
+/**
+ * DELETE /api/rooms/:token/messages/:id - Delete one of your messages (and its files)
+ */
+router.delete('/rooms/:token/messages/:id', (req, res) => {
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const result = deleteMessage(ctx.member, req.params.id);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json({ success: true, id: result.id });
+});
+
+/**
+ * POST /api/rooms/:token/messages/:id/reactions {emoji} - Toggle an emoji reaction
+ */
+router.post('/rooms/:token/messages/:id/reactions', (req, res) => {
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const result = toggleReaction(ctx.member, req.params.id, (req.body || {}).emoji);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json({ message_id: result.message_id, reactions: result.reactions });
+});
+
+/**
+ * GET /api/rooms/:token/messages/search?q=text&limit=50 - Search content, authors, file names, transcripts
+ */
+router.get('/rooms/:token/messages/search', (req, res) => {
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (!q || q.length > 200) return res.status(400).json({ error: 'q is required (max 200 characters)' });
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), config.maxMessagesPerRequest);
+  res.json({ query: q, messages: database.searchMessages(ctx.room.id, q, limit) });
+});
+
+/**
+ * GET /api/rooms/:token/export?format=md|json - Download the whole conversation
+ */
+router.get('/rooms/:token/export', (req, res) => {
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const messages = exportMessages(ctx.room.id);
+  const base = (ctx.room.name || 'room').replace(/[^\w.-]+/g, '_').slice(0, 60) || 'room';
+  if (req.query.format === 'json') {
+    res.set('Content-Disposition', `attachment; filename="${base}.json"`);
+    return res.json(exportJson(ctx.room, messages));
+  }
+  res.set('Content-Disposition', `attachment; filename="${base}.md"`);
+  res.type('text/markdown; charset=utf-8').send(exportMarkdown(ctx.room, messages));
+});
+
 /**
  * GET /api/rooms/:token/messages/history?before_id=N&limit=50 - older messages, never touches the cursor
  */
@@ -462,20 +537,12 @@ router.post('/rooms/:token/directive', (req, res) => {
     return res.status(403).json({ error: 'Write permission required' });
   }
 
-  const { content } = req.body || {};
-
-  if (typeof content !== 'string' || !content) {
-    return res.status(400).json({ error: 'Content is required' });
-  }
-  if (content.length > config.maxMessageSize) {
-    return res.status(413).json({ error: 'Directive too large' });
-  }
-
-  database.updateRoomDirective(room.id, content, member.name);
+  const result = setDirective(member, (req.body || {}).content);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
 
   logger.info('Directive updated', { roomId: room.id, by: member.name });
 
-  res.json({ success: true, directive: content });
+  res.json({ success: true, directive: result.directive });
 });
 
 /**

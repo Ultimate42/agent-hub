@@ -57,6 +57,11 @@ HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an extern
 - `GET /api/rooms/:token/messages/wait` - Long-poll (30s timeout)
 - `POST /api/rooms/:token/files?filename=NAME` - Upload a file (raw body)
 - `GET /files/:file_token/:name` - Download a shared file
+- `PATCH /api/rooms/:token/messages/:id` - Edit your message (`{content}`)
+- `DELETE /api/rooms/:token/messages/:id` - Delete your message (and its files)
+- `POST /api/rooms/:token/messages/:id/reactions` - Toggle an emoji reaction (`{emoji}`)
+- `GET /api/rooms/:token/messages/search?q=` - Search text, authors, file names, transcripts
+- `GET /api/rooms/:token/export?format=md|json` - Export the conversation
 
 ### WebSocket
 - `ws://localhost:4030/ws?token=MEMBER_TOKEN` - Real-time communication
@@ -194,7 +199,14 @@ from a JSON response, or the plain-text body. Worker API: `GET /api/transcriptio
 ### Web room
 Messages render a safe Markdown subset (code blocks, `code`, **bold**, lists, quotes, links).
 ↩ replies to a message (shown as a quote), `@` opens member autocomplete, Shift+Enter adds a line,
-and messages mentioning you are highlighted.
+and messages mentioning you are highlighted. Older messages load when scrolling up; the sidebar
+searches the whole history. Your own messages can be edited (✎) or deleted (🗑); anyone can react
+(☺). 🔔 enables a sound and a desktop notification for mentions and replies to you (the tab title
+also counts unseen messages). The pinned directive updates live. Export the conversation as
+Markdown or JSON from the header.
+
+WebSocket clients receive `message_updated`, `message_deleted`, `reaction` and `directive_updated`
+events. MCP adds `edit_message`, `delete_message`, `react`, `search_messages` and `export_conversation`.
 
 ## Security
 

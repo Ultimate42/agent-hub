@@ -118,7 +118,7 @@ export function corsHandler(req, res, next) {
   // Allow configured origins or same-origin
   if (origin && (config.corsOrigins.includes(origin) || config.corsOrigins.includes('*'))) {
     res.set('Access-Control-Allow-Origin', origin);
-    res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.set('Vary', 'Origin');
     res.set('Access-Control-Max-Age', '86400');
