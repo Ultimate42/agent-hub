@@ -14,13 +14,17 @@
 //     TRANSCRIBE_HTTP_FIELDS      extra form fields as JSON, e.g. {"model":"whisper-1","language":"fr"}
 //     TRANSCRIBE_HTTP_AUTH        value of the Authorization header, e.g. "Bearer sk-..."
 //     TRANSCRIBE_HTTP_JSON_FIELD  field holding the text in a JSON response (default "text")
+//     TRANSCRIBE_HTTP_BODY=path   instead of uploading, write the audio to a local file and POST
+//                                 JSON {"path": "/tmp/..."} (for a service on the same host that
+//                                 reads files, e.g. stt-server); extra TRANSCRIBE_HTTP_FIELDS are
+//                                 merged into that JSON
 //   TRANSCRIBE_CMD          shell command; the audio file path is "$1" (or {file}); stdout = text,
 //                           e.g. TRANSCRIBE_CMD='my-whisper-client "$1"'
 // Optional:
 //   TRANSCRIBE_TIMEOUT_MS   per-file timeout (default 300000)
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -34,16 +38,22 @@ function log(msg, extra = {}) {
   console.log(JSON.stringify({ time: new Date().toISOString(), msg, ...extra }));
 }
 
-export async function transcribeHttp(data, job, env = process.env) {
-  const form = new FormData();
-  form.append(env.TRANSCRIBE_HTTP_FIELD || 'file', new Blob([data], { type: job.mime_type }), job.filename);
-  for (const [k, v] of Object.entries(JSON.parse(env.TRANSCRIBE_HTTP_FIELDS || '{}'))) form.append(k, String(v));
-  const res = await fetch(env.TRANSCRIBE_HTTP_URL, {
-    method: 'POST',
-    body: form,
-    headers: env.TRANSCRIBE_HTTP_AUTH ? { Authorization: env.TRANSCRIBE_HTTP_AUTH } : {},
-    signal: AbortSignal.timeout(TIMEOUT_MS)
-  });
+/** Write the audio to a fresh temp dir; returns { file, cleanup }. */
+function writeTemp(data, job, readableByOthers = false) {
+  const dir = mkdtempSync(path.join(tempRoot(), 'hub-transcribe-'));
+  const ext = path.extname(job.filename).replace(/[^.\w]/g, '') || '.audio';
+  const file = path.join(dir, `audio${ext}`);
+  writeFileSync(file, data);
+  // A service running as another user must be able to read it
+  if (readableByOthers) { chmodSync(dir, 0o755); chmodSync(file, 0o644); }
+  return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+function tempRoot() {
+  return process.env.TRANSCRIBE_TMP_DIR || tmpdir();
+}
+
+async function readText(res, env) {
   const body = await res.text();
   if (!res.ok) throw new Error(`service answered ${res.status}: ${body.slice(0, 200)}`);
   try {
@@ -57,11 +67,39 @@ export async function transcribeHttp(data, job, env = process.env) {
   }
 }
 
+export async function transcribeHttp(data, job, env = process.env) {
+  if (env.TRANSCRIBE_HTTP_BODY === 'path') {
+    const { file, cleanup } = writeTemp(data, job, true);
+    try {
+      const res = await fetch(env.TRANSCRIBE_HTTP_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(env.TRANSCRIBE_HTTP_AUTH ? { Authorization: env.TRANSCRIBE_HTTP_AUTH } : {})
+        },
+        body: JSON.stringify({ ...JSON.parse(env.TRANSCRIBE_HTTP_FIELDS || '{}'), path: file }),
+        signal: AbortSignal.timeout(TIMEOUT_MS)
+      });
+      return await readText(res, env);
+    } finally {
+      cleanup();
+    }
+  }
+
+  const form = new FormData();
+  form.append(env.TRANSCRIBE_HTTP_FIELD || 'file', new Blob([data], { type: job.mime_type }), job.filename);
+  for (const [k, v] of Object.entries(JSON.parse(env.TRANSCRIBE_HTTP_FIELDS || '{}'))) form.append(k, String(v));
+  const res = await fetch(env.TRANSCRIBE_HTTP_URL, {
+    method: 'POST',
+    body: form,
+    headers: env.TRANSCRIBE_HTTP_AUTH ? { Authorization: env.TRANSCRIBE_HTTP_AUTH } : {},
+    signal: AbortSignal.timeout(TIMEOUT_MS)
+  });
+  return readText(res, env);
+}
+
 export function transcribeCmd(data, job, cmd = CMD) {
-  const dir = mkdtempSync(path.join(tmpdir(), 'hub-transcribe-'));
-  const ext = path.extname(job.filename).replace(/[^.\w]/g, '') || '.audio';
-  const file = path.join(dir, `audio${ext}`);
-  writeFileSync(file, data);
+  const { file, cleanup } = writeTemp(data, job);
   return new Promise((resolve, reject) => {
     const child = spawn('sh', ['-c', cmd.replaceAll('{file}', `"${file}"`), 'transcribe', file], {
       stdio: ['ignore', 'pipe', 'pipe']
@@ -74,7 +112,7 @@ export function transcribeCmd(data, job, cmd = CMD) {
     child.on('error', reject);
     child.on('close', (code) => {
       clearTimeout(timer);
-      rmSync(dir, { recursive: true, force: true });
+      cleanup();
       if (code === 0) resolve(out);
       else reject(new Error(`command exited with ${code}: ${err.slice(0, 200)}`));
     });
