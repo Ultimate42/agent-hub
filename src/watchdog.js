@@ -167,6 +167,13 @@ export function startWatchdog() {
             }
 
             // Check if alert already exists
+            // One alert per absence: if they were already reported and have not been seen since,
+            // another alert says nothing new (it fired once per pending message before)
+            const lastAlert = database.lastWatchdogAlertFor(member.id);
+            if (lastAlert && !(parseDbTime(member.last_seen) > parseDbTime(lastAlert))) {
+              continue;
+            }
+
             if (database.watchdogAlertExists(msg.id, member.id)) {
               continue; // Alert already posted
             }
