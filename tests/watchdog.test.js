@@ -221,6 +221,29 @@ describe('Watchdog Tests', () => {
     assert.strictEqual(alertCount2, 1, 'Should still have exactly 1 alert (no duplicate)');
   });
 
+  test('One alert per absence, not one per pending message', async () => {
+    // Agent2 comes back (seen), then goes silent while two messages are addressed to it
+    await request(`/api/rooms/${roomToken}/messages/history?limit=1`, { headers: { 'Authorization': `Bearer ${member2Token}` } });
+    await new Promise(r => setTimeout(r, 1100)); // last_seen has a 1 s resolution
+    const ids = [];
+    for (const content of ['@Agent2 first question?', '@Agent2 second question?']) {
+      const { data } = await request(`/api/rooms/${roomToken}/messages`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${member1Token}` },
+        body: JSON.stringify({ content })
+      });
+      ids.push(data.id);
+    }
+
+    await new Promise(r => setTimeout(r, 3500));
+
+    const { data } = await request(`/api/rooms/${roomToken}/messages/history?limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
+    });
+    const alerts = data.messages.filter(m => m.author === 'HubWatchdog' && ids.some(id => m.content.includes(`message #${id} `)));
+    assert.strictEqual(alerts.length, 1, `expected a single alert, got: ${alerts.map(a => a.content).join(' | ')}`);
+  });
+
   test('No alert if addressee replies quickly', async () => {
     // Agent1 mentions Agent2
     const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
@@ -314,6 +337,10 @@ describe('Watchdog Tests', () => {
       headers: { 'Authorization': `Bearer ${member1Token}` }
     });
     const alertCountBefore = msgs1.messages.filter(m => m.author === 'HubWatchdog').length;
+
+    // Agent2 comes back first (an absent member already reported is not alerted again)
+    await request(`/api/rooms/${roomToken}/messages/history?limit=1`, { headers: { 'Authorization': `Bearer ${member2Token}` } });
+    await new Promise(r => setTimeout(r, 1100));
 
     // Simulate old message without reply
     const { data: msg } = await request(`/api/rooms/${roomToken}/messages`, {
