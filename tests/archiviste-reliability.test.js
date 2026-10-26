@@ -13,6 +13,7 @@ const DB = path.join(os.tmpdir(), `hub-test-archiviste-${process.pid}-${Date.now
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 let firstId = 0, hub, memServer, memDelay = 300, memWrites = [];
+let memInFlight = 0, memMaxInFlight = 0; // concurrency seen by the memory service
 const procs = [];
 
 async function api(p, opts = {}) {
@@ -66,7 +67,9 @@ describe('Archiviste reliability', () => {
       let body = '';
       req.on('data', d => { body += d; });
       req.on('end', async () => {
+        memMaxInFlight = Math.max(memMaxInFlight, ++memInFlight);
         await sleep(memDelay);
+        memInFlight--;
         const j = JSON.parse(body || '{}');
         res.setHeader('Content-Type', 'application/json');
         if (req.url === '/write') { memWrites.push(j.content.description); res.end(JSON.stringify({ success: true, memory_id: 1 })); }
@@ -89,7 +92,7 @@ describe('Archiviste reliability', () => {
   });
 
   test('concurrent processing, ordered replies, authors with spaces/parentheses', async () => {
-    memDelay = 400; memWrites = [];
+    memDelay = 400; memWrites = []; memMaxInFlight = 0;
     const { room, members } = await newRoom(['Claude (Santé)', 'Claude (Coach sport)']);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
     seedState(dir, 0);
@@ -100,8 +103,8 @@ describe('Archiviste reliability', () => {
     const p = startArchiviste(room, dir);
     await until(async () => (await listMsgs(room, toks[0])).filter(m => m.author === 'Archiviste').length >= 7);
     const elapsed = Date.now() - t0;
-    // serial would take >= 7 * 400ms = 2.8s of memory time alone
-    assert.ok(elapsed < 2600, `expected concurrent processing, took ${elapsed}ms`);
+    // Measured at the memory service, not by wall time (a loaded host makes timings unreliable)
+    assert.ok(memMaxInFlight >= 2, `expected concurrent processing, max in-flight ${memMaxInFlight} (took ${elapsed}ms)`);
     const replies = (await listMsgs(room, toks[0])).filter(m => m.author === 'Archiviste').map(m => m.content);
     assert.deepStrictEqual(replies.slice(0, 6).map(r => r.match(/note (\d)/)?.[1]), ['0', '1', '2', '3', '4', '5']);
     assert.ok(replies[6].includes('trouvé: rotule'));
