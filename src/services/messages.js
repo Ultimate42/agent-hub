@@ -2,12 +2,13 @@ import { database } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { processWakeTargets } from '../wake-targets.js';
-import { validateAttachmentIds } from './files.js';
+import { validateAttachmentIds, deleteAttachmentFiles } from './files.js';
+import { queueTranscriptions } from './transcription.js';
 
 export const MESSAGE_TYPES = ['message', 'question', 'response', 'directive'];
 export const MEMBER_ROLES = ['agent', 'human', 'observer', 'manager', 'second'];
 export const MAX_NAME_LENGTH = 64;
-const RESERVED_NAMES = ['hubwatchdog', 'system'];
+const RESERVED_NAMES = ['hubwatchdog', 'system', 'transcription'];
 
 // ---------------------------------------------------------------------------
 // Realtime fan-out: long-poll waiters + WebSocket clients
@@ -63,6 +64,18 @@ export function publishMessage(roomId, message) {
     logger.warn('WebSocket broadcast failed', { error: err.message });
   }
   notifyWaiters(roomId, [message]);
+}
+
+/**
+ * Push a room event to WebSocket clients only (edits, deletions, reactions, directive changes).
+ * Long-poll / MCP readers see the new state on their next read; these are not new messages.
+ */
+export function broadcastEvent(roomId, event) {
+  try {
+    wsBroadcaster?.(roomId, event);
+  } catch (err) {
+    logger.warn('WebSocket broadcast failed', { error: err.message });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +185,7 @@ export function postMessage(member, { content, type = 'message', reply_to, attac
 
   if (applyDirective && type === 'directive') {
     database.updateRoomDirective(room.id, content, member.name);
+    broadcastEvent(room.id, { type: 'directive_updated', directive: content, author: member.name });
   }
 
   let messageId;
@@ -185,6 +199,7 @@ export function postMessage(member, { content, type = 'message', reply_to, attac
     if (err.message === 'attachment already used') return fail(400, 'attachment is already attached to a message');
     throw err;
   }
+  queueTranscriptions(files.ids);
   const attachmentList = files.ids.length > 0
     ? database.getMessageAttachments(messageId)
     : undefined;
@@ -210,4 +225,73 @@ export function postMessage(member, { content, type = 'message', reply_to, attac
   });
 
   return { ok: true, message };
+}
+
+// ---------------------------------------------------------------------------
+// Edit / delete / react / directive (REST, MCP and WebSocket share these)
+// ---------------------------------------------------------------------------
+
+/** Load a message of the member's room, or a failure. */
+function loadRoomMessage(member, messageId) {
+  const id = Number(messageId);
+  const msg = Number.isInteger(id) ? database.getMessage(id) : undefined;
+  if (!msg || msg.room_id !== member.room_id) return { error: { ok: false, status: 404, error: 'Message not found' } };
+  return { msg };
+}
+
+function publicMessage(msg) {
+  const { room_id, member_id, ...rest } = msg;
+  return rest;
+}
+
+/** Edit one of your own messages. */
+export function editMessage(member, messageId, content) {
+  const { msg, error } = loadRoomMessage(member, messageId);
+  if (error) return error;
+  if (msg.member_id !== member.id) return { ok: false, status: 403, error: 'You can only edit your own messages' };
+  if (msg.deleted) return { ok: false, status: 400, error: 'Message was deleted' };
+  if (typeof content !== 'string' || (!content && !msg.attachments)) return { ok: false, status: 400, error: 'Content is required' };
+  if (content.length > config.maxMessageSize) return { ok: false, status: 413, error: 'Message too large' };
+
+  database.editMessage(msg.id, content);
+  const message = publicMessage(database.getMessage(msg.id));
+  broadcastEvent(member.room_id, { type: 'message_updated', message });
+  return { ok: true, message };
+}
+
+/** Delete one of your own messages (its files are removed too). */
+export function deleteMessage(member, messageId) {
+  const { msg, error } = loadRoomMessage(member, messageId);
+  if (error) return error;
+  if (msg.member_id !== member.id) return { ok: false, status: 403, error: 'You can only delete your own messages' };
+  if (msg.deleted) return { ok: true, id: msg.id };
+
+  deleteAttachmentFiles(database.deleteMessage(msg.id));
+  broadcastEvent(member.room_id, { type: 'message_deleted', id: msg.id });
+  return { ok: true, id: msg.id };
+}
+
+/** Toggle an emoji reaction on any message of the room. */
+export function toggleReaction(member, messageId, emoji) {
+  const { msg, error } = loadRoomMessage(member, messageId);
+  if (error) return error;
+  if (msg.deleted) return { ok: false, status: 400, error: 'Message was deleted' };
+  // One emoji or a short token like ":+1:" — no spaces, no control characters
+  // eslint-disable-next-line no-control-regex
+  if (typeof emoji !== 'string' || !emoji || emoji.length > 16 || /[\s\u0000-\u001f\u007f<>]/.test(emoji)) {
+    return { ok: false, status: 400, error: 'emoji must be a short string without spaces' };
+  }
+  const reactions = database.toggleReaction(msg.id, member.id, emoji);
+  broadcastEvent(member.room_id, { type: 'reaction', message_id: msg.id, reactions });
+  return { ok: true, message_id: msg.id, reactions };
+}
+
+/** Set the pinned directive and push it live to the web clients. */
+export function setDirective(member, content) {
+  if (!member.permissions.includes('w')) return { ok: false, status: 403, error: 'Write permission required' };
+  if (typeof content !== 'string' || !content) return { ok: false, status: 400, error: 'Content is required' };
+  if (content.length > config.maxMessageSize) return { ok: false, status: 413, error: 'Directive too large' };
+  database.updateRoomDirective(member.room_id, content, member.name);
+  broadcastEvent(member.room_id, { type: 'directive_updated', directive: content, author: member.name });
+  return { ok: true, directive: content };
 }
