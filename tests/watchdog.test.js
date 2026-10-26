@@ -168,6 +168,25 @@ describe('Watchdog Tests', () => {
     assert.strictEqual(alert, undefined, 'Reacted message must not trigger an alert');
   });
 
+  test('No "may be asleep" alert when the addressee received the message', async () => {
+    const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${member1Token}` },
+      body: JSON.stringify({ content: '@Agent2 FYI, nothing to answer' })
+    });
+    await new Promise(r => setTimeout(r, 1100)); // last_seen has a 1 s resolution
+    // Agent2 reads its unread messages (cursor passes the mention)
+    await request(`/api/rooms/${roomToken}/messages`, { headers: { 'Authorization': `Bearer ${member2Token}` } });
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    const { data } = await request(`/api/rooms/${roomToken}/messages/history?limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
+    });
+    const alert = data.messages.find(m => m.author === 'HubWatchdog' && m.content.includes(`message #${msgRes.id}`));
+    assert.strictEqual(alert, undefined, 'A member who got the message is not asleep');
+  });
+
   test('No second alert for same unanswered message', async () => {
     // Post another mention to Agent2
     const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
