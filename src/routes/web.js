@@ -531,7 +531,7 @@ router.get('/r/:token', (req, res) => {
     </div>
     <div>
       <button type="button" class="header-btn" id="notify-btn" title="Notifications for mentions and replies" onclick="toggleNotifications()">&#128277;</button>
-      <button type="button" class="header-btn mobile-only" title="Search and members" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+      <button type="button" class="header-btn mobile-only" title="Search and members" onclick="toggleSidebar()">&#9776;</button>
       <button type="button" class="header-btn" title="Photos shared in this room" onclick="openGallery()">&#128444; Photos</button>
       <button type="button" class="header-btn" title="Export the conversation (Markdown)" onclick="exportConversation('md')">Export .md</button>
       <button type="button" class="header-btn" title="Export the conversation (JSON)" onclick="exportConversation('json')">.json</button>
@@ -1169,6 +1169,37 @@ router.get('/r/:token', (req, res) => {
       }).join('');
     }
 
+    // ---- Overlays (gallery, lightbox, mobile sidebar) are history entries: Android Back closes
+    // the top one instead of leaving the room
+    const layers = [];
+    function layerEl(name) {
+      return name === 'sidebar' ? document.querySelector('.sidebar') : document.getElementById(name);
+    }
+    function openLayer(name) {
+      if (layers.includes(name)) return;
+      layerEl(name).classList.add('open');
+      layers.push(name);
+      history.pushState({ layer: name }, '');
+    }
+    function hideLayer(name) {
+      layerEl(name).classList.remove('open');
+      const i = layers.indexOf(name);
+      if (i >= 0) layers.splice(i, 1);
+    }
+    function closeLayer(name) {
+      if (!layers.includes(name)) return;
+      if (layers[layers.length - 1] === name) history.back(); // popstate hides it
+      else hideLayer(name);
+    }
+    window.addEventListener('popstate', () => {
+      const top = layers[layers.length - 1];
+      if (top) hideLayer(top);
+    });
+    function toggleSidebar() {
+      if (layers.includes('sidebar')) closeLayer('sidebar');
+      else openLayer('sidebar');
+    }
+
     // ---- Room photo gallery (grid, full screen on tap)
     let galleryBefore = null;
     let galleryItems = [];
@@ -1176,11 +1207,11 @@ router.get('/r/:token', (req, res) => {
       galleryBefore = null;
       galleryItems = [];
       document.getElementById('gallery-grid').innerHTML = '';
-      document.getElementById('gallery').classList.add('open');
+      openLayer('gallery');
       loadGallery();
     }
     function closeGallery() {
-      document.getElementById('gallery').classList.remove('open');
+      closeLayer('gallery');
     }
     async function loadGallery() {
       const q = 'type=image&limit=60' + (galleryBefore ? '&before_id=' + galleryBefore : '');
@@ -1207,10 +1238,10 @@ router.get('/r/:token', (req, res) => {
       document.getElementById('lightbox-img').src = f.url;
       document.getElementById('lightbox-cap').textContent =
         (f.author || '') + ' \u00B7 ' + new Date(f.created_at).toLocaleString() + ' \u00B7 ' + f.filename;
-      document.getElementById('lightbox').classList.add('open');
+      openLayer('lightbox');
     }
     function closeLightbox() {
-      document.getElementById('lightbox').classList.remove('open');
+      closeLayer('lightbox');
     }
     // Images in messages open in the lightbox too, instead of a new tab
     document.getElementById('messages').addEventListener('click', (e) => {
@@ -1220,10 +1251,10 @@ router.get('/r/:token', (req, res) => {
       galleryItems = [{ url: img.getAttribute('src'), filename: img.alt, author: '', created_at: Date.now() }];
       document.getElementById('lightbox-img').src = img.getAttribute('src');
       document.getElementById('lightbox-cap').textContent = img.alt;
-      document.getElementById('lightbox').classList.add('open');
+      openLayer('lightbox');
     });
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') { closeLightbox(); closeGallery(); }
+      if (e.key === 'Escape' && layers.length) closeLayer(layers[layers.length - 1]);
     });
 
     // Paste (screenshots) and drag & drop
