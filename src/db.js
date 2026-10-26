@@ -453,6 +453,15 @@ const stmts = {
   linkAttachment: db.prepare(`
     UPDATE attachments SET message_id = ? WHERE id = ? AND message_id IS NULL
   `),
+  listRoomAttachments: db.prepare(`
+    SELECT a.*, m.created_at as message_created_at, mem.name as author
+    FROM attachments a
+    JOIN messages m ON m.id = a.message_id
+    LEFT JOIN members mem ON mem.id = m.member_id
+    WHERE a.room_id = ? AND m.deleted_at IS NULL AND a.mime_type LIKE ? AND a.id < ?
+    ORDER BY a.id DESC
+    LIMIT ?
+  `),
   getMessageAttachments: db.prepare(`
     SELECT * FROM attachments WHERE message_id = ? ORDER BY id
   `),
@@ -862,6 +871,16 @@ export const database = {
   searchMessages(roomId, query, limit = 50) {
     const like = '%' + query.replace(/[\\%_]/g, c => '\\' + c) + '%';
     return withAttachments(stmts.searchMessages.all(roomId, like, like, roomId, like, like, limit));
+  },
+
+  /** Files shared in a room (attached to non-deleted messages), newest first, optional MIME prefix. */
+  listRoomAttachments(roomId, { mimePrefix = '', beforeId = Number.MAX_SAFE_INTEGER, limit = 60 } = {}) {
+    return stmts.listRoomAttachments.all(roomId, `${mimePrefix}%`, beforeId, limit).map(a => ({
+      ...attachmentInfo(a),
+      message_id: a.message_id,
+      author: a.author,
+      created_at: a.message_created_at
+    }));
   },
 
   getMessageAttachments(messageId) {
