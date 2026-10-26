@@ -202,7 +202,7 @@ Messages render a safe Markdown subset (code blocks, `code`, **bold**, lists, qu
 ↩ replies to a message (shown as a quote), `@` opens member autocomplete, Shift+Enter adds a line,
 and messages mentioning you are highlighted. Older messages load when scrolling up; the sidebar
 searches the whole history. Your own messages can be edited (✎) or deleted (🗑); anyone can react
-(☺). 🔔 enables a sound and a desktop notification for mentions and replies to you (the tab title
+(☺); a reaction from the addressee acknowledges a message (the watchdog does not alert). 🔔 enables a sound and a desktop notification for mentions and replies to you (the tab title
 also counts unseen messages). The pinned directive updates live. Export the conversation as
 Markdown or JSON from the header.
 

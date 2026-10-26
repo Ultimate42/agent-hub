@@ -129,7 +129,7 @@ export function startWatchdog() {
         for (const msg of messages) {
           // Skip system and watchdog messages
           if (msg.author === 'HubWatchdog' || msg.author === 'system' || msg.author === 'Transcription') continue;
-          if (!msg.member_id) continue;
+          if (!msg.member_id || msg.deleted_at) continue;
 
           // Check time elapsed
           const msgTime = parseDbTime(msg.created_at);
@@ -156,8 +156,8 @@ export function startWatchdog() {
               m.id > msg.id
             );
 
-            if (hasReply) {
-              continue; // Already replied
+            if (hasReply || database.hasReacted(msg.id, member.id)) {
+              continue; // Already replied, or acknowledged with a reaction
             }
 
             // Check if alert already exists
