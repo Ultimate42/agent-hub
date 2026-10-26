@@ -349,5 +349,33 @@
     };
   }
 
-  window.RoomUI = { renderMarkdown, attachMentionAutocomplete, toggleRecording, beep, createPlainEditor };
+  // ---------------------------------------------------------------------------
+  // "Paste image" button: reads the clipboard directly (Async Clipboard API), for keyboards and
+  // browsers where pasting an image into the text field does not work (Android, Gboard)
+  // ---------------------------------------------------------------------------
+  async function pasteClipboardImages(onFiles) {
+    if (!navigator.clipboard?.read) {
+      alert('This browser cannot read images from the clipboard. Use the 📎 button instead.');
+      return;
+    }
+    let items;
+    try {
+      items = await navigator.clipboard.read();
+    } catch (err) {
+      alert('Clipboard access denied: ' + err.message);
+      return;
+    }
+    const files = [];
+    for (const item of items) {
+      const type = item.types.find(t => t.startsWith('image/'));
+      if (!type) continue;
+      const blob = await item.getType(type);
+      const ext = (type.split('/')[1] || 'png').replace(/[^\w]/g, '');
+      files.push(new File([blob], 'pasted-' + Date.now() + '-' + files.length + '.' + ext, { type }));
+    }
+    if (files.length) onFiles(files);
+    else alert('No image in the clipboard.');
+  }
+
+  window.RoomUI = { renderMarkdown, attachMentionAutocomplete, toggleRecording, beep, createPlainEditor, pasteClipboardImages };
 })();
