@@ -79,7 +79,7 @@ function getMemberInRoom(roomId, memberName) {
 /**
  * Get or create HubWatchdog member in a room
  */
-function getOrCreateWatchdogMember(roomId) {
+export function getOrCreateWatchdogMember(roomId) {
   const existing = database.getMemberByNameAndRoom(roomId, 'HubWatchdog');
   if (existing) {
     // Legacy rows used a constant, publicly guessable token (and a UNIQUE clash for
