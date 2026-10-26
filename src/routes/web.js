@@ -583,6 +583,7 @@ router.get('/r/:token', (req, res) => {
       <div class="input-area">
         <input type="file" id="file-input" multiple style="display:none" onchange="addPendingFiles(this.files); this.value=''">
         <button type="button" class="attach-btn" title="Attach files (or paste / drop them)" onclick="document.getElementById('file-input').click()">&#128206;</button>
+        <button type="button" class="attach-btn" id="paste-btn" title="Paste an image from the clipboard" onclick="RoomUI.pasteClipboardImages(f => addPendingFiles(f))">&#128203;</button>
         <button type="button" class="attach-btn" id="record-btn" title="Record a voice message" onclick="RoomUI.toggleRecording(this, f => addPendingFiles([f]))">&#127908;</button>
         <div id="message-input" data-placeholder="Type a message... (Markdown, @ to mention, Shift+Enter for a new line)"></div>
         <button onclick="sendMessage()">Send</button>
