@@ -342,6 +342,35 @@ router.get('/r/:token', (req, res) => {
     .attachments a.file { display: inline-block; padding: 6px 10px; border: 1px solid var(--accent); border-radius: 6px; color: var(--text); text-decoration: none; }
     #pending-files { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 15px; }
     #pending-files .chip { background: var(--code-bg); border: 1px solid var(--accent); border-radius: 12px; padding: 2px 10px; font-size: 12px; }
+    #pending-files .chip { display: inline-flex; align-items: center; gap: 6px; }
+    #pending-files .chip img { width: 40px; height: 40px; object-fit: cover; border-radius: 6px; }
+    .mobile-only { display: none; }
+    @media (max-width: 700px) {
+      header { padding: 8px 10px; flex-wrap: wrap; gap: 6px; }
+      header h1 { font-size: 1.05em; }
+      header a { margin-left: 8px; font-size: 0.85em; }
+      .header-btn { padding: 3px 6px; margin-right: 3px; }
+      .mobile-only { display: inline-block; }
+      .sidebar { display: none; position: fixed; top: 0; right: 0; bottom: 0; width: 85vw; max-width: 320px; z-index: 40; box-shadow: -4px 0 16px rgba(0,0,0,0.5); }
+      .sidebar.open { display: block; }
+      .message { max-width: 92%; }
+      .input-area { padding: 8px; gap: 6px; flex-wrap: wrap; }
+      .input-area button { padding: 10px 14px; }
+      .input-area .attach-btn { padding: 8px 10px !important; }
+      #message-input { flex: 1 1 100% !important; order: -1; }
+      .input-area > button { flex: 1 1 auto; }
+      .attachments img, .attachments video { max-width: 100%; }
+    }
+    .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 50; align-items: center; justify-content: center; }
+    .overlay.open { display: flex; }
+    .gallery-panel { background: var(--card); width: min(960px, 96vw); max-height: 90vh; overflow-y: auto; border-radius: 10px; padding: 12px; }
+    .gallery-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    #gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 6px; }
+    #gallery-grid img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; cursor: zoom-in; display: block; }
+    #gallery-more { margin-top: 10px; }
+    #lightbox img { max-width: 96vw; max-height: 86vh; border-radius: 6px; }
+    #lightbox { flex-direction: column; gap: 8px; }
+    #lightbox-cap { color: #ddd; font-size: 0.85em; }
     #pending-files .chip button { background: none; border: none; color: var(--text); cursor: pointer; padding: 0 0 0 6px; }
     .attach-btn { padding: 0 12px !important; }
     .attach-btn.recording { background: #e5484d !important; color: #fff !important; }
@@ -502,6 +531,8 @@ router.get('/r/:token', (req, res) => {
     </div>
     <div>
       <button type="button" class="header-btn" id="notify-btn" title="Notifications for mentions and replies" onclick="toggleNotifications()">&#128277;</button>
+      <button type="button" class="header-btn mobile-only" title="Search and members" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+      <button type="button" class="header-btn" title="Photos shared in this room" onclick="openGallery()">&#128444; Photos</button>
       <button type="button" class="header-btn" title="Export the conversation (Markdown)" onclick="exportConversation('md')">Export .md</button>
       <button type="button" class="header-btn" title="Export the conversation (JSON)" onclick="exportConversation('json')">.json</button>
       <a href="/r/${escapeHtml(roomToken)}/setup">Setup Guide</a>
@@ -583,6 +614,8 @@ router.get('/r/:token', (req, res) => {
       <div class="input-area">
         <input type="file" id="file-input" multiple style="display:none" onchange="addPendingFiles(this.files); this.value=''">
         <button type="button" class="attach-btn" title="Attach files (or paste / drop them)" onclick="document.getElementById('file-input').click()">&#128206;</button>
+        <input type="file" id="camera-input" accept="image/*,video/*" capture="environment" style="display:none" onchange="addPendingFiles(this.files); this.value=''">
+        <button type="button" class="attach-btn" title="Take a photo or video" onclick="document.getElementById('camera-input').click()">&#128247;</button>
         <button type="button" class="attach-btn" id="paste-btn" title="Paste an image from the clipboard" onclick="RoomUI.pasteClipboardImages(f => addPendingFiles(f))">&#128203;</button>
         <button type="button" class="attach-btn" id="record-btn" title="Record a voice message" onclick="RoomUI.toggleRecording(this, f => addPendingFiles([f]))">&#127908;</button>
         <div id="message-input" data-placeholder="Type a message... (Markdown, @ to mention, Shift+Enter for a new line)"></div>
@@ -598,6 +631,14 @@ router.get('/r/:token', (req, res) => {
     </div>
   </div>
 
+  <div id="gallery" class="overlay" onclick="if(event.target===this)closeGallery()">
+    <div class="gallery-panel">
+      <div class="gallery-head"><strong>Photos</strong><button class="header-btn" onclick="closeGallery()">&times;</button></div>
+      <div id="gallery-grid"></div>
+      <button id="gallery-more" class="header-btn" onclick="loadGallery()">Load more</button>
+    </div>
+  </div>
+  <div id="lightbox" class="overlay" onclick="closeLightbox()"><img id="lightbox-img" alt=""><div id="lightbox-cap"></div></div>
   <script src="/assets/room-ui.js"></script>
   <script>
     const roomToken = '${escapeHtml(roomToken)}';
@@ -1111,12 +1152,79 @@ router.get('/r/:token', (req, res) => {
       pendingFiles.splice(i, 1);
       renderPendingFiles();
     }
+    // Pending files: thumbnails for images (object URLs released on every re-render)
+    let previewUrls = [];
     function renderPendingFiles() {
-      document.getElementById('pending-files').innerHTML = pendingFiles.map((f, i) =>
-        '<span class="chip">' + escapeHtml(f.name || 'file') + ' (' + formatSize(f.size) + ')' +
-        '<button title="Remove" onclick="removePendingFile(' + i + ')">&times;</button></span>'
-      ).join('');
+      previewUrls.forEach(u => URL.revokeObjectURL(u));
+      previewUrls = [];
+      document.getElementById('pending-files').innerHTML = pendingFiles.map((f, i) => {
+        let thumb = '';
+        if ((f.type || '').startsWith('image/')) {
+          const url = URL.createObjectURL(f);
+          previewUrls.push(url);
+          thumb = '<img src="' + url + '" alt="">';
+        }
+        return '<span class="chip">' + thumb + escapeHtml(f.name || 'file') + ' (' + formatSize(f.size) + ')' +
+          '<button title="Remove" onclick="removePendingFile(' + i + ')">&times;</button></span>';
+      }).join('');
     }
+
+    // ---- Room photo gallery (grid, full screen on tap)
+    let galleryBefore = null;
+    let galleryItems = [];
+    function openGallery() {
+      galleryBefore = null;
+      galleryItems = [];
+      document.getElementById('gallery-grid').innerHTML = '';
+      document.getElementById('gallery').classList.add('open');
+      loadGallery();
+    }
+    function closeGallery() {
+      document.getElementById('gallery').classList.remove('open');
+    }
+    async function loadGallery() {
+      const q = 'type=image&limit=60' + (galleryBefore ? '&before_id=' + galleryBefore : '');
+      const res = await fetch(apiBase + '/files?' + q, { headers: authHeaders() });
+      const data = await res.json();
+      if (!res.ok) return;
+      const grid = document.getElementById('gallery-grid');
+      for (const f of data.files) {
+        const i = galleryItems.push(f) - 1;
+        const img = document.createElement('img');
+        img.src = f.url;
+        img.loading = 'lazy';
+        img.alt = f.filename;
+        img.onclick = () => openLightbox(i);
+        grid.appendChild(img);
+      }
+      if (data.files.length) galleryBefore = data.files[data.files.length - 1].id;
+      if (!galleryItems.length) grid.textContent = 'No photos yet.';
+      document.getElementById('gallery-more').style.display = data.has_more ? '' : 'none';
+    }
+    function openLightbox(i) {
+      const f = galleryItems[i];
+      if (!f) return;
+      document.getElementById('lightbox-img').src = f.url;
+      document.getElementById('lightbox-cap').textContent =
+        (f.author || '') + ' \u00B7 ' + new Date(f.created_at).toLocaleString() + ' \u00B7 ' + f.filename;
+      document.getElementById('lightbox').classList.add('open');
+    }
+    function closeLightbox() {
+      document.getElementById('lightbox').classList.remove('open');
+    }
+    // Images in messages open in the lightbox too, instead of a new tab
+    document.getElementById('messages').addEventListener('click', (e) => {
+      const img = e.target.closest('.attachments img');
+      if (!img) return;
+      e.preventDefault();
+      galleryItems = [{ url: img.getAttribute('src'), filename: img.alt, author: '', created_at: Date.now() }];
+      document.getElementById('lightbox-img').src = img.getAttribute('src');
+      document.getElementById('lightbox-cap').textContent = img.alt;
+      document.getElementById('lightbox').classList.add('open');
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { closeLightbox(); closeGallery(); }
+    });
 
     // Paste (screenshots) and drag & drop
     document.addEventListener('paste', (e) => {

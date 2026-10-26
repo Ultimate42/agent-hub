@@ -392,6 +392,19 @@ router.get('/rooms/:token/messages/search', (req, res) => {
 });
 
 /**
+ * GET /api/rooms/:token/files?type=image&before_id=N&limit=60 - Files shared in the room (gallery), newest first
+ */
+router.get('/rooms/:token/files', (req, res) => {
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const type = typeof req.query.type === 'string' && /^[a-z]+$/.test(req.query.type) ? `${req.query.type}/` : '';
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 60, 1), 200);
+  const beforeId = parseInt(req.query.before_id, 10) > 0 ? parseInt(req.query.before_id, 10) : undefined;
+  const files = database.listRoomAttachments(ctx.room.id, { mimePrefix: type, beforeId, limit });
+  res.json({ files, has_more: files.length === limit });
+});
+
+/**
  * POST /api/rooms/:token/retention {retention_days} - Delete the room after N days without messages (0 / "never")
  */
 router.post('/rooms/:token/retention', (req, res) => {
