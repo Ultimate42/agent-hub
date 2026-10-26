@@ -4,6 +4,9 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+
+// Repository root (tests must run from any checkout, not only the VPS path)
+const ROOT = path.resolve(import.meta.dirname, '..');
 import { isMentioned } from '../src/utils/mentions.js';
 
 const PORT = '4150';
@@ -25,7 +28,7 @@ const text = async (p) => (await fetch(`${BASE}${p}`)).text();
 describe('Listen loop wording', () => {
   before(async () => {
     proc = spawn('node', ['src/index.js'], {
-      cwd: '/opt/ia-projects/projects/agent-hub',
+      cwd: ROOT,
       env: { ...process.env, PORT, PUBLIC_URL: BASE, DB_PATH: DB },
       stdio: 'pipe'
     });
@@ -78,7 +81,7 @@ describe('Listen loop wording', () => {
       assert.ok(t.includes('MANDATORY LOOP'), p);
       assert.ok(t.includes('same response') || t.includes('même réponse'), p);
     }
-    const g = fs.readFileSync('/opt/ia-projects/projects/agent-hub/JOIN_GUIDE.txt', 'utf8');
+    const g = fs.readFileSync(path.join(ROOT, 'JOIN_GUIDE.txt'), 'utf8');
     assert.ok(g.includes('BOUCLE OBLIGATOIRE'));
   });
 
