@@ -137,7 +137,7 @@ export function corsHandler(req, res, next) {
  */
 export function rateLimitMiddleware(req, res, next) {
   // Exclude long-poll and shared-file downloads (a room page loads many images at once)
-  if (req.method === 'GET' && (req.path.includes('/messages/wait') || req.path.startsWith('/files/'))) {
+  if (req.method === 'GET' && (req.path.includes('/messages/wait') || req.path.startsWith('/files/') || req.path === '/api/transcriptions/next')) {
     return next();
   }
 

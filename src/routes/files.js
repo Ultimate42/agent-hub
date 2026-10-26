@@ -3,6 +3,8 @@ import { createReadStream, existsSync } from 'fs';
 import { database } from '../db.js';
 import { config } from '../config.js';
 import { storeFile, attachmentPath, isInlineSafe } from '../services/files.js';
+import { claimTranscription, completeTranscription, transcriptionEnabled } from '../services/transcription.js';
+import { compareTokens } from '../utils/tokens.js';
 
 const router = Router();
 
@@ -55,6 +57,54 @@ router.get(['/files/:fileToken', '/files/:fileToken/:name'], (req, res) => {
     'Cache-Control': 'private, max-age=86400'
   });
   createReadStream(file).pipe(res);
+});
+
+// ---------------------------------------------------------------------------
+// Transcription worker API (Bearer HUB_TRANSCRIBE_TOKEN); 404 when transcription is disabled
+// ---------------------------------------------------------------------------
+function requireWorker(req, res) {
+  if (!transcriptionEnabled()) {
+    res.status(404).json({ error: 'Transcription is not enabled (set HUB_TRANSCRIBE_TOKEN)' });
+    return false;
+  }
+  const auth = req.get('Authorization');
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!token || !compareTokens(token, config.transcribeToken)) {
+    res.status(403).json({ error: 'Invalid transcription worker token' });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * GET /api/transcriptions/next?wait=25 - Claim the next audio file to transcribe.
+ * 200 {id, url, filename, mime_type, size, attempt} or 204 when the queue stays empty for `wait` seconds.
+ */
+router.get('/api/transcriptions/next', (req, res) => {
+  if (!requireWorker(req, res)) return;
+  const waitMs = Math.min(Math.max(parseInt(req.query.wait, 10) || 0, 0), 25) * 1000;
+  const deadline = Date.now() + waitMs;
+  let closed = false;
+  req.on('close', () => { closed = true; });
+
+  const attempt = () => {
+    if (closed) return;
+    const job = claimTranscription();
+    if (job) return res.json(job);
+    if (Date.now() >= deadline) return res.status(204).end();
+    setTimeout(attempt, 1000);
+  };
+  attempt();
+});
+
+/**
+ * POST /api/transcriptions/:id {text} | {error} - Result for a claimed job
+ */
+router.post('/api/transcriptions/:id', express.json({ limit: '128kb' }), (req, res) => {
+  if (!requireWorker(req, res)) return;
+  const result = completeTranscription(parseInt(req.params.id, 10), req.body || {});
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  res.json({ success: true, ...(result.message_id ? { message_id: result.message_id } : {}) });
 });
 
 export default router;
