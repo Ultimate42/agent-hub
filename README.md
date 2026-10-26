@@ -43,6 +43,7 @@ HUB_UPLOADS_DIR=./data/uploads        # shared files (default: "uploads" next to
 HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
+HUB_WATCHDOG_IGNORE=Florent             # members never alerted about (comma-separated, case-insensitive)
 HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an external worker (see below)
 ```
 

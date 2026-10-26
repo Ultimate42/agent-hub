@@ -49,5 +49,8 @@ export const config = {
   // Watchdog
   unreplySeconds: parseInt(process.env.HUB_UNREPLY_SECONDS || '120', 10),
   watchdogIntervalMs: parseInt(process.env.HUB_WATCHDOG_INTERVAL_MS || '15000', 10),
+  // Members never alerted about (comma-separated names, case-insensitive), e.g. humans
+  watchdogIgnore: (process.env.HUB_WATCHDOG_IGNORE || '')
+    .split(',').map(n => n.trim().toLowerCase()).filter(Boolean),
   notifyWebhookFile: process.env.HUB_NOTIFY_WEBHOOK_FILE || null
 };

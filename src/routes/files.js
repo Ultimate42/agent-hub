@@ -1,5 +1,6 @@
 import express, { Router } from 'express';
-import { createReadStream, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import path from 'path';
 import { database } from '../db.js';
 import { config } from '../config.js';
 import { storeFile, attachmentPath, isInlineSafe } from '../services/files.js';
@@ -51,12 +52,15 @@ router.get(['/files/:fileToken', '/files/:fileToken/:name'], (req, res) => {
   const inline = isInlineSafe(att.mime_type) && req.query.download === undefined;
   res.set({
     'Content-Type': inline ? att.mime_type : 'application/octet-stream',
-    'Content-Length': String(att.size),
     'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(att.filename)}`,
     'Content-Security-Policy': "default-src 'none'; sandbox",
     'Cache-Control': 'private, max-age=86400'
   });
-  createReadStream(file).pipe(res);
+  // sendFile handles Range (206, needed by Safari for audio/video seeking), ETag and Last-Modified;
+  // it keeps the Content-Type set above (stored files have no extension)
+  res.sendFile(path.resolve(file), { cacheControl: false, acceptRanges: true }, (err) => {
+    if (err && !res.headersSent) res.status(err.status || 500).end();
+  });
 });
 
 // ---------------------------------------------------------------------------

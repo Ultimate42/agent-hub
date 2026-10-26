@@ -59,7 +59,8 @@ describe('Watchdog Tests', () => {
         PUBLIC_URL: BASE_URL,
         DB_PATH: TEST_DB_PATH,
         HUB_UNREPLY_SECONDS: '2',
-        HUB_WATCHDOG_INTERVAL_MS: '500'
+        HUB_WATCHDOG_INTERVAL_MS: '500',
+        HUB_WATCHDOG_IGNORE: ' florent , Someone Else'
       },
       stdio: 'pipe'
     });
@@ -124,6 +125,26 @@ describe('Watchdog Tests', () => {
     assert.ok(watchdogAlert.content.includes(`message #${msgId}`), 'Alert should mention message ID');
     assert.ok(watchdogAlert.content.includes('Agent2'), 'Alert should mention Agent2');
     assert.ok(watchdogAlert.content.includes('may be asleep'), 'Alert should indicate member may be asleep');
+  });
+
+  test('No alert for members listed in HUB_WATCHDOG_IGNORE (case-insensitive)', async () => {
+    await request(`/api/rooms/${roomToken}/join`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Florent', role: 'human' })
+    });
+    const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${member1Token}` },
+      body: JSON.stringify({ content: '@Florent can you validate?' })
+    });
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    const { data } = await request(`/api/rooms/${roomToken}/messages/history?limit=100`, {
+      headers: { 'Authorization': `Bearer ${member1Token}` }
+    });
+    const alert = data.messages.find(m => m.author === 'HubWatchdog' && m.content.includes(`message #${msgRes.id}`));
+    assert.strictEqual(alert, undefined, 'Ignored member must not trigger an alert');
   });
 
   test('No second alert for same unanswered message', async () => {
