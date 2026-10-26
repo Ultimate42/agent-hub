@@ -5,9 +5,8 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { postMessage, sanitizeName, MEMBER_ROLES, parseBool, peekUnread, settleDelivery, ackMessages } from '../services/messages.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
-import { deduplicateAndAddPresence } from '../utils/members.js';
+import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import { LOOP_RULE_EN, LOOP_RULE_FR, ARRIVAL_FR, ARRIVAL_EN, MORE_UNREAD_NOTICE, MANUAL_ACK_NOTICE, NEXT_STEP, TIMEOUT_NOTICE, NEW_MESSAGES_NOTICE, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../utils/listen-loop.js';
-import { isMentioned } from '../utils/mentions.js';
 import { readFileSync } from 'fs';
 import { storeFile, attachmentPath } from '../services/files.js';
 import { attachmentInfo } from '../db.js';
@@ -511,46 +510,10 @@ async function handleToolCall(name, args, req) {
       const allMembers = database.getMembersByRoom(member.room_id);
       const dedupedMembers = deduplicateAndAddPresence(allMembers);
 
-      // Helper to calculate pending unreplied
-      function getPendingUnrepliedCount(roomId, memberId) {
-        const allMessages = database.getAllMessages(roomId);
-
-        const members = database.getMembersByRoom(roomId);
-        const m = members.find(x => x.id === memberId);
-        if (!m) return 0;
-
-        let count = 0;
-        for (const msg of allMessages) {
-          if (msg.author === 'HubWatchdog' || msg.author === 'system') continue;
-
-          let addressed = false;
-          if (msg.reply_to) {
-            const replyToMsg = allMessages.find(x => x.id === msg.reply_to);
-            if (replyToMsg?.member_id === memberId) {
-              addressed = true;
-            }
-          }
-
-          if (!addressed) {
-            if (isMentioned(msg.content, m.name)) {
-              addressed = true;
-            }
-          }
-
-          if (!addressed) continue;
-
-          const hasReply = allMessages.some(x =>
-            x.author === m.name &&
-            x.id > msg.id
-          );
-
-          if (!hasReply) {
-            count++;
-          }
-        }
-
-        return count;
-      }
+      const pending = countPendingUnreplied(
+        database.getAllMessages(member.room_id),
+        dedupedMembers.map(m => ({ id: m._id, name: m.name }))
+      );
 
       return {
         members: dedupedMembers.map(m => ({
@@ -559,7 +522,7 @@ async function handleToolCall(name, args, req) {
           last_seen: m.last_seen,
           presence: m.presence,
           unread_count: database.countUnread(member.room_id, m._id),
-          pending_unreplied: getPendingUnrepliedCount(member.room_id, m.id)
+          pending_unreplied: pending.get(m._id) || 0
         }))
       };
     }

@@ -114,6 +114,33 @@ export function validateAttachmentIds(member, attachments) {
   return { ok: true, ids };
 }
 
+/** Delete uploads that were never attached to a message (frees disk and room quota). */
+export function sweepPendingFiles(maxAgeMs = config.pendingFileTtlMs) {
+  const stale = database.getStalePendingAttachments(maxAgeMs);
+  for (const att of stale) {
+    try {
+      rmSync(attachmentPath(att), { force: true });
+      database.deleteAttachment(att.id);
+    } catch (err) {
+      logger.warn('Failed to delete pending file', { attachmentId: att.id, error: err.message });
+    }
+  }
+  if (stale.length) logger.info('Pending files swept', { count: stale.length });
+  return stale.length;
+}
+
+let sweepTimer = null;
+export function startFileSweeper(intervalMs = 3600 * 1000) {
+  sweepPendingFiles();
+  sweepTimer = setInterval(sweepPendingFiles, intervalMs);
+  sweepTimer.unref();
+}
+
+export function stopFileSweeper() {
+  clearInterval(sweepTimer);
+  sweepTimer = null;
+}
+
 /** Remove a room's files from disk (rows go with ON DELETE CASCADE). */
 export function deleteRoomFiles(roomId) {
   const dir = roomDir(roomId);

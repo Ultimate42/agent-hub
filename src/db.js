@@ -357,6 +357,12 @@ const stmts = {
   getMessageAttachments: db.prepare(`
     SELECT * FROM attachments WHERE message_id = ? ORDER BY id
   `),
+  getStalePendingAttachments: db.prepare(`
+    SELECT * FROM attachments WHERE message_id IS NULL AND created_at < datetime('now', ?)
+  `),
+  deleteAttachment: db.prepare(`
+    DELETE FROM attachments WHERE id = ?
+  `),
   roomStorageUsed: db.prepare(`
     SELECT COALESCE(SUM(size), 0) as n FROM attachments WHERE room_id = ?
   `),
@@ -653,6 +659,15 @@ export const database = {
 
   getMessageAttachments(messageId) {
     return stmts.getMessageAttachments.all(messageId).map(attachmentInfo);
+  },
+
+  /** Uploads never attached to a message, older than maxAgeMs. */
+  getStalePendingAttachments(maxAgeMs) {
+    return stmts.getStalePendingAttachments.all(`-${Math.floor(maxAgeMs / 1000)} seconds`);
+  },
+
+  deleteAttachment(id) {
+    stmts.deleteAttachment.run(id);
   },
 
   getRoomStorageUsed(roomId) {

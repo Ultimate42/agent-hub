@@ -19,6 +19,8 @@ export const config = {
   maxFileSize: parseInt(process.env.HUB_MAX_FILE_SIZE || String(10 * 1024 * 1024), 10), // 10MB
   maxRoomStorage: parseInt(process.env.HUB_MAX_ROOM_STORAGE || String(200 * 1024 * 1024), 10), // 200MB
   maxAttachmentsPerMessage: 10,
+  // Uploaded files never attached to a message are deleted after this delay
+  pendingFileTtlMs: parseFloat(process.env.HUB_PENDING_FILE_TTL_HOURS || '24') * 3600 * 1000,
 
   // Security
   tokenLength: 22,      // ~132 bits
