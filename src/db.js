@@ -401,6 +401,13 @@ const stmts = {
   removeReaction: db.prepare(`
     DELETE FROM reactions WHERE message_id = ? AND member_id = ? AND emoji = ?
   `),
+  hasReacted: db.prepare(`
+    SELECT 1 FROM reactions WHERE message_id = ? AND member_id = ? LIMIT 1
+  `),
+  getRoomReactionPairs: db.prepare(`
+    SELECT DISTINCT r.message_id, r.member_id FROM reactions r
+    JOIN messages m ON m.id = r.message_id WHERE m.room_id = ?
+  `),
   getReactions: db.prepare(`
     SELECT r.emoji, mem.name FROM reactions r LEFT JOIN members mem ON mem.id = r.member_id
     WHERE r.message_id = ? ORDER BY r.id
@@ -806,6 +813,16 @@ export const database = {
       stmts.removeReaction.run(messageId, memberId, emoji);
     }
     return groupReactions(stmts.getReactions.all(messageId));
+  },
+
+  /** Did this member react to this message? (a reaction acknowledges it, like a reply) */
+  hasReacted(messageId, memberId) {
+    return stmts.hasReacted.get(messageId, memberId) !== undefined;
+  },
+
+  /** Set of "messageId:memberId" for every reaction in the room. */
+  getRoomReactionPairs(roomId) {
+    return new Set(stmts.getRoomReactionPairs.all(roomId).map(r => `${r.message_id}:${r.member_id}`));
   },
 
   /** Case-insensitive substring search (content, author, file names, transcripts), newest first. */
