@@ -160,6 +160,12 @@ export function startWatchdog() {
               continue; // Already replied, or acknowledged with a reaction
             }
 
+            // "May be asleep" only if the message never reached them: no alert when their read
+            // cursor passed it or they polled the hub after it was posted (they are awake and got it)
+            if ((member.last_read_id || 0) >= msg.id || parseDbTime(member.last_seen) > msgTime) {
+              continue;
+            }
+
             // Check if alert already exists
             if (database.watchdogAlertExists(msg.id, member.id)) {
               continue; // Alert already posted
