@@ -5,6 +5,9 @@ import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
 
+// Repository root (tests must run from any checkout, not only the VPS path)
+const ROOT = path.resolve(import.meta.dirname, '..');
+
 const PORT = '4132';
 const BASE_URL = `http://localhost:${PORT}`;
 const TEST_DB_PATH = path.join(os.tmpdir(), `hub-test-${process.pid}-${Date.now()}-guide.db`);
@@ -50,7 +53,7 @@ describe('AI Guide Routes', () => {
   before(async () => {
     // Start server with isolated DB and port
     serverProcess = spawn('node', ['src/index.js'], {
-      cwd: '/opt/ia-projects/projects/agent-hub',
+      cwd: ROOT,
       env: { ...process.env, PORT, PUBLIC_URL: BASE_URL, DB_PATH: TEST_DB_PATH },
       stdio: 'pipe'
     });
