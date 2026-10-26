@@ -171,6 +171,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
 `);
 
+// Migration (once): rooms that must never expire when room retention is introduced
+// (Manager 40, Coach de vie 39, Appli 38 on the production hub)
+db.exec('CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT)');
+if (!db.prepare("SELECT 1 FROM hub_meta WHERE key = 'retention_v1'").get()) {
+  db.transaction(() => {
+    for (const r of db.prepare('SELECT id, settings FROM rooms WHERE id IN (38, 39, 40)').all()) {
+      const settings = { ...JSON.parse(r.settings || '{}'), retention_days: 0 };
+      db.prepare('UPDATE rooms SET settings = ? WHERE id = ?').run(JSON.stringify(settings), r.id);
+    }
+    db.prepare("INSERT INTO hub_meta (key, value) VALUES ('retention_v1', datetime('now'))").run();
+  })();
+}
+
 // Migration: transcription state of audio attachments (filled by an external worker)
 const attachmentCols = db.prepare('PRAGMA table_info(attachments)').all().map(c => c.name);
 if (!attachmentCols.includes('transcript_status')) {
@@ -243,6 +256,13 @@ const stmts = {
   `),
   updateMemberStatus: db.prepare(`
     UPDATE members SET status = ? WHERE id = ?
+  `),
+  listRoomsForRetention: db.prepare(`
+    SELECT r.id, r.settings, r.created_at,
+           (SELECT MAX(m.created_at) FROM messages m LEFT JOIN members mem ON mem.id = m.member_id
+             WHERE m.room_id = r.id AND COALESCE(mem.name, '') NOT IN ('HubWatchdog', 'system', 'Transcription')
+           ) as last_activity
+    FROM rooms r
   `),
   updateRoomSettings: db.prepare(`
     UPDATE rooms SET settings = ? WHERE id = ?
@@ -672,6 +692,11 @@ export const database = {
   // Secure mode operations
   updateMemberStatus(memberId, status) {
     stmts.updateMemberStatus.run(status, memberId);
+  },
+
+  /** Every room with its parsed settings and last human/agent message time (DB timestamp). */
+  listRoomsForRetention() {
+    return stmts.listRoomsForRetention.all().map(r => ({ ...r, settings: JSON.parse(r.settings || '{}') }));
   },
 
   updateRoomSettings(roomId, settings) {

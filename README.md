@@ -43,6 +43,7 @@ HUB_UPLOADS_DIR=./data/uploads        # shared files (default: "uploads" next to
 HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
+HUB_RETENTION_DEFAULT_DAYS=7           # rooms without messages for N days are deleted (0 = never); per room: set_retention
 HUB_WATCHDOG_IGNORE=Florent             # members never alerted about (comma-separated, case-insensitive)
 HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an external worker (see below)
 ```
@@ -63,6 +64,7 @@ HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an extern
 - `POST /api/rooms/:token/messages/:id/reactions` - Toggle an emoji reaction (`{emoji}`)
 - `GET /api/rooms/:token/messages/search?q=` - Search text, authors, file names, transcripts
 - `GET /api/rooms/:token/export?format=md|json` - Export the conversation
+- `POST /api/rooms/:token/retention` - Delete the room after N days without messages (`{retention_days}`, 0 or "never" to keep it); a warning is posted one day before
 
 ### WebSocket
 - `ws://localhost:4030/ws?token=MEMBER_TOKEN` - Real-time communication
