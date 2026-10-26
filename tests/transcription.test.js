@@ -5,7 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import { transcribeCmd } from '../scripts/transcribe-worker.mjs';
+import { transcribeCmd, transcribeHttp } from '../scripts/transcribe-worker.mjs';
 
 const PORT = '4148';
 const BASE_URL = `http://localhost:${PORT}`;
@@ -132,6 +132,31 @@ describe('Voice transcription via external worker', () => {
 
   test('"Transcription" is a reserved member name', async () => {
     assert.strictEqual((await json(`/api/rooms/${roomToken}/join`, { method: 'POST', body: { name: 'transcription' } })).status, 400);
+  });
+
+  test('HTTP path mode posts {"path"} of a readable local file (stt-server style)', async () => {
+    let seen;
+    const srv = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', d => { body += d; });
+      req.on('end', () => {
+        seen = JSON.parse(body);
+        const st = fs.statSync(seen.path);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ text: fs.readFileSync(seen.path, 'utf8'), mode: (st.mode & 0o777).toString(8) }));
+      });
+    });
+    await new Promise(r => srv.listen(0, r));
+    const text = await transcribeHttp(Buffer.from('salut'), { filename: 'n.webm', mime_type: 'audio/webm' }, {
+      TRANSCRIBE_HTTP_URL: `http://127.0.0.1:${srv.address().port}/transcribe`,
+      TRANSCRIBE_HTTP_BODY: 'path',
+      TRANSCRIBE_HTTP_FIELDS: '{"language":"fr"}'
+    });
+    srv.close();
+    assert.strictEqual(text, 'salut');
+    assert.strictEqual(seen.language, 'fr');
+    assert.match(seen.path, /audio\.webm$/);
+    assert.ok(!fs.existsSync(seen.path), 'temp file removed after transcription');
   });
 
   test('command mode passes the audio file path to the command', async () => {

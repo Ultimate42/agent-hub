@@ -174,9 +174,11 @@ describe('Watchdog Tests', () => {
       headers: { 'Authorization': `Bearer ${member1Token}` },
       body: JSON.stringify({ content: '@Agent2 FYI, nothing to answer' })
     });
-    await new Promise(r => setTimeout(r, 1100)); // last_seen has a 1 s resolution
-    // Agent2 reads its unread messages (cursor passes the mention)
-    await request(`/api/rooms/${roomToken}/messages`, { headers: { 'Authorization': `Bearer ${member2Token}` } });
+    // Agent2 reads its unread messages right away (its read cursor passes the mention)
+    const read = await request(`/api/rooms/${roomToken}/messages?limit=100`, { headers: { 'Authorization': `Bearer ${member2Token}` } });
+    assert.strictEqual(read.status, 200, `Agent2 read failed: ${JSON.stringify(read.data)}`);
+    assert.ok(read.data.messages.some(m => m.id === msgRes.id), 'Agent2 must receive the mention');
+    assert.ok(read.data.last_read_id >= msgRes.id, `cursor ${read.data.last_read_id} must pass #${msgRes.id}`);
 
     await new Promise(r => setTimeout(r, 3000));
 
