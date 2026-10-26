@@ -8,6 +8,7 @@ import {
   editMessage, deleteMessage, toggleReaction, setDirective
 } from '../services/messages.js';
 import { exportMessages, exportMarkdown } from '../services/export.js';
+import { setRoomRetention, roomRetentionDays } from '../services/retention.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
 import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import { LOOP_RULE_EN, LOOP_RULE_FR, ARRIVAL_FR, ARRIVAL_EN, MORE_UNREAD_NOTICE, MANUAL_ACK_NOTICE, NEXT_STEP, TIMEOUT_NOTICE, NEW_MESSAGES_NOTICE, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../utils/listen-loop.js';
@@ -126,6 +127,18 @@ const MCP_TOOLS = [
         limit: { type: 'number', description: 'Max results. Defaults to 20, max 100.' }
       },
       required: ['member_token', 'query']
+    }
+  },
+  {
+    name: 'set_retention',
+    description: 'Room retention: the room (messages and files) is deleted after N days without messages; a warning is posted one day before. Default 7 days. Use 0 or "never" to keep it forever. Without retention_days, returns the current value. / Durée de conservation du salon.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        retention_days: { description: 'Days without messages before deletion (number, 1-3650), or 0 / "never"' }
+      },
+      required: ['member_token']
     }
   },
   {
@@ -441,6 +454,19 @@ async function handleToolCall(name, args, req) {
       if (!query || query.length > 200) throw new Error('query is required (max 200 characters)');
       const limit = Math.min(Math.max(Math.floor(Number(args.limit)) || 20, 1), config.maxMessagesPerRequest);
       return { query, messages: database.searchMessages(member.room_id, query, limit) };
+    }
+
+    case 'set_retention': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+      if (args.retention_days === undefined) {
+        return { retention_days: roomRetentionDays(database.getRoomById(member.room_id).settings) };
+      }
+      const result = setRoomRetention(member, args.retention_days);
+      if (!result.ok) throw new Error(result.error);
+      return { success: true, retention_days: result.retention_days, next_step: NEXT_STEP };
     }
 
     case 'export_conversation': {

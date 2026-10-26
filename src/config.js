@@ -24,6 +24,10 @@ export const config = {
   transcribeToken: process.env.HUB_TRANSCRIBE_TOKEN || null,
   transcribeLeaseMs: 5 * 60 * 1000,
   transcribeMaxAttempts: 3,
+  // Rooms are deleted after this many days without messages (0 = never); agents can change it
+  // per room (set_retention). A warning is posted retentionWarnMs before deletion.
+  retentionDefaultDays: parseFloat(process.env.HUB_RETENTION_DEFAULT_DAYS ?? '7'),
+  retentionWarnMs: 24 * 3600 * 1000,
   pendingFileTtlMs: parseFloat(process.env.HUB_PENDING_FILE_TTL_HOURS || '24') * 3600 * 1000,
 
   // Security

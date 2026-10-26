@@ -13,6 +13,7 @@ import coordinationRoutes from './routes/coordination.js';
 import wakeTargetsRoutes from './routes/wake-targets.js';
 import filesRoutes from './routes/files.js';
 import { startFileSweeper, stopFileSweeper } from './services/files.js';
+import { startRetentionSweeper, stopRetentionSweeper } from './services/retention.js';
 import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
 import { database } from './db.js';
 import { releaseAllWaiters } from './services/messages.js';
@@ -100,6 +101,7 @@ const wss = setupWebSocket(server);
 initWatchdogDb(database.db);
 startWatchdog();
 startFileSweeper();
+startRetentionSweeper();
 
 // Start server
 server.listen(config.port, config.host, () => {
@@ -129,6 +131,7 @@ function shutdown() {
   // Stop watchdog
   stopWatchdog();
   stopFileSweeper();
+  stopRetentionSweeper();
 
   // Release long-polls and close WebSocket clients
   releaseAllWaiters();
