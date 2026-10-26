@@ -118,7 +118,7 @@ export function corsHandler(req, res, next) {
   // Allow configured origins or same-origin
   if (origin && (config.corsOrigins.includes(origin) || config.corsOrigins.includes('*'))) {
     res.set('Access-Control-Allow-Origin', origin);
-    res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.set('Vary', 'Origin');
     res.set('Access-Control-Max-Age', '86400');
@@ -137,7 +137,7 @@ export function corsHandler(req, res, next) {
  */
 export function rateLimitMiddleware(req, res, next) {
   // Exclude long-poll and shared-file downloads (a room page loads many images at once)
-  if (req.method === 'GET' && (req.path.includes('/messages/wait') || req.path.startsWith('/files/'))) {
+  if (req.method === 'GET' && (req.path.includes('/messages/wait') || req.path.startsWith('/files/') || req.path === '/api/transcriptions/next')) {
     return next();
   }
 

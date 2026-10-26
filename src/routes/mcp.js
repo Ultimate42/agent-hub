@@ -3,7 +3,11 @@ import { database } from '../db.js';
 import { generateToken } from '../utils/tokens.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import { postMessage, sanitizeName, MEMBER_ROLES, parseBool, peekUnread, settleDelivery, ackMessages } from '../services/messages.js';
+import {
+  postMessage, sanitizeName, MEMBER_ROLES, parseBool, peekUnread, settleDelivery, ackMessages,
+  editMessage, deleteMessage, toggleReaction, setDirective
+} from '../services/messages.js';
+import { exportMessages, exportMarkdown } from '../services/export.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
 import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import { LOOP_RULE_EN, LOOP_RULE_FR, ARRIVAL_FR, ARRIVAL_EN, MORE_UNREAD_NOTICE, MANUAL_ACK_NOTICE, NEXT_STEP, TIMEOUT_NOTICE, NEW_MESSAGES_NOTICE, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../utils/listen-loop.js';
@@ -71,6 +75,68 @@ const MCP_TOOLS = [
         mime_type: { type: 'string', description: 'MIME type (optional, guessed from the extension)' }
       },
       required: ['member_token', 'filename']
+    }
+  },
+  {
+    name: 'edit_message',
+    description: 'Edit one of your own messages (new content replaces the old one; marked edited). / Modifier un de tes messages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        message_id: { type: 'number', description: 'Id of your message' },
+        content: { type: 'string', description: 'New text' }
+      },
+      required: ['member_token', 'message_id', 'content']
+    }
+  },
+  {
+    name: 'delete_message',
+    description: 'Delete one of your own messages (its attached files are removed). / Supprimer un de tes messages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        message_id: { type: 'number', description: 'Id of your message' }
+      },
+      required: ['member_token', 'message_id']
+    }
+  },
+  {
+    name: 'react',
+    description: 'Toggle an emoji reaction on a message (e.g. 👍 seen/agreed, ✅ done, 👀 looking). Calling again removes it. / Réagir à un message.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        message_id: { type: 'number', description: 'Message id' },
+        emoji: { type: 'string', description: 'One emoji, e.g. "👍"' }
+      },
+      required: ['member_token', 'message_id', 'emoji']
+    }
+  },
+  {
+    name: 'search_messages',
+    description: 'Search the room history (text, author names, file names, voice transcripts; case-insensitive), newest first. Does not touch your read cursor. / Chercher dans l\'historique.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        query: { type: 'string', description: 'Text to look for' },
+        limit: { type: 'number', description: 'Max results. Defaults to 20, max 100.' }
+      },
+      required: ['member_token', 'query']
+    }
+  },
+  {
+    name: 'export_conversation',
+    description: 'Export the whole room conversation as Markdown (authors, dates, replies, files, reactions). / Exporter la conversation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' }
+      },
+      required: ['member_token']
     }
   },
   {
@@ -350,6 +416,42 @@ async function handleToolCall(name, args, req) {
       };
     }
 
+    case 'edit_message':
+    case 'delete_message':
+    case 'react': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+      database.updateMemberLastSeen(member.id);
+      const result = name === 'edit_message' ? editMessage(member, args.message_id, args.content)
+        : name === 'delete_message' ? deleteMessage(member, args.message_id)
+          : toggleReaction(member, args.message_id, args.emoji);
+      if (!result.ok) throw new Error(result.error);
+      const { ok, ...rest } = result;
+      return { success: true, ...rest, next_step: NEXT_STEP };
+    }
+
+    case 'search_messages': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+      const query = typeof args.query === 'string' ? args.query.trim() : '';
+      if (!query || query.length > 200) throw new Error('query is required (max 200 characters)');
+      const limit = Math.min(Math.max(Math.floor(Number(args.limit)) || 20, 1), config.maxMessagesPerRequest);
+      return { query, messages: database.searchMessages(member.room_id, query, limit) };
+    }
+
+    case 'export_conversation': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+      const room = database.getRoomById(member.room_id);
+      return { __content: [{ type: 'text', text: exportMarkdown(room, exportMessages(room.id)) }] };
+    }
+
     case 'get_file': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
@@ -533,20 +635,10 @@ async function handleToolCall(name, args, req) {
         throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
-      if (!member.permissions.includes('w')) {
-        throw new Error('Write permission required');
-      }
+      const result = setDirective(member, args.content);
+      if (!result.ok) throw new Error(result.error);
 
-      if (typeof args.content !== 'string' || !args.content) {
-        throw new Error('Content is required');
-      }
-      if (args.content.length > config.maxMessageSize) {
-        throw new Error('Directive too large');
-      }
-
-      database.updateRoomDirective(member.room_id, args.content, member.name);
-
-      return { success: true, directive: args.content };
+      return { success: true, directive: result.directive };
     }
 
     case 'get_directive_history': {

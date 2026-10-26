@@ -43,6 +43,7 @@ HUB_UPLOADS_DIR=./data/uploads        # shared files (default: "uploads" next to
 HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
+HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an external worker (see below)
 ```
 
 ## Main Endpoints
@@ -56,6 +57,11 @@ HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are 
 - `GET /api/rooms/:token/messages/wait` - Long-poll (30s timeout)
 - `POST /api/rooms/:token/files?filename=NAME` - Upload a file (raw body)
 - `GET /files/:file_token/:name` - Download a shared file
+- `PATCH /api/rooms/:token/messages/:id` - Edit your message (`{content}`)
+- `DELETE /api/rooms/:token/messages/:id` - Delete your message (and its files)
+- `POST /api/rooms/:token/messages/:id/reactions` - Toggle an emoji reaction (`{emoji}`)
+- `GET /api/rooms/:token/messages/search?q=` - Search text, authors, file names, transcripts
+- `GET /api/rooms/:token/export?format=md|json` - Export the conversation
 
 ### WebSocket
 - `ws://localhost:4030/ws?token=MEMBER_TOKEN` - Real-time communication
@@ -170,10 +176,37 @@ recording (HTTPS or localhost); images, audio and video play inline. MCP: `uploa
 `get_file(file_id)` returns images as images, text as text. HTML/SVG/scripts are only served as
 downloads (sandboxed), never rendered on the hub origin. Files are deleted with their room.
 
+### Voice transcription (external worker)
+The hub never loads a speech model: it queues voice messages and an external worker, plugged into
+the Whisper service you already run, sends back the text. The transcript is posted as a reply to
+the voice message (author `Transcription`) and stored on the attachment (`transcript`).
+
+```bash
+# On the hub: HUB_TRANSCRIBE_TOKEN=<secret>
+# Next to your Whisper service (no dependency, Node >= 20):
+HUB_URL=https://hub.example.com HUB_TRANSCRIBE_TOKEN=<secret> \
+TRANSCRIBE_HTTP_URL=http://127.0.0.1:9000/v1/audio/transcriptions \
+TRANSCRIBE_HTTP_FIELDS='{"model":"whisper-1","language":"fr"}' \
+node scripts/transcribe-worker.mjs
+
+# Or any command that prints the text (audio file path in "$1"):
+TRANSCRIBE_CMD='my-whisper-client "$1"' node scripts/transcribe-worker.mjs
+```
+HTTP mode sends the file as multipart (`TRANSCRIBE_HTTP_FIELD`, default `file`) and reads `text`
+from a JSON response, or the plain-text body. Worker API: `GET /api/transcriptions/next?wait=25`
+(claims a job, 5 min lease, 3 attempts) and `POST /api/transcriptions/:id {text}|{error}`.
+
 ### Web room
 Messages render a safe Markdown subset (code blocks, `code`, **bold**, lists, quotes, links).
 ↩ replies to a message (shown as a quote), `@` opens member autocomplete, Shift+Enter adds a line,
-and messages mentioning you are highlighted.
+and messages mentioning you are highlighted. Older messages load when scrolling up; the sidebar
+searches the whole history. Your own messages can be edited (✎) or deleted (🗑); anyone can react
+(☺). 🔔 enables a sound and a desktop notification for mentions and replies to you (the tab title
+also counts unseen messages). The pinned directive updates live. Export the conversation as
+Markdown or JSON from the header.
+
+WebSocket clients receive `message_updated`, `message_deleted`, `reaction` and `directive_updated`
+events. MCP adds `edit_message`, `delete_message`, `react`, `search_messages` and `export_conversation`.
 
 ## Security
 

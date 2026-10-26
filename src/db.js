@@ -151,6 +151,37 @@ if (!memberCols.includes('last_read_id')) {
   })();
 }
 
+// Migration: message edit / soft delete, and emoji reactions
+const messageCols = db.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
+if (!messageCols.includes('edited_at')) {
+  db.exec(`
+    ALTER TABLE messages ADD COLUMN edited_at DATETIME;
+    ALTER TABLE messages ADD COLUMN deleted_at DATETIME;
+  `);
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    emoji TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(message_id, member_id, emoji)
+  );
+  CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
+`);
+
+// Migration: transcription state of audio attachments (filled by an external worker)
+const attachmentCols = db.prepare('PRAGMA table_info(attachments)').all().map(c => c.name);
+if (!attachmentCols.includes('transcript_status')) {
+  db.exec(`
+    ALTER TABLE attachments ADD COLUMN transcript TEXT;
+    ALTER TABLE attachments ADD COLUMN transcript_status TEXT;
+    ALTER TABLE attachments ADD COLUMN transcript_claimed_at INTEGER;
+    ALTER TABLE attachments ADD COLUMN transcript_attempts INTEGER DEFAULT 0;
+  `);
+}
+
 logger.info('Database initialized', { path: config.dbPath });
 
 // Prepared statements
@@ -223,7 +254,7 @@ const stmts = {
     VALUES (?, ?, ?, ?, ?)
   `),
   getMessages: db.prepare(`
-    SELECT m.id, m.type, m.content, m.reply_to, m.created_at,
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at, m.edited_at, m.deleted_at,
            mem.name as author, mem.role as author_role
     FROM messages m
     LEFT JOIN members mem ON m.member_id = mem.id
@@ -232,7 +263,7 @@ const stmts = {
     LIMIT ?
   `),
   getMessagesSince: db.prepare(`
-    SELECT m.id, m.type, m.content, m.reply_to, m.created_at,
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at, m.edited_at, m.deleted_at,
            mem.name as author, mem.role as author_role
     FROM messages m
     LEFT JOIN members mem ON m.member_id = mem.id
@@ -241,7 +272,7 @@ const stmts = {
     LIMIT ?
   `),
   getUnread: db.prepare(`
-    SELECT m.id, m.type, m.content, m.reply_to, m.created_at,
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at, m.edited_at, m.deleted_at,
            mem.name as author, mem.role as author_role
     FROM messages m
     LEFT JOIN members mem ON m.member_id = mem.id
@@ -253,7 +284,7 @@ const stmts = {
     SELECT COUNT(*) as n FROM messages WHERE room_id = ? AND id > ? AND member_id IS NOT ?
   `),
   getMessagesBefore: db.prepare(`
-    SELECT m.id, m.type, m.content, m.reply_to, m.created_at,
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at, m.edited_at, m.deleted_at,
            mem.name as author, mem.role as author_role
     FROM messages m
     LEFT JOIN members mem ON m.member_id = mem.id
@@ -348,6 +379,44 @@ const stmts = {
   getAttachmentByToken: db.prepare(`
     SELECT * FROM attachments WHERE token = ?
   `),
+  getMessageFull: db.prepare(`
+    SELECT m.id, m.room_id, m.member_id, m.type, m.content, m.reply_to, m.created_at, m.edited_at, m.deleted_at,
+           mem.name as author, mem.role as author_role
+    FROM messages m
+    LEFT JOIN members mem ON m.member_id = mem.id
+    WHERE m.id = ?
+  `),
+  editMessage: db.prepare(`
+    UPDATE messages SET content = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL
+  `),
+  softDeleteMessage: db.prepare(`
+    UPDATE messages SET content = '', deleted_at = CURRENT_TIMESTAMP WHERE id = ?
+  `),
+  getAttachmentsByMessage: db.prepare(`
+    SELECT * FROM attachments WHERE message_id = ?
+  `),
+  addReaction: db.prepare(`
+    INSERT OR IGNORE INTO reactions (message_id, member_id, emoji) VALUES (?, ?, ?)
+  `),
+  removeReaction: db.prepare(`
+    DELETE FROM reactions WHERE message_id = ? AND member_id = ? AND emoji = ?
+  `),
+  getReactions: db.prepare(`
+    SELECT r.emoji, mem.name FROM reactions r LEFT JOIN members mem ON mem.id = r.member_id
+    WHERE r.message_id = ? ORDER BY r.id
+  `),
+  searchMessages: db.prepare(`
+    SELECT m.id, m.type, m.content, m.reply_to, m.created_at, m.edited_at, m.deleted_at,
+           mem.name as author, mem.role as author_role
+    FROM messages m
+    LEFT JOIN members mem ON m.member_id = mem.id
+    WHERE m.room_id = ? AND m.deleted_at IS NULL
+      AND (m.content LIKE ? ESCAPE '\\' OR mem.name LIKE ? ESCAPE '\\'
+           OR m.id IN (SELECT message_id FROM attachments WHERE room_id = ? AND message_id IS NOT NULL
+                       AND (filename LIKE ? ESCAPE '\\' OR transcript LIKE ? ESCAPE '\\')))
+    ORDER BY m.id DESC
+    LIMIT ?
+  `),
   getAttachmentById: db.prepare(`
     SELECT * FROM attachments WHERE id = ?
   `),
@@ -356,6 +425,23 @@ const stmts = {
   `),
   getMessageAttachments: db.prepare(`
     SELECT * FROM attachments WHERE message_id = ? ORDER BY id
+  `),
+  queueTranscription: db.prepare(`
+    UPDATE attachments SET transcript_status = 'pending'
+    WHERE id = ? AND mime_type LIKE 'audio/%' AND transcript_status IS NULL
+  `),
+  nextTranscription: db.prepare(`
+    SELECT * FROM attachments
+    WHERE transcript_status = 'pending' OR (transcript_status = 'claimed' AND transcript_claimed_at < ?)
+    ORDER BY id LIMIT 1
+  `),
+  claimTranscription: db.prepare(`
+    UPDATE attachments SET transcript_status = 'claimed', transcript_claimed_at = ?,
+      transcript_attempts = COALESCE(transcript_attempts, 0) + 1
+    WHERE id = ?
+  `),
+  setTranscriptionStatus: db.prepare(`
+    UPDATE attachments SET transcript_status = ?, transcript = ? WHERE id = ?
   `),
   getStalePendingAttachments: db.prepare(`
     SELECT * FROM attachments WHERE message_id IS NULL AND created_at < datetime('now', ?)
@@ -384,25 +470,61 @@ export function attachmentInfo(a) {
     filename: a.filename,
     mime_type: a.mime_type,
     size: a.size,
-    url: `${config.publicUrl}/files/${a.token}/${encodeURIComponent(a.filename)}`
+    url: `${config.publicUrl}/files/${a.token}/${encodeURIComponent(a.filename)}`,
+    ...(a.transcript_status ? { transcript_status: a.transcript_status } : {}),
+    ...(a.transcript ? { transcript: a.transcript } : {})
   };
 }
 
-/** Add an `attachments` array to the messages that have files (one query per page). */
+/** Group reaction rows ({emoji, name}) into [{emoji, count, members}] in first-use order. */
+function groupReactions(rows) {
+  const byEmoji = new Map();
+  for (const r of rows) {
+    if (!byEmoji.has(r.emoji)) byEmoji.set(r.emoji, { emoji: r.emoji, count: 0, members: [] });
+    const g = byEmoji.get(r.emoji);
+    g.count++;
+    if (r.name) g.members.push(r.name);
+  }
+  return [...byEmoji.values()];
+}
+
+/**
+ * Decorate a page of messages (one query per kind): `attachments`, `reactions`,
+ * `edited_at` / `deleted: true` only when set (a deleted message has empty content).
+ */
 function withAttachments(messages) {
+  for (const m of messages) {
+    if (m.deleted_at) { m.deleted = true; m.content = ''; }
+    if (!m.edited_at) delete m.edited_at;
+    delete m.deleted_at;
+  }
   const ids = messages.map(m => m.id).filter(Boolean);
   if (ids.length === 0) return messages;
+  const placeholders = ids.map(() => '?').join(',');
+
   const rows = db.prepare(
-    `SELECT * FROM attachments WHERE message_id IN (${ids.map(() => '?').join(',')}) ORDER BY id`
+    `SELECT * FROM attachments WHERE message_id IN (${placeholders}) ORDER BY id`
   ).all(...ids);
-  if (rows.length === 0) return messages;
   const byMsg = new Map();
   for (const r of rows) {
     if (!byMsg.has(r.message_id)) byMsg.set(r.message_id, []);
     byMsg.get(r.message_id).push(attachmentInfo(r));
   }
+
+  const reactionRows = db.prepare(`
+    SELECT r.message_id, r.emoji, mem.name FROM reactions r
+    LEFT JOIN members mem ON mem.id = r.member_id
+    WHERE r.message_id IN (${placeholders}) ORDER BY r.id
+  `).all(...ids);
+  const reactionsByMsg = new Map();
+  for (const r of reactionRows) {
+    if (!reactionsByMsg.has(r.message_id)) reactionsByMsg.set(r.message_id, []);
+    reactionsByMsg.get(r.message_id).push(r);
+  }
+
   for (const m of messages) {
     if (byMsg.has(m.id)) m.attachments = byMsg.get(m.id);
+    if (reactionsByMsg.has(m.id)) m.reactions = groupReactions(reactionsByMsg.get(m.id));
   }
   return messages;
 }
@@ -581,7 +703,7 @@ export const database = {
   // Get all messages in a room (no limit)
   getAllMessages(roomId) {
     return db.prepare(`
-      SELECT m.id, m.type, m.content, m.reply_to, m.created_at, mem.name as author, mem.id as member_id
+      SELECT m.id, m.type, m.content, m.reply_to, m.created_at, m.edited_at, m.deleted_at, mem.name as author, mem.id as member_id
       FROM messages m
       LEFT JOIN members mem ON m.member_id = mem.id
       WHERE m.room_id = ?
@@ -657,8 +779,69 @@ export const database = {
     })();
   },
 
+  /** One message, decorated like lists (attachments, reactions, edited/deleted), with room_id/member_id. */
+  getMessage(messageId) {
+    const m = stmts.getMessageFull.get(messageId);
+    return m ? withAttachments([m])[0] : undefined;
+  },
+
+  editMessage(messageId, content) {
+    return stmts.editMessage.run(content, messageId).changes === 1;
+  },
+
+  /** Soft delete: the row stays (replies keep their parent), content and attachments go. Returns removed attachments. */
+  deleteMessage(messageId) {
+    return db.transaction(() => {
+      const atts = stmts.getAttachmentsByMessage.all(messageId);
+      for (const a of atts) stmts.deleteAttachment.run(a.id);
+      stmts.softDeleteMessage.run(messageId);
+      db.prepare('DELETE FROM reactions WHERE message_id = ?').run(messageId);
+      return atts;
+    })();
+  },
+
+  /** Toggle a reaction; returns the message's grouped reactions. */
+  toggleReaction(messageId, memberId, emoji) {
+    if (stmts.addReaction.run(messageId, memberId, emoji).changes === 0) {
+      stmts.removeReaction.run(messageId, memberId, emoji);
+    }
+    return groupReactions(stmts.getReactions.all(messageId));
+  },
+
+  /** Case-insensitive substring search (content, author, file names, transcripts), newest first. */
+  searchMessages(roomId, query, limit = 50) {
+    const like = '%' + query.replace(/[\\%_]/g, c => '\\' + c) + '%';
+    return withAttachments(stmts.searchMessages.all(roomId, like, like, roomId, like, like, limit));
+  },
+
   getMessageAttachments(messageId) {
     return stmts.getMessageAttachments.all(messageId).map(attachmentInfo);
+  },
+
+  // Transcription queue (audio attachments, processed by an external worker)
+  queueTranscription(attachmentId) {
+    return stmts.queueTranscription.run(attachmentId).changes === 1;
+  },
+
+  /** Claim the next pending (or lease-expired) job. Jobs over maxAttempts are marked failed. */
+  claimNextTranscription(leaseMs, maxAttempts) {
+    return db.transaction(() => {
+      const now = Date.now();
+      for (;;) {
+        const job = stmts.nextTranscription.get(now - leaseMs);
+        if (!job) return null;
+        if ((job.transcript_attempts || 0) >= maxAttempts) {
+          stmts.setTranscriptionStatus.run('failed', null, job.id);
+          continue;
+        }
+        stmts.claimTranscription.run(now, job.id);
+        return stmts.getAttachmentById.get(job.id);
+      }
+    })();
+  },
+
+  setTranscriptionStatus(attachmentId, status, transcript = null) {
+    stmts.setTranscriptionStatus.run(status, transcript, attachmentId);
   },
 
   /** Uploads never attached to a message, older than maxAgeMs. */
