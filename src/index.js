@@ -88,6 +88,10 @@ app.use((err, req, res, next) => {
 
 // Create HTTP server
 const server = createServer(app);
+// Keep idle connections longer than clients and reverse proxies do (Node's 5 s default makes a
+// client reusing a socket race with the server closing it: "socket hang up" / UND_ERR_SOCKET)
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 
 // Setup WebSocket
 const wss = setupWebSocket(server);
