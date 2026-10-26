@@ -3,11 +3,12 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { processWakeTargets } from '../wake-targets.js';
 import { validateAttachmentIds } from './files.js';
+import { queueTranscriptions } from './transcription.js';
 
 export const MESSAGE_TYPES = ['message', 'question', 'response', 'directive'];
 export const MEMBER_ROLES = ['agent', 'human', 'observer', 'manager', 'second'];
 export const MAX_NAME_LENGTH = 64;
-const RESERVED_NAMES = ['hubwatchdog', 'system'];
+const RESERVED_NAMES = ['hubwatchdog', 'system', 'transcription'];
 
 // ---------------------------------------------------------------------------
 // Realtime fan-out: long-poll waiters + WebSocket clients
@@ -185,6 +186,7 @@ export function postMessage(member, { content, type = 'message', reply_to, attac
     if (err.message === 'attachment already used') return fail(400, 'attachment is already attached to a message');
     throw err;
   }
+  queueTranscriptions(files.ids);
   const attachmentList = files.ids.length > 0
     ? database.getMessageAttachments(messageId)
     : undefined;

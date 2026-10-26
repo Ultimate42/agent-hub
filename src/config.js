@@ -20,6 +20,10 @@ export const config = {
   maxRoomStorage: parseInt(process.env.HUB_MAX_ROOM_STORAGE || String(200 * 1024 * 1024), 10), // 200MB
   maxAttachmentsPerMessage: 10,
   // Uploaded files never attached to a message are deleted after this delay
+  // Voice transcription by an external worker (scripts/transcribe-worker.mjs); disabled when unset
+  transcribeToken: process.env.HUB_TRANSCRIBE_TOKEN || null,
+  transcribeLeaseMs: 5 * 60 * 1000,
+  transcribeMaxAttempts: 3,
   pendingFileTtlMs: parseFloat(process.env.HUB_PENDING_FILE_TTL_HOURS || '24') * 3600 * 1000,
 
   // Security

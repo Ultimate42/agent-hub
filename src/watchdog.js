@@ -128,7 +128,7 @@ export function startWatchdog() {
         // For each message, check if it's addressed to someone and unresponded
         for (const msg of messages) {
           // Skip system and watchdog messages
-          if (msg.author === 'HubWatchdog' || msg.author === 'system') continue;
+          if (msg.author === 'HubWatchdog' || msg.author === 'system' || msg.author === 'Transcription') continue;
           if (!msg.member_id) continue;
 
           // Check time elapsed

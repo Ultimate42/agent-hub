@@ -151,6 +151,17 @@ if (!memberCols.includes('last_read_id')) {
   })();
 }
 
+// Migration: transcription state of audio attachments (filled by an external worker)
+const attachmentCols = db.prepare('PRAGMA table_info(attachments)').all().map(c => c.name);
+if (!attachmentCols.includes('transcript_status')) {
+  db.exec(`
+    ALTER TABLE attachments ADD COLUMN transcript TEXT;
+    ALTER TABLE attachments ADD COLUMN transcript_status TEXT;
+    ALTER TABLE attachments ADD COLUMN transcript_claimed_at INTEGER;
+    ALTER TABLE attachments ADD COLUMN transcript_attempts INTEGER DEFAULT 0;
+  `);
+}
+
 logger.info('Database initialized', { path: config.dbPath });
 
 // Prepared statements
@@ -357,6 +368,23 @@ const stmts = {
   getMessageAttachments: db.prepare(`
     SELECT * FROM attachments WHERE message_id = ? ORDER BY id
   `),
+  queueTranscription: db.prepare(`
+    UPDATE attachments SET transcript_status = 'pending'
+    WHERE id = ? AND mime_type LIKE 'audio/%' AND transcript_status IS NULL
+  `),
+  nextTranscription: db.prepare(`
+    SELECT * FROM attachments
+    WHERE transcript_status = 'pending' OR (transcript_status = 'claimed' AND transcript_claimed_at < ?)
+    ORDER BY id LIMIT 1
+  `),
+  claimTranscription: db.prepare(`
+    UPDATE attachments SET transcript_status = 'claimed', transcript_claimed_at = ?,
+      transcript_attempts = COALESCE(transcript_attempts, 0) + 1
+    WHERE id = ?
+  `),
+  setTranscriptionStatus: db.prepare(`
+    UPDATE attachments SET transcript_status = ?, transcript = ? WHERE id = ?
+  `),
   getStalePendingAttachments: db.prepare(`
     SELECT * FROM attachments WHERE message_id IS NULL AND created_at < datetime('now', ?)
   `),
@@ -384,7 +412,9 @@ export function attachmentInfo(a) {
     filename: a.filename,
     mime_type: a.mime_type,
     size: a.size,
-    url: `${config.publicUrl}/files/${a.token}/${encodeURIComponent(a.filename)}`
+    url: `${config.publicUrl}/files/${a.token}/${encodeURIComponent(a.filename)}`,
+    ...(a.transcript_status ? { transcript_status: a.transcript_status } : {}),
+    ...(a.transcript ? { transcript: a.transcript } : {})
   };
 }
 
@@ -659,6 +689,32 @@ export const database = {
 
   getMessageAttachments(messageId) {
     return stmts.getMessageAttachments.all(messageId).map(attachmentInfo);
+  },
+
+  // Transcription queue (audio attachments, processed by an external worker)
+  queueTranscription(attachmentId) {
+    return stmts.queueTranscription.run(attachmentId).changes === 1;
+  },
+
+  /** Claim the next pending (or lease-expired) job. Jobs over maxAttempts are marked failed. */
+  claimNextTranscription(leaseMs, maxAttempts) {
+    return db.transaction(() => {
+      const now = Date.now();
+      for (;;) {
+        const job = stmts.nextTranscription.get(now - leaseMs);
+        if (!job) return null;
+        if ((job.transcript_attempts || 0) >= maxAttempts) {
+          stmts.setTranscriptionStatus.run('failed', null, job.id);
+          continue;
+        }
+        stmts.claimTranscription.run(now, job.id);
+        return stmts.getAttachmentById.get(job.id);
+      }
+    })();
+  },
+
+  setTranscriptionStatus(attachmentId, status, transcript = null) {
+    stmts.setTranscriptionStatus.run(status, transcript, attachmentId);
   },
 
   /** Uploads never attached to a message, older than maxAgeMs. */
