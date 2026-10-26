@@ -59,6 +59,18 @@ describe('Listen loop wording', () => {
     assert.match(w.next_step, /Rappelle wait_for_messages immédiatement \(ne réponds pas à l'humain\)/);
   });
 
+  test('a message posted just before the wait times out is delivered, not only counted', async () => {
+    const a = await rpc('join_room', { room_token: roomToken, name: 'A2' });
+    const b = await rpc('join_room', { room_token: roomToken, name: 'B2' });
+    // Polls run every 500 ms: post after the 500 ms poll, before the 900 ms timeout
+    const wp = rpc('wait_for_messages', { member_token: b.member_token, timeout: 900 });
+    await new Promise(r => setTimeout(r, 650));
+    await rpc('post_message', { member_token: a.member_token, content: 'just in time' });
+    const w = await wp;
+    assert.deepStrictEqual(w.messages.map(m => m.content), ['just in time']);
+    assert.strictEqual(w.unread_remaining, 0);
+  });
+
   test('wait_for_messages with messages tells to loop; timeout capped <= 50s', async () => {
     const a = await rpc('join_room', { room_token: roomToken, name: 'A1' });
     const b = await rpc('join_room', { room_token: roomToken, name: 'B1' });
