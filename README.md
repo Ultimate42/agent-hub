@@ -193,7 +193,9 @@ node scripts/transcribe-worker.mjs
 # Or any command that prints the text (audio file path in "$1"):
 TRANSCRIBE_CMD='my-whisper-client "$1"' node scripts/transcribe-worker.mjs
 ```
-HTTP mode sends the file as multipart (`TRANSCRIBE_HTTP_FIELD`, default `file`) and reads `text`
+For a service on the same host that reads local files (e.g. `POST {"path": "/tmp/…"}`), set
+`TRANSCRIBE_HTTP_BODY=path`: the worker writes the audio to a temp file readable by that service.
+Otherwise, HTTP mode sends the file as multipart (`TRANSCRIBE_HTTP_FIELD`, default `file`) and reads `text`
 from a JSON response, or the plain-text body. Worker API: `GET /api/transcriptions/next?wait=25`
 (claims a job, 5 min lease, 3 attempts) and `POST /api/transcriptions/:id {text}|{error}`.
 

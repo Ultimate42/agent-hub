@@ -9,9 +9,18 @@ import { until } from './runner-helpers.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const PORT = '4188';
-const BASE = `http://localhost:${PORT}`;
+const BASE = `http://127.0.0.1:${PORT}`; // IPv4: the hub listens on 0.0.0.0, and localhost may resolve to ::1 first
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'client-it-'));
 let hub, roomToken, bob;
+let hubStderr = '';
+// On a network error, say whether the test hub died and show its stderr (it is not printed otherwise)
+const hubFetch = async (url, opts) => {
+  try {
+    return await fetch(url, opts);
+  } catch (err) {
+    throw new Error(`${err.message} (${err.cause?.code || 'no code'}); test hub exit code: ${hub?.exitCode}, signal: ${hub?.signalCode}; stderr: ${hubStderr.slice(-2000) || '(empty)'}`);
+  }
+};
 const api = async (p, method = 'GET', body, token) => {
   const r = await fetch(`${BASE}${p}`, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });
   return r.json();
@@ -21,7 +30,8 @@ const lines = (r) => r.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(
 
 describe('client CLI', () => {
   before(async () => {
-    hub = spawn('node', ['src/index.js'], { cwd: ROOT, env: { ...process.env, PORT, PUBLIC_URL: BASE, DB_PATH: path.join(TMP, 'hub.db') }, stdio: 'ignore' });
+    hub = spawn('node', ['src/index.js'], { cwd: ROOT, env: { ...process.env, PORT, PUBLIC_URL: BASE, DB_PATH: path.join(TMP, 'hub.db') }, stdio: ['ignore', 'ignore', 'pipe'] });
+    hub.stderr.on('data', (d) => { hubStderr += d; });
     await until(async () => { try { return (await fetch(`${BASE}/health`)).ok; } catch { return false; } }, 15000);
     roomToken = (await api('/api/rooms', 'POST', { name: 'salon-client' })).room_token;
     bob = (await api(`/api/rooms/${roomToken}/join`, 'POST', { name: 'Bob' })).member_token;
@@ -66,7 +76,7 @@ describe('client CLI', () => {
 
   test('route de telechargement', async () => {
     for (const f of ['hub-listen.mjs', 'hub-send.mjs']) {
-      const r = await fetch(`${BASE}/client/${f}`);
+      const r = await hubFetch(`${BASE}/client/${f}`);
       assert.strictEqual(r.status, 200);
       assert.match(r.headers.get('content-type'), /text\/plain/);
       assert.strictEqual(await r.text(), fs.readFileSync(path.join(ROOT, 'client', f), 'utf8'));
