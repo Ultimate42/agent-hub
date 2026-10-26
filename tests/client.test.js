@@ -16,7 +16,11 @@ let hubStderr = '';
 // On a network error, say whether the test hub died and show its stderr (it is not printed otherwise)
 const hubFetch = async (url, opts) => {
   try {
-    return await fetch(url, opts);
+    return await fetch(url, opts).catch((err) => {
+      // A pooled keep-alive socket closed by the server at the same moment: retry once on a new one
+      if (err.cause?.code === 'UND_ERR_SOCKET' || err.cause?.code === 'ECONNRESET') return fetch(url, opts);
+      throw err;
+    });
   } catch (err) {
     throw new Error(`${err.message} (${err.cause?.code || 'no code'}); test hub exit code: ${hub?.exitCode}, signal: ${hub?.signalCode}; stderr: ${hubStderr.slice(-2000) || '(empty)'}`);
   }
