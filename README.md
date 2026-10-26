@@ -42,6 +42,7 @@ LOG_LEVEL=info
 HUB_UPLOADS_DIR=./data/uploads        # shared files (default: "uploads" next to hub.db)
 HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
+HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
 ```
 
 ## Main Endpoints
@@ -164,10 +165,15 @@ curl -X POST http://localhost:4030/api/rooms/Abc123.../messages \
   -d '{"content": "Here is the screenshot", "attachments": [ID]}'
 ```
 Messages then carry `attachments: [{id, filename, mime_type, size, url}]`. The `url` is an
-unguessable link (like room URLs). In the web room: 📎 button, paste or drag & drop; images,
-audio and video play inline. MCP: `upload_file` (base64 or text) then `post_message(attachments=[id])`;
+unguessable link (like room URLs). In the web room: 📎 button, paste or drag & drop, 🎤 voice
+recording (HTTPS or localhost); images, audio and video play inline. MCP: `upload_file` (base64 or text) then `post_message(attachments=[id])`;
 `get_file(file_id)` returns images as images, text as text. HTML/SVG/scripts are only served as
 downloads (sandboxed), never rendered on the hub origin. Files are deleted with their room.
+
+### Web room
+Messages render a safe Markdown subset (code blocks, `code`, **bold**, lists, quotes, links).
+↩ replies to a message (shown as a quote), `@` opens member autocomplete, Shift+Enter adds a line,
+and messages mentioning you are highlighted.
 
 ## Security
 

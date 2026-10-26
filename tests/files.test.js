@@ -159,3 +159,29 @@ describe('Shared files (attachments)', () => {
     assert.strictEqual((await fetch(up.data.url)).status, 404);
   });
 });
+
+describe('Pending file sweeper', () => {
+  test('deletes uploads never attached to a message, keeps attached ones', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-sweep-'));
+    process.env.DB_PATH = path.join(dir, 'hub.db');
+    const { database } = await import('../src/db.js');
+    const { storeFile, sweepPendingFiles, attachmentPath } = await import('../src/services/files.js');
+    const roomId = Number(database.createRoom('sweepRoomToken', 'sweepAdminToken', 'S'));
+    const memberId = Number(database.createMember(roomId, 'sweepMemberToken', 'M'));
+    const member = database.getMemberByToken('sweepMemberToken');
+
+    const pending = storeFile(member, { filename: 'p.txt', data: Buffer.from('p') }).attachment;
+    const used = storeFile(member, { filename: 'u.txt', data: Buffer.from('u') }).attachment;
+    const msgId = Number(database.createMessage(roomId, memberId, 'message', 'x'));
+    database.linkAttachments(msgId, [used.id]);
+    database.db.prepare(`UPDATE attachments SET created_at = datetime('now', '-2 days')`).run();
+
+    const pendingPath = attachmentPath(database.getAttachmentById(pending.id));
+    assert.strictEqual(sweepPendingFiles(24 * 3600 * 1000), 1);
+    assert.strictEqual(database.getAttachmentById(pending.id), undefined);
+    assert.ok(!fs.existsSync(pendingPath));
+    assert.ok(fs.existsSync(attachmentPath(database.getAttachmentById(used.id))));
+    database.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

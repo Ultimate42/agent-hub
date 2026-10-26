@@ -3,8 +3,18 @@ import { Router } from 'express';
 import { database } from '../db.js';
 import { config } from '../config.js';
 import { escapeHtml } from '../utils/security.js';
+import { readFileSync } from 'fs';
+
+const ROOM_UI_JS = readFileSync(new URL('../public/room-ui.js', import.meta.url), 'utf8');
 
 const router = Router();
+
+/**
+ * GET /assets/room-ui.js - Room page helpers (Markdown, @mentions, voice recording)
+ */
+router.get('/assets/room-ui.js', (req, res) => {
+  res.type('application/javascript').set('Cache-Control', 'public, max-age=300').send(ROOM_UI_JS);
+});
 
 /**
  * GET / - Home page
@@ -333,7 +343,27 @@ router.get('/r/:token', (req, res) => {
     #pending-files { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 15px; }
     #pending-files .chip { background: var(--code-bg); border: 1px solid var(--accent); border-radius: 12px; padding: 2px 10px; font-size: 12px; }
     #pending-files .chip button { background: none; border: none; color: var(--text); cursor: pointer; padding: 0 0 0 6px; }
-    .attach-btn { padding: 0 12px; }
+    .attach-btn { padding: 0 12px !important; }
+    .attach-btn.recording { background: #e5484d !important; color: #fff !important; }
+    .message-body pre { background: var(--code-bg); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+    .message-body code { background: var(--code-bg); padding: 1px 4px; border-radius: 4px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.9em; }
+    .message-body pre code { background: none; padding: 0; }
+    .message-body blockquote { border-left: 3px solid var(--accent); padding-left: 8px; color: #aaa; margin: 4px 0; }
+    .message-body ul, .message-body ol { padding-left: 22px; margin: 4px 0; }
+    .message-body a { color: var(--accent); }
+    .message-body .md-h { font-weight: bold; margin: 6px 0 2px; }
+    .message-body .md-h1 { font-size: 1.3em; }
+    .message-body .md-h2 { font-size: 1.15em; }
+    .message.mentioned { box-shadow: inset 3px 0 0 var(--accent); }
+    .reply-btn { background: none; border: none; color: #888; cursor: pointer; float: right; margin-left: 8px; font-size: 1em; padding: 0; }
+    .reply-btn:hover { color: var(--accent); }
+    .reply-quote { font-size: 0.85em; color: #999; border-left: 3px solid #666; padding-left: 6px; margin-bottom: 6px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .message.flash { outline: 2px solid var(--accent); }
+    #reply-bar { display: none; padding: 6px 15px; font-size: 0.85em; color: #aaa; background: var(--card); border-top: 1px solid var(--code-bg); }
+    #reply-bar button { background: none; border: none; color: var(--text); cursor: pointer; margin-left: 8px; }
+    .mention-menu { position: absolute; bottom: 100%; left: 60px; background: var(--card); border: 1px solid var(--accent); border-radius: 6px; min-width: 180px; max-height: 220px; overflow-y: auto; z-index: 10; }
+    .mention-item { padding: 6px 10px; cursor: pointer; }
+    .mention-item.active, .mention-item:hover { background: var(--code-bg); color: var(--accent); }
     .messages-container.dragover { outline: 2px dashed var(--accent); outline-offset: -6px; }
     .message.other { background: var(--msg-other); }
     .message.system {
@@ -374,7 +404,13 @@ router.get('/r/:token', (req, res) => {
       gap: 10px;
       border-top: 1px solid var(--code-bg);
     }
-    .input-area input {
+    .input-area textarea {
+      resize: none;
+      max-height: 160px;
+      font-family: inherit;
+      line-height: 1.4;
+    }
+    .input-area input, .input-area textarea {
       flex: 1;
       padding: 12px;
       border: 1px solid var(--accent);
@@ -461,7 +497,7 @@ router.get('/r/:token', (req, res) => {
           <p>If your AI supports custom connectors (Claude.ai, ChatGPT Dev):</p>
           <ul>
             <li>Go to Settings → Connectors → Add Custom Connector</li>
-            <li>Enter URL: <code>https://hub.rollium.fr/mcp</code></li>
+            <li>Enter URL: <code>${escapeHtml(config.publicUrl)}/mcp</code></li>
             <li>Open a NEW conversation</li>
             <li>Use these tools:
               <ul>
@@ -487,10 +523,10 @@ router.get('/r/:token', (req, res) => {
           <strong>Option C: REST API / curl</strong>
           <p>If you can make HTTP requests:</p>
           <ul>
-            <li>Join: <code>curl -X POST https://hub.rollium.fr/api/rooms/${escapeHtml(roomToken)}/join -H "Content-Type: application/json" -d '{"name":"YourName","role":"agent"}'</code></li>
+            <li>Join: <code>curl -X POST ${escapeHtml(config.publicUrl)}/api/rooms/${escapeHtml(roomToken)}/join -H "Content-Type: application/json" -d '{"name":"YourName","role":"agent"}'</code></li>
             <li>Save the <code>member_token</code> from response</li>
-            <li>Read: <code>curl https://hub.rollium.fr/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN"</code></li>
-            <li>Send: <code>curl -X POST https://hub.rollium.fr/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d '{"content":"Your message"}'</code></li>
+            <li>Read: <code>curl ${escapeHtml(config.publicUrl)}/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN"</code></li>
+            <li>Send: <code>curl -X POST ${escapeHtml(config.publicUrl)}/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d '{"content":"Your message"}'</code></li>
           </ul>
         </div>
 
@@ -517,10 +553,12 @@ router.get('/r/:token', (req, res) => {
       <div id="directive"></div>
       <div id="messages"></div>
       <div id="pending-files"></div>
+      <div id="reply-bar"></div>
       <div class="input-area">
         <input type="file" id="file-input" multiple style="display:none" onchange="addPendingFiles(this.files); this.value=''">
         <button type="button" class="attach-btn" title="Attach files (or paste / drop them)" onclick="document.getElementById('file-input').click()">&#128206;</button>
-        <input type="text" id="message-input" placeholder="Type a message..." onkeypress="if(event.key==='Enter')sendMessage()">
+        <button type="button" class="attach-btn" id="record-btn" title="Record a voice message" onclick="RoomUI.toggleRecording(this, f => addPendingFiles([f]))">&#127908;</button>
+        <textarea id="message-input" rows="1" placeholder="Type a message... (Markdown, @ to mention, Shift+Enter for a new line)"></textarea>
         <button onclick="sendMessage()">Send</button>
       </div>
     </div>
@@ -530,6 +568,7 @@ router.get('/r/:token', (req, res) => {
     </div>
   </div>
 
+  <script src="/assets/room-ui.js"></script>
   <script>
     const roomToken = '${escapeHtml(roomToken)}';
     const apiBase = '/api/rooms/' + roomToken;
@@ -537,6 +576,61 @@ router.get('/r/:token', (req, res) => {
     let memberToken = localStorage.getItem('agent-hub-token-' + roomToken);
     let memberName = localStorage.getItem('agent-hub-name-' + roomToken);
     let ws = null;
+    let memberNames = [];
+    const messagesById = new Map();
+    let replyTo = null;
+
+    // Textarea: Enter sends, Shift+Enter new line, @ opens the member menu
+    const messageInput = document.getElementById('message-input');
+    const mentionKey = RoomUI.attachMentionAutocomplete(messageInput, () => memberNames);
+    messageInput.addEventListener('keydown', (e) => {
+      if (mentionKey(e)) return;
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+    messageInput.addEventListener('input', () => {
+      messageInput.style.height = 'auto';
+      messageInput.style.height = messageInput.scrollHeight + 'px';
+    });
+
+    function snippet(msg) {
+      const text = (msg.content || '').replace(/\\s+/g, ' ').trim();
+      if (text) return text.length > 80 ? text.slice(0, 80) + '...' : text;
+      return msg.attachments && msg.attachments.length ? '[' + msg.attachments.map(a => a.filename).join(', ') + ']' : '';
+    }
+
+    function setReply(id) {
+      const msg = messagesById.get(id);
+      if (!msg) return;
+      replyTo = id;
+      const bar = document.getElementById('reply-bar');
+      bar.innerHTML = '&#8618; Replying to <strong>' + escapeHtml(msg.author) + '</strong>: ' + escapeHtml(snippet(msg)) +
+        '<button title="Cancel" onclick="cancelReply()">&times;</button>';
+      bar.style.display = 'block';
+      messageInput.focus();
+    }
+
+    function cancelReply() {
+      replyTo = null;
+      const bar = document.getElementById('reply-bar');
+      bar.style.display = 'none';
+      bar.innerHTML = '';
+    }
+
+    function scrollToMessage(id) {
+      const el = document.getElementById('msg-' + id);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), 1200);
+    }
+
+    function mentionsMe(content) {
+      if (!memberName || !content) return false;
+      return content.toLowerCase().includes('@' + memberName.toLowerCase());
+    }
 
     // Check if already have a token
     if (memberToken && memberName) {
@@ -621,6 +715,7 @@ router.get('/r/:token', (req, res) => {
         });
         const data = await res.json();
         if (res.ok) {
+          memberNames = data.members.filter(m => !m.is_you).map(m => m.name);
           const container = document.getElementById('members');
           container.innerHTML = data.members.map(m =>
             '<div class="member"><strong>' + escapeHtml(m.name) + '</strong>' +
@@ -669,12 +764,27 @@ router.get('/r/:token', (req, res) => {
 
       if (msg.type !== 'system') {
         const time = msg.created_at ? new Date(msg.created_at).toLocaleTimeString() : '';
+        const id = Number(msg.id) || 0;
+        if (id) {
+          messagesById.set(id, msg);
+          div.id = 'msg-' + id;
+        }
+        if (!isOwn && mentionsMe(msg.content)) div.className += ' mentioned';
+        let quote = '';
+        const parentId = Number(msg.reply_to) || 0;
+        if (parentId) {
+          const parent = messagesById.get(parentId);
+          quote = '<div class="reply-quote" onclick="scrollToMessage(' + parentId + ')">&#8618; ' +
+            (parent ? '<strong>' + escapeHtml(parent.author) + '</strong>: ' + escapeHtml(snippet(parent)) : 'message #' + parentId) +
+            '</div>';
+        }
         div.innerHTML =
           '<div class="message-header">' +
           '<strong>' + escapeHtml(msg.author || 'Unknown') + '</strong>' +
+          (id ? '<button class="reply-btn" title="Reply" onclick="setReply(' + id + ')">&#8617;</button>' : '') +
           '<span class="message-time">' + time + '</span>' +
-          '</div>' +
-          (msg.content ? '<div>' + escapeHtml(msg.content) + '</div>' : '') +
+          '</div>' + quote +
+          (msg.content ? '<div class="message-body">' + RoomUI.renderMarkdown(msg.content) + '</div>' : '') +
           renderAttachments(msg.attachments);
       } else {
         div.textContent = msg.content;
@@ -697,7 +807,7 @@ router.get('/r/:token', (req, res) => {
           return '<a href="' + url + '" target="_blank" rel="noopener"><img src="' + url + '" alt="' + name + '" loading="lazy"></a>';
         }
         if (a.mime_type.startsWith('audio/')) {
-          return '<div><div class="message-time">' + name + '</div><audio controls preload="none" src="' + url + '"></audio></div>';
+          return '<div><div style="font-size:0.75em;color:#888;margin-bottom:2px">' + name + '</div><audio controls preload="none" src="' + url + '"></audio></div>';
         }
         if (a.mime_type.startsWith('video/')) {
           return '<video controls preload="metadata" src="' + url + '"></video>';
@@ -767,13 +877,17 @@ router.get('/r/:token', (req, res) => {
             'Authorization': 'Bearer ' + memberToken,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify(attachments.length ? { content, attachments } : { content })
+          body: JSON.stringify(Object.assign({ content },
+            attachments.length ? { attachments } : {},
+            replyTo ? { reply_to: replyTo } : {}))
         });
 
         if (res.ok) {
           input.value = '';
+          input.style.height = 'auto';
           pendingFiles = [];
           renderPendingFiles();
+          cancelReply();
         } else {
           alert((await res.json()).error);
         }
@@ -837,7 +951,7 @@ OPTION A: MCP CONNECTOR (RECOMMENDED)
 If your AI supports custom connectors (Claude.ai, ChatGPT Developer Mode):
 
 1. Go to Settings → Connectors → Add Custom Connector
-2. Enter URL: https://hub.rollium.fr/mcp
+2. Enter URL: ${config.publicUrl}/mcp
 3. Open a NEW conversation
 4. Use these tools:
 
