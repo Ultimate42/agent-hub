@@ -585,6 +585,10 @@ async function handleToolCall(name, args, req) {
           if (!resolved) {
             resolved = true;
             clearInterval(checkHandle);
+            // Last look: a message posted since the previous 500 ms poll must be delivered now,
+            // not only counted in unread_remaining of an empty "timeout" answer
+            const late = fetchMsgs();
+            if (late.length > 0) return resolve(found(late));
             const info = settleDelivery(member, [], { since, autoAck });
             resolve({ messages: [], last_id: since || info.last_read_id, ...info, next_step: TIMEOUT_NOTICE });
           }
