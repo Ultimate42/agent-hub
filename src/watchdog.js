@@ -40,30 +40,20 @@ export function initWatchdogDb(dbInstance) {
 
 /**
  * Check if a message is addressed to a member
- * (a) type='question' and reply_to points to member's message
- * (b) content contains "@MemberName" (case-insensitive)
- * (c) reply_to points to member's message
+ * (a) content contains "@MemberName" (case-insensitive)
+ * (b) reply_to points to member's message, unless the message @mentions other members only
+ *     (a reply that names someone else is addressed to them, not to the replied-to author)
  */
-function isMessageAddressedToMember(message, memberId, memberName) {
-  // Case (c): reply_to points to this member's message
+function isMessageAddressedToMember(message, memberId, memberName, memberNames = []) {
+  if (isMentioned(message.content, memberName)) {
+    return true;
+  }
+
   if (message.reply_to) {
     const replyToMsg = stmt_getReplyToAuthor.get(message.reply_to);
     if (replyToMsg?.id === memberId) {
-      return true;
+      return !memberNames.some(n => n !== memberName && isMentioned(message.content, n));
     }
-  }
-
-  // Case (a): type='question' and reply_to points to member's message
-  if (message.type === 'question' && message.reply_to) {
-    const replyToMsg = stmt_getReplyToAuthor.get(message.reply_to);
-    if (replyToMsg?.id === memberId) {
-      return true;
-    }
-  }
-
-  // Case (b): content contains "@MemberName" (case-insensitive)
-  if (isMentioned(message.content, memberName)) {
-    return true;
   }
 
   return false;
@@ -146,7 +136,7 @@ export function startWatchdog() {
             if (member.id === msg.member_id) continue; // Don't check author
             if (config.watchdogIgnore.includes(member.name.trim().toLowerCase())) continue; // HUB_WATCHDOG_IGNORE
 
-            if (!isMessageAddressedToMember(msg, member.id, member.name)) {
+            if (!isMessageAddressedToMember(msg, member.id, member.name, members.map(m => m.name))) {
               continue; // Not addressed to this member
             }
 
