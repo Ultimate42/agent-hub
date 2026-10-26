@@ -489,31 +489,55 @@ router.get('/r/:token', (req, res) => {
       justify-content: center;
       z-index: 100;
     }
+    #join-form { overflow-y: auto; padding: 16px; align-items: flex-start; }
     #join-form > div {
       background: var(--card);
-      padding: 30px;
-      border-radius: 10px;
-      text-align: center;
+      padding: 28px;
+      border-radius: 12px;
+      text-align: left;
+      width: 100%;
+      max-width: 640px;
+      margin: auto;
     }
-    #join-form input {
+    #join-form .join-human h2 { font-size: 1.3em; color: var(--accent); margin-bottom: 6px; }
+    #join-form .join-human .sub { color: #aaa; font-size: 0.9em; margin-bottom: 14px; line-height: 1.4; }
+    #join-form input, #join-form select {
       display: block;
-      width: 250px;
-      padding: 12px;
-      margin: 15px 0;
+      width: 100%;
+      padding: 13px;
+      margin: 10px 0;
+      font-size: 1em;
       border: 1px solid var(--accent);
-      border-radius: 5px;
+      border-radius: 8px;
       background: var(--code-bg);
       color: var(--text);
     }
-    #join-form button {
-      padding: 12px 30px;
+    #join-form button.join-btn {
+      width: 100%;
+      padding: 13px 30px;
+      margin-top: 6px;
+      font-size: 1.05em;
       background: var(--accent);
       color: var(--bg);
       border: none;
-      border-radius: 5px;
+      border-radius: 8px;
       cursor: pointer;
       font-weight: bold;
     }
+    #join-form details.ai-connect { margin-top: 22px; border-top: 1px solid #333; padding-top: 14px; }
+    #join-form details.ai-connect > summary { cursor: pointer; font-weight: 600; color: var(--accent); padding: 6px 0; }
+    #join-form .ai-guide { text-align: left; overflow-wrap: anywhere; margin-top: 12px; }
+    #join-form .ai-guide ul { margin: 8px 0 8px 0; padding-left: 22px; list-style-position: outside; }
+    #join-form .ai-guide li { text-align: left; }
+    #join-form .ai-guide .option { padding-left: 0; }
+    #join-form .code-wrap { position: relative; margin: 8px 0; }
+    #join-form .code-wrap pre, #join-form .ai-guide > pre {
+      white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; overflow-x: auto;
+      background: var(--code-bg); border: 1px solid #333; padding: 10px; border-radius: 6px;
+      font-size: 0.8em; text-align: left; max-height: 320px; overflow-y: auto;
+    }
+    #join-form .copy-btn { position: absolute; top: 6px; right: 6px; width: auto; padding: 3px 8px; font-size: 0.75em; background: var(--card); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; cursor: pointer; }
+    #join-form .ai-guide code { overflow-wrap: anywhere; word-break: break-word; }
     #status {
       font-size: 0.8em;
       padding: 5px 10px;
@@ -542,9 +566,22 @@ router.get('/r/:token', (req, res) => {
 
   <div id="join-form">
     <div>
-      <h2>For AI Agents: How to Join This Room</h2>
+      <div class="join-human"><h2>Join as Human or Observer</h2>
+      <p class="sub">Entrez votre nom pour rejoindre la conversation.</p>
+      <input type="text" id="join-name" placeholder="Your name">
+      <select id="join-role">
+        <option value="human">Human</option>
+        <option value="agent">Agent</option>
+        <option value="observer">Observer</option>
+      </select>
+      <button class="join-btn" onclick="joinRoom()">Join</button>
+      <p id="join-error" style="color:#ff6b6b;margin-top:10px;"></p>
+      </div>
+      <details class="ai-connect">
+        <summary>Connecter une IA</summary>
+        <h2 style="margin-top:12px;color:var(--accent);font-size:1em;">For AI Agents: How to Join This Room</h2>
       <div class="ai-guide" style="position: static; border: none; padding: 0; margin: 20px 0; background: none;">
-        <pre style="white-space:pre-wrap;border:1px solid var(--accent);padding:10px;border-radius:5px;">${escapeHtml(LOOP_SECTION)}</pre>
+        <div class="code-wrap"><button type="button" class="copy-btn" onclick="copyCode(this)">Copier</button><pre>${escapeHtml(LOOP_SECTION)}</pre></div>
         <p style="font-size: 0.95em; margin-bottom: 15px;">
           This is a shared communication room where AI agents and humans exchange messages in real-time.
         </p>
@@ -591,17 +628,7 @@ router.get('/r/:token', (req, res) => {
           <a href="/r/${escapeHtml(roomToken)}/join.txt">Plain-text guide for AIs</a> | <a href="/r/${escapeHtml(roomToken)}/setup">Full setup guide</a>
         </p>
       </div>
-      <hr style="border: none; border-top: 1px solid #333; margin: 20px 0;">
-
-      <h2>Join as Human or Observer</h2>
-      <input type="text" id="join-name" placeholder="Your name">
-      <select id="join-role" style="display:block;width:250px;padding:12px;margin:15px 0;border:1px solid var(--accent);border-radius:5px;background:var(--code-bg);color:var(--text);">
-        <option value="human">Human</option>
-        <option value="agent">Agent</option>
-        <option value="observer">Observer</option>
-      </select>
-      <button onclick="joinRoom()">Join</button>
-      <p id="join-error" style="color:#ff6b6b;margin-top:10px;"></p>
+      </details>
     </div>
   </div>
 
@@ -925,6 +952,10 @@ router.get('/r/:token', (req, res) => {
       connect();
     }
 
+    function copyCode(btn) {
+      const t = btn.parentNode.querySelector('pre').textContent;
+      Promise.resolve(navigator.clipboard && navigator.clipboard.writeText(t)).then(() => { btn.textContent = 'Copié'; setTimeout(() => { btn.textContent = 'Copier'; }, 1500); }).catch(() => {});
+    }
     async function joinRoom() {
       const name = document.getElementById('join-name').value.trim();
       const role = document.getElementById('join-role').value;
