@@ -110,6 +110,20 @@ db.exec(`
     UNIQUE(member_id, message_id)
   );
 
+  -- Files shared in a room (bytes on disk under config.uploadsDir/<room_id>/<token>).
+  -- message_id is NULL until the uploader attaches the file to a message.
+  CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    member_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+    message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    token TEXT UNIQUE NOT NULL,
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   -- Indexes
   CREATE INDEX IF NOT EXISTS idx_rooms_token ON rooms(token);
   CREATE INDEX IF NOT EXISTS idx_members_token ON members(token);
@@ -120,6 +134,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_watchdog_alerts_room ON watchdog_alerts(room_id);
   CREATE INDEX IF NOT EXISTS idx_watchdog_alerts_msg_member ON watchdog_alerts(message_id, to_member_id);
   CREATE INDEX IF NOT EXISTS idx_wake_targets_member ON wake_targets(member_id);
+  CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+  CREATE INDEX IF NOT EXISTS idx_attachments_room ON attachments(room_id);
   CREATE INDEX IF NOT EXISTS idx_wake_notifications_member_msg ON wake_notifications(member_id, message_id);
 `);
 
@@ -324,6 +340,27 @@ const stmts = {
     WHERE member_id = ?
   `),
 
+  // Attachments
+  createAttachment: db.prepare(`
+    INSERT INTO attachments (room_id, member_id, token, filename, mime_type, size)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `),
+  getAttachmentByToken: db.prepare(`
+    SELECT * FROM attachments WHERE token = ?
+  `),
+  getAttachmentById: db.prepare(`
+    SELECT * FROM attachments WHERE id = ?
+  `),
+  linkAttachment: db.prepare(`
+    UPDATE attachments SET message_id = ? WHERE id = ? AND message_id IS NULL
+  `),
+  getMessageAttachments: db.prepare(`
+    SELECT * FROM attachments WHERE message_id = ? ORDER BY id
+  `),
+  roomStorageUsed: db.prepare(`
+    SELECT COALESCE(SUM(size), 0) as n FROM attachments WHERE room_id = ?
+  `),
+
   // Wake notifications
   createWakeNotification: db.prepare(`
     INSERT INTO wake_notifications (member_id, message_id)
@@ -333,6 +370,36 @@ const stmts = {
     SELECT 1 FROM wake_notifications WHERE member_id = ? AND message_id = ? LIMIT 1
   `)
 };
+
+/** Public shape of an attachment (the token-based URL is the download capability). */
+export function attachmentInfo(a) {
+  return {
+    id: a.id,
+    filename: a.filename,
+    mime_type: a.mime_type,
+    size: a.size,
+    url: `${config.publicUrl}/files/${a.token}/${encodeURIComponent(a.filename)}`
+  };
+}
+
+/** Add an `attachments` array to the messages that have files (one query per page). */
+function withAttachments(messages) {
+  const ids = messages.map(m => m.id).filter(Boolean);
+  if (ids.length === 0) return messages;
+  const rows = db.prepare(
+    `SELECT * FROM attachments WHERE message_id IN (${ids.map(() => '?').join(',')}) ORDER BY id`
+  ).all(...ids);
+  if (rows.length === 0) return messages;
+  const byMsg = new Map();
+  for (const r of rows) {
+    if (!byMsg.has(r.message_id)) byMsg.set(r.message_id, []);
+    byMsg.get(r.message_id).push(attachmentInfo(r));
+  }
+  for (const m of messages) {
+    if (byMsg.has(m.id)) m.attachments = byMsg.get(m.id);
+  }
+  return messages;
+}
 
 // Database API
 export const database = {
@@ -420,11 +487,11 @@ export const database = {
   },
 
   getMessages(roomId, limit = 50) {
-    return stmts.getMessages.all(roomId, limit).reverse();
+    return withAttachments(stmts.getMessages.all(roomId, limit).reverse());
   },
 
   getMessagesSince(roomId, sinceId, limit = 100) {
-    return stmts.getMessagesSince.all(roomId, sinceId, limit);
+    return withAttachments(stmts.getMessagesSince.all(roomId, sinceId, limit));
   },
 
   // --- Server-side read cursor (per member; a member belongs to a single room) ---
@@ -433,7 +500,7 @@ export const database = {
   },
 
   getUnread(roomId, memberId, cursor, limit = 100) {
-    return stmts.getUnread.all(roomId, cursor, memberId, limit);
+    return withAttachments(stmts.getUnread.all(roomId, cursor, memberId, limit));
   },
 
   countUnread(roomId, memberId, cursor = this.getReadCursor(memberId)) {
@@ -448,7 +515,7 @@ export const database = {
 
   /** Older history (id < beforeId, newest first reversed to ascending). Does not touch any cursor. */
   getMessagesBefore(roomId, beforeId, limit = 50) {
-    return stmts.getMessagesBefore.all(roomId, beforeId, limit).reverse();
+    return withAttachments(stmts.getMessagesBefore.all(roomId, beforeId, limit).reverse());
   },
 
   messageExistsBefore(roomId, id) {
@@ -559,6 +626,37 @@ export const database = {
 
   updateWakeTargetSuccess(memberId) {
     stmts.updateWakeTargetSuccess.run(memberId);
+  },
+
+  // Attachment operations
+  createAttachment(roomId, memberId, token, filename, mimeType, size) {
+    return Number(stmts.createAttachment.run(roomId, memberId, token, filename, mimeType, size).lastInsertRowid);
+  },
+
+  getAttachmentByToken(token) {
+    return stmts.getAttachmentByToken.get(token);
+  },
+
+  getAttachmentById(id) {
+    return stmts.getAttachmentById.get(id);
+  },
+
+  /** Link pending attachments to a message. Returns false if one was already linked. */
+  linkAttachments(messageId, attachmentIds) {
+    return db.transaction(() => {
+      for (const id of attachmentIds) {
+        if (stmts.linkAttachment.run(messageId, id).changes !== 1) throw new Error('attachment already used');
+      }
+      return true;
+    })();
+  },
+
+  getMessageAttachments(messageId) {
+    return stmts.getMessageAttachments.all(messageId).map(attachmentInfo);
+  },
+
+  getRoomStorageUsed(roomId) {
+    return stmts.roomStorageUsed.get(roomId).n;
   },
 
   wakeNotificationExists(memberId, messageId) {

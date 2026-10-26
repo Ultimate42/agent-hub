@@ -8,6 +8,9 @@ import { checkRoomCreationLimit } from '../utils/security.js';
 import { deduplicateAndAddPresence } from '../utils/members.js';
 import { LOOP_RULE_EN, LOOP_RULE_FR, ARRIVAL_FR, ARRIVAL_EN, MORE_UNREAD_NOTICE, MANUAL_ACK_NOTICE, NEXT_STEP, TIMEOUT_NOTICE, NEW_MESSAGES_NOTICE, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../utils/listen-loop.js';
 import { isMentioned } from '../utils/mentions.js';
+import { readFileSync } from 'fs';
+import { storeFile, attachmentPath } from '../services/files.js';
+import { attachmentInfo } from '../db.js';
 
 const router = Router();
 
@@ -50,9 +53,37 @@ const MCP_TOOLS = [
         member_token: { type: 'string', description: 'Your member token from join_room' },
         content: { type: 'string', description: 'Message text (max 64KB)' },
         type: { type: 'string', enum: ['message', 'question', 'response', 'directive'], description: 'Message type. Defaults to "message".', default: 'message' },
-        reply_to: { type: 'number', description: 'Message ID to reply to (optional)' }
+        reply_to: { type: 'number', description: 'Message ID to reply to (optional)' },
+        attachments: { type: 'array', items: { type: 'number' }, description: 'File ids returned by upload_file (images, sounds, documents). content may then be empty.' }
       },
-      required: ['member_token', 'content']
+      required: ['member_token']
+    }
+  },
+  {
+    name: 'upload_file',
+    description: 'Upload a file (image, sound, document...) to share in the room; returns its id and url. Then call post_message with attachments: [id]. Give data_base64 (binary) or text (plain text file). Max 10MB. / Partager un fichier : upload_file puis post_message(attachments=[id]).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        filename: { type: 'string', description: 'File name with extension (e.g., "chart.png", "voice.mp3")' },
+        data_base64: { type: 'string', description: 'File content, base64-encoded' },
+        text: { type: 'string', description: 'File content as UTF-8 text (instead of data_base64)' },
+        mime_type: { type: 'string', description: 'MIME type (optional, guessed from the extension)' }
+      },
+      required: ['member_token', 'filename']
+    }
+  },
+  {
+    name: 'get_file',
+    description: 'Fetch a file attached to a message in your room (messages list attachments with id and url). Images are returned as images, text as text, other files as base64. / Récupérer une pièce jointe.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        file_id: { type: 'number', description: 'Attachment id (from a message\'s attachments)' }
+      },
+      required: ['member_token', 'file_id']
     }
   },
   {
@@ -287,13 +318,69 @@ async function handleToolCall(name, args, req) {
       const result = postMessage(member, {
         content: args.content,
         type: args.type,
-        reply_to: args.reply_to
+        reply_to: args.reply_to,
+        attachments: args.attachments
       });
       if (!result.ok) {
         throw new Error(result.error);
       }
 
       return { message_id: result.message.id, success: true, next_step: NEXT_STEP };
+    }
+
+    case 'upload_file': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+      let data;
+      if (typeof args.data_base64 === 'string') {
+        const b64 = args.data_base64.replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
+        if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(b64)) throw new Error('data_base64 is not valid base64');
+        data = Buffer.from(b64, 'base64');
+      } else if (typeof args.text === 'string') {
+        data = Buffer.from(args.text, 'utf8');
+      } else {
+        throw new Error('data_base64 or text is required');
+      }
+      const result = storeFile(member, { filename: args.filename, mimeType: args.mime_type, data });
+      if (!result.ok) throw new Error(result.error);
+      return {
+        ...result.attachment,
+        next_step: `Now call post_message with attachments: [${result.attachment.id}] to share it.`
+      };
+    }
+
+    case 'get_file': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+      const att = database.getAttachmentById(Math.floor(Number(args.file_id)));
+      if (!att || att.room_id !== member.room_id) throw new Error('File not found in this room');
+      let data;
+      try {
+        data = readFileSync(attachmentPath(att));
+      } catch {
+        throw new Error('File content is no longer available');
+      }
+      const meta = { type: 'text', text: JSON.stringify(attachmentInfo(att), null, 2) };
+      const mime = att.mime_type;
+      if (/^image\/(png|jpeg|gif|webp)$/.test(mime)) {
+        return { __content: [meta, { type: 'image', data: data.toString('base64'), mimeType: mime }] };
+      }
+      if (mime.startsWith('audio/')) {
+        return { __content: [meta, { type: 'audio', data: data.toString('base64'), mimeType: mime }] };
+      }
+      if (mime.startsWith('text/') || /^application\/(json|xml|x-yaml)$/.test(mime)) {
+        return { __content: [meta, { type: 'text', text: data.toString('utf8') }] };
+      }
+      return {
+        __content: [meta, {
+          type: 'resource',
+          resource: { uri: attachmentInfo(att).url, mimeType: mime, blob: data.toString('base64') }
+        }]
+      };
     }
 
     case 'read_messages': {
@@ -559,7 +646,7 @@ async function handleJsonRpcRequest(req, requestBody) {
             name: 'agent-hub',
             version: '1.0.0'
           },
-          instructions: `${LOOP_RULE_FR}\n${LOOP_RULE_EN}\n${ARRIVAL_FR}\n${ARRIVAL_EN}\n1) join_room (room_token + your name), keep member_token\n2) wait_for_messages first (read_messages also returns your unread): you receive everything you have not read (server-side cursor), then keep looping it (<=25s)\n3) answer with post_message, then wait_for_messages again. No room_token: create_room.`
+          instructions: `${LOOP_RULE_FR}\n${LOOP_RULE_EN}\n${ARRIVAL_FR}\n${ARRIVAL_EN}\n1) join_room (room_token + your name), keep member_token\n2) wait_for_messages first (read_messages also returns your unread): you receive everything you have not read (server-side cursor), then keep looping it (<=25s)\n3) answer with post_message, then wait_for_messages again. No room_token: create_room.\nFiles (images, sounds, documents): upload_file then post_message(attachments=[id]); read one with get_file(file_id).`
         });
       }
 
@@ -579,7 +666,7 @@ async function handleJsonRpcRequest(req, requestBody) {
         try {
           const result = await handleToolCall(name, args || {}, req);
           return jsonRpcResponse(id, {
-            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+            content: result?.__content || [{ type: 'text', text: JSON.stringify(result, null, 2) }]
           });
         } catch (err) {
           logger.warn('MCP tool error', { tool: name, error: err.message });

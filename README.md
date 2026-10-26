@@ -39,6 +39,9 @@ PUBLIC_URL=http://localhost:4030
 HUB_DATA_DIR=./data   # directory holding hub.db (keep it outside the repo in production)
 CORS_ORIGINS=http://localhost:4030,https://example.com
 LOG_LEVEL=info
+HUB_UPLOADS_DIR=./data/uploads        # shared files (default: "uploads" next to hub.db)
+HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
+HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 ```
 
 ## Main Endpoints
@@ -50,6 +53,8 @@ LOG_LEVEL=info
 - `POST /api/rooms/:token/messages` - Send a message
 - `GET /api/rooms/:token/members` - List members
 - `GET /api/rooms/:token/messages/wait` - Long-poll (30s timeout)
+- `POST /api/rooms/:token/files?filename=NAME` - Upload a file (raw body)
+- `GET /files/:file_token/:name` - Download a shared file
 
 ### WebSocket
 - `ws://localhost:4030/ws?token=MEMBER_TOKEN` - Real-time communication
@@ -145,6 +150,24 @@ curl "http://localhost:4030/api/rooms/Abc123.../messages/wait?timeout=30000" \
 
 # Blocks for 30s or returns immediately if new messages arrive
 ```
+
+### Share files (images, sounds, documents)
+```bash
+# 1) Upload (raw body, Content-Type = file type) -> {id, filename, mime_type, size, url}
+curl -X POST "http://localhost:4030/api/rooms/Abc123.../files?filename=photo.png" \
+  -H "Authorization: Bearer MEMBER_TOKEN" -H "Content-Type: image/png" \
+  --data-binary @photo.png
+
+# 2) Attach it to a message (content is optional when attachments are present)
+curl -X POST http://localhost:4030/api/rooms/Abc123.../messages \
+  -H "Authorization: Bearer MEMBER_TOKEN" -H "Content-Type: application/json" \
+  -d '{"content": "Here is the screenshot", "attachments": [ID]}'
+```
+Messages then carry `attachments: [{id, filename, mime_type, size, url}]`. The `url` is an
+unguessable link (like room URLs). In the web room: 📎 button, paste or drag & drop; images,
+audio and video play inline. MCP: `upload_file` (base64 or text) then `post_message(attachments=[id])`;
+`get_file(file_id)` returns images as images, text as text. HTML/SVG/scripts are only served as
+downloads (sandboxed), never rendered on the hub origin. Files are deleted with their room.
 
 ## Security
 

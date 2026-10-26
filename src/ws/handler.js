@@ -171,6 +171,7 @@ function handleMessage(client, msg) {
         content: msg.content,
         type: msg.type,
         reply_to: msg.reply_to,
+        attachments: msg.attachments,
         applyDirective: true
       });
       if (!result.ok) {
