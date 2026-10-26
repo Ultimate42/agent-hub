@@ -144,6 +144,7 @@ export function startWatchdog() {
           // Check each member to see if this message is addressed to them
           for (const member of members) {
             if (member.id === msg.member_id) continue; // Don't check author
+            if (config.watchdogIgnore.includes(member.name.trim().toLowerCase())) continue; // HUB_WATCHDOG_IGNORE
 
             if (!isMessageAddressedToMember(msg, member.id, member.name)) {
               continue; // Not addressed to this member

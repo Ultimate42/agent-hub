@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import http from 'node:http';
 
 const PORT = '4147';
 const BASE_URL = `http://localhost:${PORT}`;
@@ -116,6 +117,29 @@ describe('Shared files (attachments)', () => {
       method: 'POST', token: aliceToken, body: { content: 'y', attachments: [up.data.id] }
     });
     assert.strictEqual(again.status, 400);
+  });
+
+  test('downloads support Range requests (Safari audio/video) and ETag', async () => {
+    const data = Buffer.from('0123456789abcdefghij');
+    const up = await upload('clip.mp3', data, 'audio/mpeg');
+    const full = await fetch(up.data.url);
+    assert.strictEqual(full.headers.get('accept-ranges'), 'bytes');
+    assert.strictEqual(full.headers.get('content-type'), 'audio/mpeg');
+    assert.strictEqual(full.headers.get('cache-control'), 'private, max-age=86400');
+    assert.ok(full.headers.get('etag'));
+
+    const part = await fetch(up.data.url, { headers: { Range: 'bytes=5-9' } });
+    assert.strictEqual(part.status, 206);
+    assert.strictEqual(part.headers.get('content-range'), `bytes 5-9/${data.length}`);
+    assert.strictEqual(part.headers.get('content-length'), '5');
+    assert.strictEqual(Buffer.from(await part.arrayBuffer()).toString(), '56789');
+
+    // fetch() adds Cache-Control: no-cache to conditional requests, so use a raw request
+    const status = await new Promise((resolve, reject) => {
+      http.get(up.data.url, { headers: { 'If-None-Match': full.headers.get('etag') } }, r => { r.resume(); resolve(r.statusCode); })
+        .on('error', reject);
+    });
+    assert.strictEqual(status, 304);
   });
 
   test('HTML/SVG are served as downloads, never inline', async () => {
