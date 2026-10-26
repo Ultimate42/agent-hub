@@ -142,6 +142,18 @@ describe('Shared files (attachments)', () => {
     assert.strictEqual(status, 304);
   });
 
+  test('room gallery lists attached files, newest first, filtered by type', async () => {
+    const res = await fetch(`${BASE_URL}/api/rooms/${roomToken}/files?type=image`, { headers: { Authorization: `Bearer ${bobToken}` } });
+    const data = await res.json();
+    assert.strictEqual(res.status, 200);
+    assert.ok(data.files.length >= 1);
+    assert.ok(data.files.every(f => f.mime_type.startsWith('image/')));
+    assert.ok(data.files.every(f => f.author && f.message_id && f.url));
+    const ids = data.files.map(f => f.id);
+    assert.deepStrictEqual(ids, [...ids].sort((a, b) => b - a));
+    assert.strictEqual((await fetch(`${BASE_URL}/api/rooms/${roomToken}/files`)).status, 401);
+  });
+
   test('HTML/SVG are served as downloads, never inline', async () => {
     const up = await upload('evil.svg', Buffer.from('<svg onload="alert(1)"/>'), 'image/svg+xml');
     const dl = await fetch(up.data.url);
