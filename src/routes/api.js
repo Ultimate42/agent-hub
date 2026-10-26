@@ -4,13 +4,12 @@ import { generateToken, compareTokens, maskToken } from '../utils/tokens.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
-import { deduplicateAndAddPresence } from '../utils/members.js';
+import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import {
   postMessage, notifyWaiters, waitingClients, sanitizeName, MEMBER_ROLES,
   parseBool, peekUnread, settleDelivery, ackMessages
 } from '../services/messages.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
-import { isMentioned } from '../utils/mentions.js';
 import { deleteRoomFiles } from '../services/files.js';
 
 const router = Router();
@@ -220,55 +219,6 @@ router.post('/rooms/:token/join', (req, res) => {
 });
 
 /**
- * Calculate pending unreplied count for a member
- */
-function getPendingUnrepliedCount(roomId, memberId) {
-  // Get all messages without limit
-  const allMessages = database.getAllMessages(roomId);
-
-  const members = database.getMembersByRoom(roomId);
-  const member = members.find(m => m.id === memberId);
-  if (!member) return 0;
-
-  let count = 0;
-  for (const msg of allMessages) {
-    if (msg.author === 'HubWatchdog' || msg.author === 'system') continue;
-
-    // Check if message is addressed to this member
-    let addressed = false;
-
-    // Case: reply_to points to member's message
-    if (msg.reply_to) {
-      const replyToMsg = allMessages.find(m => m.id === msg.reply_to);
-      if (replyToMsg?.member_id === memberId) {
-        addressed = true;
-      }
-    }
-
-    // Case: contains @MemberName
-    if (!addressed) {
-      if (isMentioned(msg.content, member.name)) {
-        addressed = true;
-      }
-    }
-
-    if (!addressed) continue;
-
-    // Check if member has replied
-    const hasReply = allMessages.some(m =>
-      m.author === member.name &&
-      m.id > msg.id
-    );
-
-    if (!hasReply) {
-      count++;
-    }
-  }
-
-  return count;
-}
-
-/**
  * GET /api/rooms/:token/members - List members
  */
 router.get('/rooms/:token/members', (req, res) => {
@@ -282,6 +232,10 @@ router.get('/rooms/:token/members', (req, res) => {
 
   const allMembers = database.getMembersByRoom(room.id);
   const dedupedMembers = deduplicateAndAddPresence(allMembers);
+  const pending = countPendingUnreplied(
+    database.getAllMessages(room.id),
+    dedupedMembers.map(m => ({ id: m._id, name: m.name }))
+  );
 
   res.json({
     members: dedupedMembers.map(m => {
@@ -292,7 +246,7 @@ router.get('/rooms/:token/members', (req, res) => {
         presence: m.presence,
         is_you: m.name === member.name,
         unread_count: database.countUnread(room.id, m._id),
-        pending_unreplied: getPendingUnrepliedCount(room.id, m.id)
+        pending_unreplied: pending.get(m._id) || 0
       };
       return obj;
     })

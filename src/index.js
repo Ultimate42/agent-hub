@@ -12,6 +12,7 @@ import designRoutes from './routes/design.js';
 import coordinationRoutes from './routes/coordination.js';
 import wakeTargetsRoutes from './routes/wake-targets.js';
 import filesRoutes from './routes/files.js';
+import { startFileSweeper, stopFileSweeper } from './services/files.js';
 import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
 import { database } from './db.js';
 import { releaseAllWaiters } from './services/messages.js';
@@ -94,6 +95,7 @@ const wss = setupWebSocket(server);
 // Initialize watchdog on the shared DB connection
 initWatchdogDb(database.db);
 startWatchdog();
+startFileSweeper();
 
 // Start server
 server.listen(config.port, config.host, () => {
@@ -122,6 +124,7 @@ function shutdown() {
 
   // Stop watchdog
   stopWatchdog();
+  stopFileSweeper();
 
   // Release long-polls and close WebSocket clients
   releaseAllWaiters();
