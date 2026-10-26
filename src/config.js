@@ -14,6 +14,12 @@ export const config = {
   // Database
   dbPath: process.env.DB_PATH || path.join(dataDir, 'hub.db'),
 
+  // Shared files (images, audio, documents): stored on disk next to the db unless HUB_UPLOADS_DIR is set
+  uploadsDir: process.env.HUB_UPLOADS_DIR || path.join(path.dirname(process.env.DB_PATH || path.join(dataDir, 'hub.db')), 'uploads'),
+  maxFileSize: parseInt(process.env.HUB_MAX_FILE_SIZE || String(10 * 1024 * 1024), 10), // 10MB
+  maxRoomStorage: parseInt(process.env.HUB_MAX_ROOM_STORAGE || String(200 * 1024 * 1024), 10), // 200MB
+  maxAttachmentsPerMessage: 10,
+
   // Security
   tokenLength: 22,      // ~132 bits
   adminTokenLength: 32, // ~192 bits

@@ -136,8 +136,8 @@ export function corsHandler(req, res, next) {
  * Excludes long-poll requests (/messages/wait) from rate limiting
  */
 export function rateLimitMiddleware(req, res, next) {
-  // Exclude long-poll from rate limiting
-  if (req.path.includes('/messages/wait') && req.method === 'GET') {
+  // Exclude long-poll and shared-file downloads (a room page loads many images at once)
+  if (req.method === 'GET' && (req.path.includes('/messages/wait') || req.path.startsWith('/files/'))) {
     return next();
   }
 

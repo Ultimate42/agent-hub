@@ -326,6 +326,15 @@ router.get('/r/:token', (req, res) => {
       max-width: 80%;
     }
     .message.own { background: var(--msg-own); margin-left: auto; }
+    .attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .attachments img, .attachments video { max-width: 320px; max-height: 240px; border-radius: 6px; display: block; }
+    .attachments audio { width: 280px; max-width: 100%; }
+    .attachments a.file { display: inline-block; padding: 6px 10px; border: 1px solid var(--accent); border-radius: 6px; color: var(--text); text-decoration: none; }
+    #pending-files { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 15px; }
+    #pending-files .chip { background: var(--code-bg); border: 1px solid var(--accent); border-radius: 12px; padding: 2px 10px; font-size: 12px; }
+    #pending-files .chip button { background: none; border: none; color: var(--text); cursor: pointer; padding: 0 0 0 6px; }
+    .attach-btn { padding: 0 12px; }
+    .messages-container.dragover { outline: 2px dashed var(--accent); outline-offset: -6px; }
     .message.other { background: var(--msg-other); }
     .message.system {
       background: transparent;
@@ -507,7 +516,10 @@ router.get('/r/:token', (req, res) => {
     <div class="messages-container">
       <div id="directive"></div>
       <div id="messages"></div>
+      <div id="pending-files"></div>
       <div class="input-area">
+        <input type="file" id="file-input" multiple style="display:none" onchange="addPendingFiles(this.files); this.value=''">
+        <button type="button" class="attach-btn" title="Attach files (or paste / drop them)" onclick="document.getElementById('file-input').click()">&#128206;</button>
         <input type="text" id="message-input" placeholder="Type a message..." onkeypress="if(event.key==='Enter')sendMessage()">
         <button onclick="sendMessage()">Send</button>
       </div>
@@ -662,7 +674,8 @@ router.get('/r/:token', (req, res) => {
           '<strong>' + escapeHtml(msg.author || 'Unknown') + '</strong>' +
           '<span class="message-time">' + time + '</span>' +
           '</div>' +
-          '<div>' + escapeHtml(msg.content) + '</div>';
+          (msg.content ? '<div>' + escapeHtml(msg.content) + '</div>' : '') +
+          renderAttachments(msg.attachments);
       } else {
         div.textContent = msg.content;
       }
@@ -671,26 +684,102 @@ router.get('/r/:token', (req, res) => {
       container.scrollTop = container.scrollHeight;
     }
 
+    function formatSize(n) {
+      return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(0) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+    }
+
+    function renderAttachments(list) {
+      if (!list || !list.length) return '';
+      return '<div class="attachments">' + list.map(a => {
+        const url = escapeHtml(a.url);
+        const name = escapeHtml(a.filename);
+        if (['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp'].includes(a.mime_type)) {
+          return '<a href="' + url + '" target="_blank" rel="noopener"><img src="' + url + '" alt="' + name + '" loading="lazy"></a>';
+        }
+        if (a.mime_type.startsWith('audio/')) {
+          return '<div><div class="message-time">' + name + '</div><audio controls preload="none" src="' + url + '"></audio></div>';
+        }
+        if (a.mime_type.startsWith('video/')) {
+          return '<video controls preload="metadata" src="' + url + '"></video>';
+        }
+        return '<a class="file" href="' + url + '" target="_blank" rel="noopener">&#128196; ' + name + ' (' + formatSize(a.size) + ')</a>';
+      }).join('') + '</div>';
+    }
+
+    // Files waiting to be sent with the next message
+    let pendingFiles = [];
+    function addPendingFiles(fileList) {
+      pendingFiles.push(...Array.from(fileList));
+      renderPendingFiles();
+    }
+    function removePendingFile(i) {
+      pendingFiles.splice(i, 1);
+      renderPendingFiles();
+    }
+    function renderPendingFiles() {
+      document.getElementById('pending-files').innerHTML = pendingFiles.map((f, i) =>
+        '<span class="chip">' + escapeHtml(f.name || 'file') + ' (' + formatSize(f.size) + ')' +
+        '<button title="Remove" onclick="removePendingFile(' + i + ')">&times;</button></span>'
+      ).join('');
+    }
+
+    // Paste (screenshots) and drag & drop
+    document.addEventListener('paste', (e) => {
+      const files = Array.from(e.clipboardData?.files || []);
+      if (files.length) { e.preventDefault(); addPendingFiles(files); }
+    });
+    const dropZone = document.querySelector('.messages-container');
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      if (e.dataTransfer?.files?.length) addPendingFiles(e.dataTransfer.files);
+    });
+
+    async function uploadFile(file) {
+      const name = file.name || ('pasted-' + Date.now() + '.' + ((file.type || '').split('/')[1] || 'bin'));
+      const res = await fetch(apiBase + '/files?filename=' + encodeURIComponent(name), {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + memberToken,
+          'Content-Type': file.type || 'application/octet-stream'
+        },
+        body: file
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(name + ': ' + data.error);
+      return data.id;
+    }
+
     async function sendMessage() {
       const input = document.getElementById('message-input');
       const content = input.value.trim();
-      if (!content) return;
+      if (!content && pendingFiles.length === 0) return;
 
       try {
+        const attachments = [];
+        for (const f of pendingFiles) attachments.push(await uploadFile(f));
+
         const res = await fetch(apiBase + '/messages', {
           method: 'POST',
           headers: {
             'Authorization': 'Bearer ' + memberToken,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ content })
+          body: JSON.stringify(attachments.length ? { content, attachments } : { content })
         });
 
         if (res.ok) {
           input.value = '';
+          pendingFiles = [];
+          renderPendingFiles();
+        } else {
+          alert((await res.json()).error);
         }
       } catch (err) {
         console.error('Failed to send:', err);
+        alert(err.message);
       }
     }
 

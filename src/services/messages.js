@@ -2,6 +2,7 @@ import { database } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { processWakeTargets } from '../wake-targets.js';
+import { validateAttachmentIds } from './files.js';
 
 export const MESSAGE_TYPES = ['message', 'question', 'response', 'directive'];
 export const MEMBER_ROLES = ['agent', 'human', 'observer', 'manager', 'second'];
@@ -134,7 +135,7 @@ export function sanitizeName(name) {
  * Validate, store and publish a message.
  * @returns {{ok: true, message: object} | {ok: false, status: number, error: string}}
  */
-export function postMessage(member, { content, type = 'message', reply_to, applyDirective = false } = {}) {
+export function postMessage(member, { content, type = 'message', reply_to, attachments, applyDirective = false } = {}) {
   const fail = (status, error) => ({ ok: false, status, error });
 
   if (!member.permissions.includes('w')) return fail(403, 'Write permission required');
@@ -150,7 +151,12 @@ export function postMessage(member, { content, type = 'message', reply_to, apply
     }
   }
 
-  if (typeof content !== 'string' || !content) return fail(400, 'Content is required');
+  const files = validateAttachmentIds(member, attachments);
+  if (!files.ok) return fail(files.status, files.error);
+
+  // A message carrying files may have no text
+  if (files.ids.length > 0 && (content === undefined || content === null)) content = '';
+  if (typeof content !== 'string' || (!content && files.ids.length === 0)) return fail(400, 'Content is required');
   if (content.length > config.maxMessageSize) return fail(413, 'Message too large');
   if (typeof type !== 'string' || !MESSAGE_TYPES.includes(type)) {
     return fail(400, `Invalid type. Must be one of: ${MESSAGE_TYPES.join(', ')}`);
@@ -168,7 +174,20 @@ export function postMessage(member, { content, type = 'message', reply_to, apply
     database.updateRoomDirective(room.id, content, member.name);
   }
 
-  const messageId = Number(database.createMessage(room.id, member.id, type, content, replyTo));
+  let messageId;
+  try {
+    messageId = database.db.transaction(() => {
+      const id = Number(database.createMessage(room.id, member.id, type, content, replyTo));
+      if (files.ids.length > 0) database.linkAttachments(id, files.ids);
+      return id;
+    })();
+  } catch (err) {
+    if (err.message === 'attachment already used') return fail(400, 'attachment is already attached to a message');
+    throw err;
+  }
+  const attachmentList = files.ids.length > 0
+    ? database.getMessageAttachments(messageId)
+    : undefined;
 
   const message = {
     id: messageId,
@@ -177,6 +196,7 @@ export function postMessage(member, { content, type = 'message', reply_to, apply
     author: member.name,
     author_role: member.role,
     reply_to: replyTo ?? undefined,
+    attachments: attachmentList,
     created_at: new Date().toISOString()
   };
 
