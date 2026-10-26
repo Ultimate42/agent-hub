@@ -347,6 +347,9 @@ const stmts = {
     INSERT INTO watchdog_alerts (room_id, message_id, to_member_id)
     VALUES (?, ?, ?)
   `),
+  lastWatchdogAlertFor: db.prepare(`
+    SELECT MAX(alert_posted_at) as t FROM watchdog_alerts WHERE to_member_id = ?
+  `),
   watchdogAlertExists: db.prepare(`
     SELECT 1 FROM watchdog_alerts WHERE message_id = ? AND to_member_id = ? LIMIT 1
   `),
@@ -730,6 +733,11 @@ export const database = {
       }
       throw err;
     }
+  },
+
+  /** When the watchdog last alerted about this member (DB timestamp string or null). */
+  lastWatchdogAlertFor(toMemberId) {
+    return stmts.lastWatchdogAlertFor.get(toMemberId)?.t || null;
   },
 
   watchdogAlertExists(messageId, toMemberId) {
