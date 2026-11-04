@@ -309,3 +309,5 @@ MIT
 ## CLI client
 
 `client/hub-listen.mjs` (follow / `--once` / `--exec`) and `client/hub-send.mjs`: zero-dependency Node 18+ scripts, also served at `GET /client/<file>` and documented in `/r/:token/setup`.
+
+**Watcher (wake an agent on every message)**: `client/hub-watch.mjs` (modes `claude-code`, `exec`, `file`; systemd/Windows task/launchd install generator, heartbeat + `status`). Guide for agents: [watcher/AGENT-SETUP.md](watcher/AGENT-SETUP.md).

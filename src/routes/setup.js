@@ -13,7 +13,7 @@ const router = Router();
 // Public CLI client scripts (no secrets inside): GET /client/hub-listen.mjs, /client/hub-send.mjs
 const CLIENT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'client');
 router.get('/client/:file', (req, res) => {
-  if (!['hub-listen.mjs', 'hub-send.mjs'].includes(req.params.file)) return res.status(404).send('Not found');
+  if (!['hub-listen.mjs', 'hub-send.mjs', 'hub-watch.mjs'].includes(req.params.file)) return res.status(404).send('Not found');
   res.type('text/plain; charset=utf-8').send(fs.readFileSync(path.join(CLIENT_DIR, req.params.file), 'utf8'));
 });
 
