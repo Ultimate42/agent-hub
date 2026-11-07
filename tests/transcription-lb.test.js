@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import { parseWorkerTokens } from '../src/config.js';
+import { parseWorkerTokens, parseWorkerMembers } from '../src/config.js';
 
 const PORT = '4149';
 const BASE_URL = `http://localhost:${PORT}`;
@@ -40,7 +40,8 @@ describe('Transcription load balancing (worker identity, min_age, failures, shad
       cwd: process.cwd(),
       env: {
         ...process.env, PORT, PUBLIC_URL: BASE_URL, DB_PATH: path.join(TMP_DIR, 'hub.db'),
-        HUB_TRANSCRIBE_TOKEN: LEGACY, HUB_TRANSCRIBE_WORKER_TOKENS: `dev-box:${PC}, junk, x:short`
+        HUB_TRANSCRIBE_TOKEN: LEGACY, HUB_TRANSCRIBE_WORKER_TOKENS: `dev-box:${PC}, junk, x:short`,
+        HUB_TRANSCRIBE_WORKER_MEMBERS: 'Claude-Helper:dev-box, Bad Entry'
       },
       stdio: 'ignore'
     });
@@ -61,6 +62,21 @@ describe('Transcription load balancing (worker identity, min_age, failures, shad
     assert.deepStrictEqual(parseWorkerTokens('a:0123456789abcdef, bad, b:short, c d:0123456789abcdef'),
       [{ name: 'a', token: '0123456789abcdef' }]);
     assert.deepStrictEqual(parseWorkerTokens(undefined), []);
+  });
+
+  test('parseWorkerMembers keeps Member:worker pairs only', () => {
+    assert.deepStrictEqual(parseWorkerMembers('Claude-Helper:dev-box, nocolon, :x, A B:w2'),
+      [{ member: 'Claude-Helper', name: 'dev-box' }, { member: 'A B', name: 'w2' }]);
+  });
+
+  test('member token of a listed member acts as its worker; other members refused', async () => {
+    const del = (await json(`/api/rooms/${roomToken}/join`, { method: 'POST', body: { name: 'Claude-Helper', role: 'agent' } })).data.member_token;
+    assert.strictEqual((await json('/api/transcriptions/next?worker=spoof', { token: del })).status, 204);
+    assert.strictEqual((await json('/api/transcriptions/next', { token: aliceToken })).status, 403);
+    const { data } = await json('/api/transcriptions/workers', { token: del });
+    const names = data.workers.map(w => w.name);
+    assert.ok(names.includes('dev-box'));
+    assert.ok(!names.includes('spoof'));
   });
 
   test('per-worker token works, legacy token stays valid, others refused', async () => {

@@ -12,6 +12,14 @@ export function parseWorkerTokens(raw) {
   }).filter(w => /^[\w.-]{1,32}$/.test(w.name) && w.token.length >= 16);
 }
 
+/** "Member Name:worker,Other:worker2" -> [{member, name}] (worker name is after the last colon; invalid entries ignored). */
+export function parseWorkerMembers(raw) {
+  return String(raw || '').split(',').map(e => e.trim()).filter(e => e.includes(':')).map(e => {
+    const i = e.lastIndexOf(':');
+    return { member: e.slice(0, i).trim(), name: e.slice(i + 1).trim() };
+  }).filter(w => w.member && /^[\w.-]{1,32}$/.test(w.name));
+}
+
 export const config = {
   port: parseInt(process.env.PORT || '4030', 10),
   host: process.env.HOST || '0.0.0.0',
@@ -32,6 +40,8 @@ export const config = {
   transcribeToken: process.env.HUB_TRANSCRIBE_TOKEN || null,
   // One token per worker machine ("dev-box:token,vps:token"), revocable one by one; the legacy token above stays valid
   transcribeWorkerTokens: parseWorkerTokens(process.env.HUB_TRANSCRIBE_WORKER_TOKENS),
+  // Room members allowed to act as a worker with their own member token: "Member:worker,..."
+  transcribeWorkerMembers: parseWorkerMembers(process.env.HUB_TRANSCRIBE_WORKER_MEMBERS),
   transcribeLeaseMs: 5 * 60 * 1000,
   transcribeMaxAttempts: 3,
   // Rooms are deleted after this many days without messages (0 = never); agents can change it

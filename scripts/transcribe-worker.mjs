@@ -5,7 +5,8 @@
 //
 // Required:
 //   HUB_URL                 e.g. https://hub.example.com
-//   HUB_TRANSCRIBE_TOKEN    same secret as the hub's HUB_TRANSCRIBE_TOKEN
+//   HUB_TRANSCRIBE_TOKEN    the hub's HUB_TRANSCRIBE_TOKEN, a per-worker token, or the room member token of a member
+//                           listed in the hub's HUB_TRANSCRIBE_WORKER_MEMBERS (no new secret)
 // Then ONE of:
 //   TRANSCRIBE_HTTP_URL     multipart POST of the audio file to your service, e.g.
 //                           http://127.0.0.1:9000/v1/audio/transcriptions (OpenAI-compatible)

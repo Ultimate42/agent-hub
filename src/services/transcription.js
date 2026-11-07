@@ -15,7 +15,7 @@ import { publishMessage } from './messages.js';
 export const TRANSCRIBER_NAME = 'Transcription';
 
 export function transcriptionEnabled() {
-  return Boolean(config.transcribeToken) || config.transcribeWorkerTokens.length > 0;
+  return Boolean(config.transcribeToken) || config.transcribeWorkerTokens.length > 0 || config.transcribeWorkerMembers.length > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,12 @@ export function identifyWorker(token, announced) {
   }
   if (config.transcribeToken && compareTokens(token, config.transcribeToken)) {
     return { name: WORKER_NAME.test(announced || '') ? announced : 'default' };
+  }
+  // A room member token whose member name is listed in HUB_TRANSCRIBE_WORKER_MEMBERS: worker name imposed
+  if (config.transcribeWorkerMembers.length > 0) {
+    const member = database.getMemberByToken(token);
+    const entry = member && config.transcribeWorkerMembers.find(w => w.member === member.name);
+    if (entry) return { name: entry.name };
   }
   return null;
 }

@@ -45,6 +45,7 @@ HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
 HUB_RETENTION_DEFAULT_DAYS=7           # rooms without messages for N days are deleted (0 = never); per room: set_retention
 HUB_WATCHDOG_IGNORE=Alice             # members never alerted about (comma-separated, case-insensitive)
+HUB_TRANSCRIBE_WORKER_MEMBERS="Claude-Helper:dev-box"  # members whose own member token may act as that worker
 HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an external worker (see below)
 ```
 
