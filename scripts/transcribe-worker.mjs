@@ -21,6 +21,9 @@
 //   TRANSCRIBE_CMD          shell command; the audio file path is "$1" (or {file}); stdout = text,
 //                           e.g. TRANSCRIBE_CMD='my-whisper-client "$1"'
 // Optional:
+//   HUB_WORKER_NAME         name shown by GET /api/transcriptions/workers (a per-worker token fixes it anyway)
+//   TRANSCRIBE_SHADOW=1     shadow mode: re-transcribe notes already done by another worker and send the
+//                           text for comparison only (nothing is claimed or posted, the real text is kept)
 //   TRANSCRIBE_TIMEOUT_MS   per-file timeout (default 300000)
 
 import { spawn } from 'node:child_process';
@@ -32,6 +35,8 @@ const HUB_URL = (process.env.HUB_URL || '').replace(/\/+$/, '');
 const TOKEN = process.env.HUB_TRANSCRIBE_TOKEN;
 const HTTP_URL = process.env.TRANSCRIBE_HTTP_URL;
 const CMD = process.env.TRANSCRIBE_CMD;
+const WORKER = process.env.HUB_WORKER_NAME || '';
+const SHADOW = process.env.TRANSCRIBE_SHADOW === '1';
 const TIMEOUT_MS = parseInt(process.env.TRANSCRIBE_TIMEOUT_MS || '300000', 10);
 
 function log(msg, extra = {}) {
@@ -122,7 +127,10 @@ export function transcribeCmd(data, job, cmd = CMD) {
 async function hub(p, options = {}) {
   return fetch(HUB_URL + p, {
     ...options,
-    headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json', ...options.headers }
+    headers: {
+      Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json',
+      ...(WORKER ? { 'X-Worker': WORKER } : {}), ...options.headers
+    }
   });
 }
 
@@ -140,7 +148,7 @@ async function handle(job) {
     result = { error: err.message };
     log('job failed', { id: job.id, error: err.message });
   }
-  const res = await hub(`/api/transcriptions/${job.id}`, { method: 'POST', body: JSON.stringify(result) });
+  const res = await hub(`/api/transcriptions/${job.id}${SHADOW ? '?shadow=1' : ''}`, { method: 'POST', body: JSON.stringify(result) });
   if (!res.ok) log('hub refused result', { id: job.id, status: res.status, body: await res.text() });
 }
 
@@ -149,14 +157,14 @@ async function main() {
     console.error('Set HUB_URL, HUB_TRANSCRIBE_TOKEN and TRANSCRIBE_HTTP_URL or TRANSCRIBE_CMD (see header).');
     process.exit(1);
   }
-  log('worker started', { hub: HUB_URL, mode: HTTP_URL ? 'http' : 'cmd' });
+  log('worker started', { hub: HUB_URL, mode: HTTP_URL ? 'http' : 'cmd', worker: WORKER || undefined, shadow: SHADOW });
   let stopping = false;
   process.on('SIGTERM', () => { stopping = true; });
   process.on('SIGINT', () => { stopping = true; });
 
   while (!stopping) {
     try {
-      const res = await hub('/api/transcriptions/next?wait=25');
+      const res = await hub(`/api/transcriptions/next?wait=25${SHADOW ? '&shadow=1' : ''}`);
       if (res.status === 200) {
         await handle(await res.json());
       } else if (res.status !== 204) {

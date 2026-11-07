@@ -194,6 +194,23 @@ if (!attachmentCols.includes('transcript_status')) {
     ALTER TABLE attachments ADD COLUMN transcript_attempts INTEGER DEFAULT 0;
   `);
 }
+// Migration: load balancing of workers (queue time, who claimed, last error) + shadow results
+if (!attachmentCols.includes('transcript_queued_at')) {
+  db.exec(`
+    ALTER TABLE attachments ADD COLUMN transcript_queued_at INTEGER;
+    ALTER TABLE attachments ADD COLUMN transcript_worker TEXT;
+    ALTER TABLE attachments ADD COLUMN transcript_error TEXT;
+  `);
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS transcript_shadows (
+    attachment_id INTEGER NOT NULL,
+    worker TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (attachment_id, worker)
+  )
+`);
 
 logger.info('Database initialized', { path: config.dbPath });
 
@@ -466,21 +483,42 @@ const stmts = {
     SELECT * FROM attachments WHERE message_id = ? ORDER BY id
   `),
   queueTranscription: db.prepare(`
-    UPDATE attachments SET transcript_status = 'pending'
+    UPDATE attachments SET transcript_status = 'pending', transcript_queued_at = ?
     WHERE id = ? AND mime_type LIKE 'audio/%' AND transcript_status IS NULL
   `),
   nextTranscription: db.prepare(`
     SELECT * FROM attachments
-    WHERE transcript_status = 'pending' OR (transcript_status = 'claimed' AND transcript_claimed_at < ?)
+    WHERE (transcript_status = 'pending' OR (transcript_status = 'claimed' AND transcript_claimed_at < ?))
+      AND COALESCE(transcript_queued_at, 0) <= ?
     ORDER BY id LIMIT 1
   `),
   claimTranscription: db.prepare(`
-    UPDATE attachments SET transcript_status = 'claimed', transcript_claimed_at = ?,
+    UPDATE attachments SET transcript_status = 'claimed', transcript_claimed_at = ?, transcript_worker = ?,
       transcript_attempts = COALESCE(transcript_attempts, 0) + 1
     WHERE id = ?
   `),
   setTranscriptionStatus: db.prepare(`
     UPDATE attachments SET transcript_status = ?, transcript = ? WHERE id = ?
+  `),
+  setTranscriptionError: db.prepare(`UPDATE attachments SET transcript_error = ? WHERE id = ?`),
+  recentFailedTranscriptions: db.prepare(`
+    SELECT id, filename, transcript_attempts AS attempts, transcript_worker AS worker, transcript_error AS error
+    FROM attachments WHERE transcript_status = 'failed' ORDER BY id DESC LIMIT ?
+  `),
+  nextShadowCandidate: db.prepare(`
+    SELECT * FROM attachments
+    WHERE transcript_status = 'done' AND transcript <> '' AND id > ?
+      AND NOT EXISTS (SELECT 1 FROM transcript_shadows s WHERE s.attachment_id = attachments.id AND s.worker = ?)
+    ORDER BY id LIMIT 1
+  `),
+  maxDoneTranscriptionId: db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM attachments WHERE transcript_status = 'done'`),
+  insertShadow: db.prepare(`
+    INSERT OR REPLACE INTO transcript_shadows (attachment_id, worker, text, created_at) VALUES (?, ?, ?, ?)
+  `),
+  listShadows: db.prepare(`
+    SELECT s.attachment_id, s.worker, s.text AS shadow_text, a.transcript AS reference_text, s.created_at
+    FROM transcript_shadows s JOIN attachments a ON a.id = s.attachment_id
+    ORDER BY s.created_at DESC LIMIT ?
   `),
   getStalePendingAttachments: db.prepare(`
     SELECT * FROM attachments WHERE message_id IS NULL AND created_at < datetime('now', ?)
@@ -511,7 +549,8 @@ export function attachmentInfo(a) {
     size: a.size,
     url: `${config.publicUrl}/files/${a.token}/${encodeURIComponent(a.filename)}`,
     ...(a.transcript_status ? { transcript_status: a.transcript_status } : {}),
-    ...(a.transcript ? { transcript: a.transcript } : {})
+    ...(a.transcript ? { transcript: a.transcript } : {}),
+    ...(a.transcript_error && a.transcript_status === 'failed' ? { transcript_error: a.transcript_error } : {})
   };
 }
 
@@ -889,21 +928,26 @@ export const database = {
 
   // Transcription queue (audio attachments, processed by an external worker)
   queueTranscription(attachmentId) {
-    return stmts.queueTranscription.run(attachmentId).changes === 1;
+    return stmts.queueTranscription.run(Date.now(), attachmentId).changes === 1;
   },
 
-  /** Claim the next pending (or lease-expired) job. Jobs over maxAttempts are marked failed. */
-  claimNextTranscription(leaseMs, maxAttempts) {
+  /**
+   * Claim the next pending (or lease-expired) job. Jobs over maxAttempts are marked failed.
+   * minAgeMs: only jobs queued at least that long ago (lets a fallback worker leave fresh jobs to a preferred one).
+   */
+  claimNextTranscription(leaseMs, maxAttempts, { worker = null, minAgeMs = 0 } = {}) {
     return db.transaction(() => {
       const now = Date.now();
       for (;;) {
-        const job = stmts.nextTranscription.get(now - leaseMs);
+        const job = stmts.nextTranscription.get(now - leaseMs, now - minAgeMs);
         if (!job) return null;
         if ((job.transcript_attempts || 0) >= maxAttempts) {
           stmts.setTranscriptionStatus.run('failed', null, job.id);
+          stmts.setTranscriptionError.run(job.transcript_error || 'lease expired without result', job.id);
+          logger.warn('Transcription gave up', { attachmentId: job.id, attempts: job.transcript_attempts, worker: job.transcript_worker });
           continue;
         }
-        stmts.claimTranscription.run(now, job.id);
+        stmts.claimTranscription.run(now, worker, job.id);
         return stmts.getAttachmentById.get(job.id);
       }
     })();
@@ -911,6 +955,28 @@ export const database = {
 
   setTranscriptionStatus(attachmentId, status, transcript = null) {
     stmts.setTranscriptionStatus.run(status, transcript, attachmentId);
+  },
+
+  setTranscriptionError(attachmentId, error) {
+    stmts.setTranscriptionError.run(error ? String(error).slice(0, 300) : null, attachmentId);
+  },
+
+  recentFailedTranscriptions(limit = 20) {
+    return stmts.recentFailedTranscriptions.all(limit);
+  },
+
+  /** Shadow mode: a finished job this worker has not shadowed yet (id > cursor), without touching its state. */
+  nextShadowCandidate(worker, afterId) {
+    return stmts.nextShadowCandidate.get(afterId, worker);
+  },
+  maxDoneTranscriptionId() {
+    return stmts.maxDoneTranscriptionId.get().id;
+  },
+  saveShadow(attachmentId, worker, text) {
+    stmts.insertShadow.run(attachmentId, worker, text, Date.now());
+  },
+  listShadows(limit = 50) {
+    return stmts.listShadows.all(limit);
   },
 
   /** Uploads never attached to a message, older than maxAgeMs. */

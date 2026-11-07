@@ -4,8 +4,10 @@ import path from 'path';
 import { database } from '../db.js';
 import { config } from '../config.js';
 import { storeFile, attachmentPath, isInlineSafe } from '../services/files.js';
-import { claimTranscription, completeTranscription, transcriptionEnabled } from '../services/transcription.js';
-import { compareTokens } from '../utils/tokens.js';
+import {
+  claimTranscription, completeTranscription, transcriptionEnabled, identifyWorker, noteWorkerPoll,
+  transcriptionWorkers, claimShadow, completeShadow
+} from '../services/transcription.js';
 
 const router = Router();
 
@@ -69,23 +71,29 @@ router.get(['/files/:fileToken', '/files/:fileToken/:name'], (req, res) => {
 function requireWorker(req, res) {
   if (!transcriptionEnabled()) {
     res.status(404).json({ error: 'Transcription is not enabled (set HUB_TRANSCRIBE_TOKEN)' });
-    return false;
+    return null;
   }
   const auth = req.get('Authorization');
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (!token || !compareTokens(token, config.transcribeToken)) {
+  const worker = identifyWorker(token, req.query.worker || req.get('X-Worker'));
+  if (!worker) {
     res.status(403).json({ error: 'Invalid transcription worker token' });
-    return false;
+    return null;
   }
-  return true;
+  return worker;
 }
 
 /**
- * GET /api/transcriptions/next?wait=25 - Claim the next audio file to transcribe.
+ * GET /api/transcriptions/next?wait=25&worker=dev-box[&min_age=8][&shadow=1] - Claim the next audio file to transcribe.
  * 200 {id, url, filename, mime_type, size, attempt} or 204 when the queue stays empty for `wait` seconds.
+ * min_age (seconds): only notes queued at least that long ago (a fallback worker leaves fresh ones to a preferred one).
+ * shadow=1: a note already transcribed by another worker, to transcribe again for comparison (nothing is claimed).
  */
 router.get('/api/transcriptions/next', (req, res) => {
-  if (!requireWorker(req, res)) return;
+  const worker = requireWorker(req, res);
+  if (!worker) return;
+  const shadow = req.query.shadow === '1';
+  const minAgeMs = Math.min(Math.max(parseFloat(req.query.min_age) || 0, 0), 600) * 1000;
   const waitMs = Math.min(Math.max(parseInt(req.query.wait, 10) || 0, 0), 25) * 1000;
   const deadline = Date.now() + waitMs;
   let closed = false;
@@ -93,7 +101,8 @@ router.get('/api/transcriptions/next', (req, res) => {
 
   const attempt = () => {
     if (closed) return;
-    const job = claimTranscription();
+    noteWorkerPoll(worker.name, { shadow });
+    const job = shadow ? claimShadow(worker.name) : claimTranscription({ worker: worker.name, minAgeMs });
     if (job) return res.json(job);
     if (Date.now() >= deadline) return res.status(204).end();
     setTimeout(attempt, 1000);
@@ -102,11 +111,25 @@ router.get('/api/transcriptions/next', (req, res) => {
 });
 
 /**
+ * GET /api/transcriptions/workers - Last poll per worker (age_s, shadow), recent permanent failures,
+ * and recent shadow comparisons. Any worker token.
+ */
+router.get('/api/transcriptions/workers', (req, res) => {
+  if (!requireWorker(req, res)) return;
+  res.json({ ...transcriptionWorkers(), shadows: database.listShadows(20) });
+});
+
+/**
  * POST /api/transcriptions/:id {text} | {error} - Result for a claimed job
+ * With ?shadow=1 the text is only stored for comparison (nothing posted, real transcript untouched).
  */
 router.post('/api/transcriptions/:id', express.json({ limit: '128kb' }), (req, res) => {
-  if (!requireWorker(req, res)) return;
-  const result = completeTranscription(parseInt(req.params.id, 10), req.body || {});
+  const worker = requireWorker(req, res);
+  if (!worker) return;
+  const id = parseInt(req.params.id, 10);
+  const result = req.query.shadow === '1'
+    ? completeShadow(id, worker.name, req.body || {})
+    : completeTranscription(id, req.body || {}, worker.name);
   if (!result.ok) return res.status(result.status).json({ error: result.error });
   res.json({ success: true, ...(result.message_id ? { message_id: result.message_id } : {}) });
 });

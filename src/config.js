@@ -4,6 +4,14 @@ import path from 'path';
 // Data directory: HUB_DATA_DIR (default ./data). DB_PATH, if set, overrides the db file only.
 export const dataDir = process.env.HUB_DATA_DIR || './data';
 
+/** "name:token,name2:token2" -> [{name, token}] (invalid entries ignored). */
+export function parseWorkerTokens(raw) {
+  return String(raw || '').split(',').map(e => e.trim()).filter(Boolean).map(e => {
+    const i = e.indexOf(':');
+    return { name: e.slice(0, i), token: e.slice(i + 1) };
+  }).filter(w => /^[\w.-]{1,32}$/.test(w.name) && w.token.length >= 16);
+}
+
 export const config = {
   port: parseInt(process.env.PORT || '4030', 10),
   host: process.env.HOST || '0.0.0.0',
@@ -22,6 +30,8 @@ export const config = {
   // Uploaded files never attached to a message are deleted after this delay
   // Voice transcription by an external worker (scripts/transcribe-worker.mjs); disabled when unset
   transcribeToken: process.env.HUB_TRANSCRIBE_TOKEN || null,
+  // One token per worker machine ("dev-box:token,vps:token"), revocable one by one; the legacy token above stays valid
+  transcribeWorkerTokens: parseWorkerTokens(process.env.HUB_TRANSCRIBE_WORKER_TOKENS),
   transcribeLeaseMs: 5 * 60 * 1000,
   transcribeMaxAttempts: 3,
   // Rooms are deleted after this many days without messages (0 = never); agents can change it
