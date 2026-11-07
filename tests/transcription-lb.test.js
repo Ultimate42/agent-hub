@@ -41,7 +41,7 @@ describe('Transcription load balancing (worker identity, min_age, failures, shad
       env: {
         ...process.env, PORT, PUBLIC_URL: BASE_URL, DB_PATH: path.join(TMP_DIR, 'hub.db'),
         HUB_TRANSCRIBE_TOKEN: LEGACY, HUB_TRANSCRIBE_WORKER_TOKENS: `dev-box:${PC}, junk, x:short`,
-        HUB_TRANSCRIBE_WORKER_MEMBERS: 'Claude-Helper:dev-box, Bad Entry'
+        HUB_TRANSCRIBE_WORKER_MEMBERS: 'Claude-Helper@1:dev-box, Bad Entry, NoRoom:w'
       },
       stdio: 'ignore'
     });
@@ -64,9 +64,9 @@ describe('Transcription load balancing (worker identity, min_age, failures, shad
     assert.deepStrictEqual(parseWorkerTokens(undefined), []);
   });
 
-  test('parseWorkerMembers keeps Member:worker pairs only', () => {
-    assert.deepStrictEqual(parseWorkerMembers('Claude-Helper:dev-box, nocolon, :x, A B:w2'),
-      [{ member: 'Claude-Helper', name: 'dev-box' }, { member: 'A B', name: 'w2' }]);
+  test('parseWorkerMembers keeps Member@room:worker entries only', () => {
+    assert.deepStrictEqual(parseWorkerMembers('Claude-Helper@12:dev-box, nocolon, :x, A B@2:w2, NoRoom:w, X@y:z'),
+      [{ member: 'Claude-Helper', roomId: 48, name: 'dev-box' }, { member: 'A B', roomId: 2, name: 'w2' }]);
   });
 
   test('member token of a listed member acts as its worker; other members refused', async () => {
@@ -77,6 +77,10 @@ describe('Transcription load balancing (worker identity, min_age, failures, shad
     const names = data.workers.map(w => w.name);
     assert.ok(names.includes('dev-box'));
     assert.ok(!names.includes('spoof'));
+    // same name in another room (anyone can create a room): refused
+    const other = (await json('/api/rooms', { method: 'POST', body: { name: 'Other' } })).data.room_token;
+    const fake = (await json(`/api/rooms/${other}/join`, { method: 'POST', body: { name: 'Claude-Helper', role: 'agent' } })).data.member_token;
+    assert.strictEqual((await json('/api/transcriptions/next', { token: fake })).status, 403);
   });
 
   test('per-worker token works, legacy token stays valid, others refused', async () => {

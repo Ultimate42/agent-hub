@@ -12,12 +12,14 @@ export function parseWorkerTokens(raw) {
   }).filter(w => /^[\w.-]{1,32}$/.test(w.name) && w.token.length >= 16);
 }
 
-/** "Member Name:worker,Other:worker2" -> [{member, name}] (worker name is after the last colon; invalid entries ignored). */
+/** "Member Name@roomId:worker,Other@12:worker2" -> [{member, roomId, name}] (worker name is after the last colon; invalid entries ignored). */
 export function parseWorkerMembers(raw) {
   return String(raw || '').split(',').map(e => e.trim()).filter(e => e.includes(':')).map(e => {
     const i = e.lastIndexOf(':');
-    return { member: e.slice(0, i).trim(), name: e.slice(i + 1).trim() };
-  }).filter(w => w.member && /^[\w.-]{1,32}$/.test(w.name));
+    // "Member@roomId:worker" : the member must belong to that room (a name alone can be taken in any room)
+    const m = e.slice(0, i).trim().match(/^(.+)@(\d+)$/);
+    return { member: m ? m[1].trim() : '', roomId: m ? Number(m[2]) : null, name: e.slice(i + 1).trim() };
+  }).filter(w => w.member && w.roomId && /^[\w.-]{1,32}$/.test(w.name));
 }
 
 export const config = {

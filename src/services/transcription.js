@@ -40,7 +40,7 @@ export function identifyWorker(token, announced) {
   // A room member token whose member name is listed in HUB_TRANSCRIBE_WORKER_MEMBERS: worker name imposed
   if (config.transcribeWorkerMembers.length > 0) {
     const member = database.getMemberByToken(token);
-    const entry = member && config.transcribeWorkerMembers.find(w => w.member === member.name);
+    const entry = member && config.transcribeWorkerMembers.find(w => w.member === member.name && w.roomId === Number(member.room_id));
     if (entry) return { name: entry.name };
   }
   return null;
