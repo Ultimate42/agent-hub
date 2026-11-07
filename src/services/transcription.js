@@ -95,9 +95,13 @@ export function completeShadow(attachmentId, worker, { text } = {}) {
   return { ok: true };
 }
 
-/** Queue the audio files of a freshly posted message. */
-export function queueTranscriptions(attachmentIds) {
+/**
+ * Queue the audio files of a freshly posted message. Only audio posted by a human (voice notes recorded
+ * in the UI) is transcribed: audio files sent by agents/bots are never transcribed automatically.
+ */
+export function queueTranscriptions(attachmentIds, author = null) {
   if (!transcriptionEnabled()) return;
+  if (!author || author.role !== 'human') return;
   for (const id of attachmentIds) database.queueTranscription(id);
 }
 

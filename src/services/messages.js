@@ -199,7 +199,7 @@ export function postMessage(member, { content, type = 'message', reply_to, attac
     if (err.message === 'attachment already used') return fail(400, 'attachment is already attached to a message');
     throw err;
   }
-  queueTranscriptions(files.ids);
+  queueTranscriptions(files.ids, member);
   const attachmentList = files.ids.length > 0
     ? database.getMessageAttachments(messageId)
     : undefined;

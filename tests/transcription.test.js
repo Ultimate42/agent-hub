@@ -97,6 +97,16 @@ describe('Voice transcription via external worker', () => {
     assert.strictEqual(hist.data.messages.find(m => m.id === msg.id).attachments[0].transcript_status, 'failed');
   });
 
+  test('audio sent by an agent is not queued for transcription', async () => {
+    const botToken = (await json(`/api/rooms/${roomToken}/join`, { method: 'POST', body: { name: 'Bot', role: 'agent' } })).data.member_token;
+    const up = await fetch(`${BASE_URL}/api/rooms/${roomToken}/files?filename=resume-partie.m4a`, {
+      method: 'POST', headers: { Authorization: `Bearer ${botToken}`, 'Content-Type': 'audio/mp4' }, body: Buffer.from('fake m4a')
+    }).then(r => r.json());
+    const msg = (await json(`/api/rooms/${roomToken}/messages`, { method: 'POST', token: botToken, body: { attachments: [up.id] } })).data;
+    assert.ok(!msg.attachments[0].transcript_status);
+    assert.strictEqual((await json('/api/transcriptions/next', { token: WORKER_TOKEN })).status, 204);
+  });
+
   test('worker transcribes a voice message and the text is posted as a reply', async () => {
     workerProcess = spawn('node', ['scripts/transcribe-worker.mjs'], {
       cwd: process.cwd(),
