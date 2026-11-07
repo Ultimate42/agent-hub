@@ -31,6 +31,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const HUB_URL = (process.env.HUB_URL || '').replace(/\/+$/, '');
 const TOKEN = process.env.HUB_TRANSCRIBE_TOKEN;
@@ -180,4 +181,4 @@ async function main() {
   log('worker stopped');
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
