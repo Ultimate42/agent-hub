@@ -125,9 +125,12 @@ server.listen(config.port, config.host, () => {
 `);
 });
 
-// Graceful shutdown
-function shutdown() {
-  logger.info('Shutting down...');
+// Graceful shutdown (idempotent: SIGTERM and an uncaught exception may both call it)
+let shuttingDown = false;
+function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info('Shutting down...', { exitCode });
 
   // Stop watchdog
   stopWatchdog();
@@ -142,7 +145,7 @@ function shutdown() {
 
   server.close(() => {
     try { database.close(); } catch { /* already closed */ }
-    process.exit(0);
+    process.exit(exitCode);
   });
 
   // Force close idle/all connections after 2s
@@ -152,11 +155,11 @@ function shutdown() {
   }, 2000);
 
   // Force exit after 5s
-  setTimeout(() => process.exit(0), 5000).unref();
+  setTimeout(() => process.exit(exitCode), 5000).unref();
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', () => shutdown(0));
+process.on('SIGINT', () => shutdown(0));
 
 // Never die silently: a rejected promise nobody awaited (webhook, sweeper) is logged and the hub
 // goes on (all DB work is synchronous, nothing is left half-written). A synchronous exception that
@@ -166,6 +169,5 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception, shutting down', { error: err.message, stack: err.stack });
-  shutdown();
-  setTimeout(() => process.exit(1), 2000).unref();
+  shutdown(1); // non-zero: the service manager restarts the hub
 });
