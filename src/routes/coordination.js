@@ -2,37 +2,20 @@ import { Router } from 'express';
 import { database } from '../db.js';
 import { logger } from '../utils/logger.js';
 import { broadcast } from '../ws/handler.js';
+import { requireRoomMember, requireRoomAdmin, clampInt } from '../utils/auth.js';
 
 const router = Router();
 
 // Coordination timeout in milliseconds (15 seconds)
 const COORDINATION_TIMEOUT = 15000;
 const HEARTBEAT_INTERVAL = 5000;
+const COORDINATION_ROLES = ['manager', 'second'];
 
-// Helper: Extract token from Authorization header
-function getToken(req) {
-  const auth = req.get('Authorization');
-  if (auth?.startsWith('Bearer ')) {
-    return auth.slice(7);
-  }
-  return req.query.token;
-}
-
-// Helper: Validate member access
-function requireMember(req, res) {
-  const token = getToken(req);
-  if (!token) {
-    res.status(401).json({ error: 'Authorization required' });
-    return null;
-  }
-
-  const member = database.getMemberByToken(token);
-  if (!member) {
-    res.status(403).json({ error: 'Invalid token' });
-    return null;
-  }
-
-  return member;
+/** A member of this room by id, or null (never a member of another room). */
+function roomMemberById(room, id) {
+  const memberId = Number(id);
+  if (!Number.isInteger(memberId)) return null;
+  return database.getMembersByRoom(room.id).find(m => m.id === memberId) || null;
 }
 
 /**
@@ -40,19 +23,13 @@ function requireMember(req, res) {
  * Send heartbeat from manager/second agent
  */
 router.post('/rooms/:token/coordination/heartbeat', (req, res) => {
-  const member = requireMember(req, res);
-  if (!member) return;
-
-  // Verify member belongs to this room
-  const room = database.getRoomByToken(req.params.token);
-  if (!room || room.id !== member.room_id) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
+  const ctx = requireRoomMember(req, res);
+  if (!ctx) return;
+  const { member, room } = ctx;
 
   // Update heartbeat timestamp
   const now = Date.now();
   database.updateMemberHeartbeat(member.id, now);
-  database.updateMemberLastSeen(member.id);
 
   // Get coordination status
   const coordMembers = database.getCoordinationMembers(room.id);
@@ -120,21 +97,13 @@ router.post('/rooms/:token/coordination/heartbeat', (req, res) => {
  * Manually switch active agent (admin only)
  */
 router.post('/rooms/:token/coordination/switch', (req, res) => {
-  const { admin_token, to_member_id } = req.body;
-
-  const room = database.getRoomByToken(req.params.token);
-  if (!room) {
-    return res.status(404).json({ error: 'Room not found' });
-  }
-
-  // Verify admin token
-  if (!admin_token || admin_token !== room.admin_token) {
-    return res.status(403).json({ error: 'Admin authorization required' });
-  }
+  const room = requireRoomAdmin(req, res);
+  if (!room) return;
+  const { to_member_id } = req.body || {};
 
   const coordMembers = database.getCoordinationMembers(room.id);
   const currentActive = coordMembers.find(m => m.coordination_role === 'manager');
-  const newActive = coordMembers.find(m => m.id === to_member_id);
+  const newActive = coordMembers.find(m => m.id === Number(to_member_id));
 
   if (!newActive) {
     return res.status(400).json({ error: 'Target member not found or not a coordination member' });
@@ -184,13 +153,9 @@ router.post('/rooms/:token/coordination/switch', (req, res) => {
  * Get current coordination state
  */
 router.get('/rooms/:token/coordination/status', (req, res) => {
-  const member = requireMember(req, res);
-  if (!member) return;
-
-  const room = database.getRoomByToken(req.params.token);
-  if (!room || room.id !== member.room_id) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
+  const ctx = requireRoomMember(req, res, { touch: false });
+  if (!ctx) return;
+  const { room } = ctx;
 
   const coordMembers = database.getCoordinationMembers(room.id);
   const manager = coordMembers.find(m => m.coordination_role === 'manager');
@@ -222,44 +187,37 @@ router.get('/rooms/:token/coordination/status', (req, res) => {
  * Get coordination event history
  */
 router.get('/rooms/:token/coordination/events', (req, res) => {
-  const member = requireMember(req, res);
-  if (!member) return;
+  const ctx = requireRoomMember(req, res, { touch: false });
+  if (!ctx) return;
 
-  const room = database.getRoomByToken(req.params.token);
-  if (!room || room.id !== member.room_id) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-
-  const limit = parseInt(req.query.limit) || 50;
-  const events = database.getCoordinationEvents(room.id, limit);
+  const limit = clampInt(req.query.limit, 50, 1, 200);
+  const events = database.getCoordinationEvents(ctx.room.id, limit);
 
   res.json({ events });
 });
 
 /**
  * POST /api/rooms/:token/coordination/set-role
- * Set coordination role for a member (admin only)
+ * Set coordination role for a member of this room (admin only); null/absent clears it
  */
 router.post('/rooms/:token/coordination/set-role', (req, res) => {
-  const { admin_token, member_id, coordination_role } = req.body;
-
-  const room = database.getRoomByToken(req.params.token);
-  if (!room) {
-    return res.status(404).json({ error: 'Room not found' });
-  }
-
-  // Verify admin token
-  if (!admin_token || admin_token !== room.admin_token) {
-    return res.status(403).json({ error: 'Admin authorization required' });
-  }
+  const room = requireRoomAdmin(req, res);
+  if (!room) return;
+  const { member_id, coordination_role } = req.body || {};
 
   // Validate coordination role
-  if (coordination_role && !['manager', 'second'].includes(coordination_role)) {
-    return res.status(400).json({ error: 'Invalid coordination role. Must be "manager" or "second"' });
+  const role = coordination_role === undefined || coordination_role === null || coordination_role === '' ? null : coordination_role;
+  if (role !== null && !COORDINATION_ROLES.includes(role)) {
+    return res.status(400).json({ error: `Invalid coordination role. Must be ${COORDINATION_ROLES.map(r => `"${r}"`).join(' or ')}` });
   }
 
-  // Update coordination role
-  database.updateMemberCoordinationRole(member_id, coordination_role);
+  // The target must be a member of THIS room (an admin token only rules its own room)
+  const target = roomMemberById(room, member_id);
+  if (!target) {
+    return res.status(404).json({ error: 'Member not found in this room' });
+  }
+
+  database.updateMemberCoordinationRole(target.id, role);
 
   // Broadcast status update
   broadcast(room.id, {
@@ -269,11 +227,11 @@ router.post('/rooms/:token/coordination/set-role', (req, res) => {
 
   logger.info('Coordination role set', {
     roomId: room.id,
-    memberId: member_id,
-    role: coordination_role
+    memberId: target.id,
+    role
   });
 
-  res.json({ success: true, member_id, coordination_role });
+  res.json({ success: true, member_id: target.id, coordination_role: role });
 });
 
 export default router;

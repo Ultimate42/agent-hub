@@ -2,6 +2,7 @@ import express, { Router } from 'express';
 import { existsSync } from 'fs';
 import path from 'path';
 import { database } from '../db.js';
+import { requireRoomMember } from '../utils/auth.js';
 import { config } from '../config.js';
 import { storeFile, attachmentPath, isInlineSafe } from '../services/files.js';
 import {
@@ -11,12 +12,6 @@ import {
 
 const router = Router();
 
-function getToken(req) {
-  const auth = req.get('Authorization');
-  if (auth?.startsWith('Bearer ')) return auth.slice(7);
-  return req.query.token;
-}
-
 /**
  * POST /api/rooms/:token/files?filename=photo.png - Upload a file (raw body, any Content-Type)
  * Returns { id, filename, mime_type, size, url }. Then post a message with attachments: [id].
@@ -24,13 +19,9 @@ function getToken(req) {
 router.post('/api/rooms/:token/files',
   express.raw({ type: () => true, limit: config.maxFileSize }),
   (req, res) => {
-    const token = getToken(req);
-    if (!token) return res.status(401).json({ error: 'Authorization required' });
-    const member = database.getMemberByToken(token);
-    if (!member) return res.status(403).json({ error: 'Invalid token' });
-    const room = database.getRoomByToken(req.params.token);
-    if (!room || room.id !== member.room_id) return res.status(403).json({ error: 'Access denied' });
-    database.updateMemberLastSeen(member.id);
+    const ctx = requireRoomMember(req, res);
+    if (!ctx) return;
+    const { member } = ctx;
 
     let filename = req.query.filename || req.get('X-Filename');
     try { filename = filename && decodeURIComponent(filename); } catch { /* keep raw */ }

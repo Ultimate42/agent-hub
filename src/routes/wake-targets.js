@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { database } from '../db.js';
+import { requireMember } from '../utils/auth.js';
 import { logger } from '../utils/logger.js';
 import path_ from 'path';
 import { isValidWakeFilePath } from '../utils/paths.js';
@@ -7,33 +8,6 @@ const { normalize } = path_;
 import { isDirectLocalRequest, isPrivateHost } from '../utils/net.js';
 
 const router = Router();
-
-// Helper: Extract token from Authorization header
-function getToken(req) {
-  const auth = req.get('Authorization');
-  if (auth?.startsWith('Bearer ')) {
-    return auth.slice(7);
-  }
-  return req.query.token;
-}
-
-// Helper: Validate member access
-function requireMember(req, res) {
-  const token = getToken(req);
-  if (!token) {
-    res.status(401).json({ error: 'Authorization required' });
-    return null;
-  }
-
-  const member = database.getMemberByToken(token);
-  if (!member) {
-    res.status(403).json({ error: 'Invalid token' });
-    return null;
-  }
-
-  database.updateMemberLastSeen(member.id);
-  return member;
-}
 
 /**
  * POST /api/members/wake-target - Register or update a wake target

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { database } from '../db.js';
-import { generateToken, compareTokens, maskToken } from '../utils/tokens.js';
+import { generateToken } from '../utils/tokens.js';
+import { requireMember, requireRoomMember, requireRoomAdmin, clampInt } from '../utils/auth.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
@@ -21,33 +22,6 @@ const router = Router();
 export { notifyWaiters };
 
 const MAX_LONGPOLLS_PER_ROOM = 200;
-
-// Helper: Extract token from Authorization header or query
-function getToken(req) {
-  const auth = req.get('Authorization');
-  if (auth?.startsWith('Bearer ')) {
-    return auth.slice(7);
-  }
-  return req.query.token;
-}
-
-// Helper: Validate member access
-function requireMember(req, res) {
-  const token = getToken(req);
-  if (!token) {
-    res.status(401).json({ error: 'Authorization required' });
-    return null;
-  }
-
-  const member = database.getMemberByToken(token);
-  if (!member) {
-    res.status(403).json({ error: 'Invalid token' });
-    return null;
-  }
-
-  database.updateMemberLastSeen(member.id);
-  return member;
-}
 
 /**
  * POST /api/rooms - Create a new room
@@ -110,19 +84,8 @@ router.get('/rooms/:token', (req, res) => {
  * DELETE /api/rooms/:token - Delete a room (requires admin token)
  */
 router.delete('/rooms/:token', (req, res) => {
-  const adminToken = getToken(req);
-  if (!adminToken) {
-    return res.status(401).json({ error: 'Admin token required' });
-  }
-
-  const room = database.getRoomByToken(req.params.token);
-  if (!room) {
-    return res.status(404).json({ error: 'Room not found' });
-  }
-
-  if (!compareTokens(adminToken, room.admin_token)) {
-    return res.status(403).json({ error: 'Invalid admin token' });
-  }
+  const room = requireRoomAdmin(req, res);
+  if (!room) return;
 
   database.deleteRoom(room.id);
   deleteRoomFiles(room.id);
@@ -333,18 +296,6 @@ router.get('/rooms/:token/messages', (req, res) => {
     history
   });
 });
-
-// Resolve the calling member and check it belongs to :token (sends the error response otherwise)
-function requireRoomMember(req, res) {
-  const member = requireMember(req, res);
-  if (!member) return null;
-  const room = database.getRoomByToken(req.params.token);
-  if (!room || room.id !== member.room_id) {
-    res.status(403).json({ error: 'Access denied' });
-    return null;
-  }
-  return { member, room };
-}
 
 /**
  * PATCH /api/rooms/:token/messages/:id {content} - Edit one of your messages
@@ -584,7 +535,7 @@ router.get('/rooms/:token/directive/history', (req, res) => {
     return res.status(403).json({ error: 'Access denied' });
   }
 
-  const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+  const limit = clampInt(req.query.limit, 20, 1, 100);
   const history = database.getDirectiveHistory(room.id, limit);
 
   res.json({ history });
@@ -613,19 +564,8 @@ router.delete('/rooms/:token/leave', (req, res) => {
  * POST /api/rooms/:token/settings - Update room settings (admin only)
  */
 router.post('/rooms/:token/settings', (req, res) => {
-  const adminToken = getToken(req);
-  if (!adminToken) {
-    return res.status(401).json({ error: 'Admin token required' });
-  }
-
-  const room = database.getRoomByToken(req.params.token);
-  if (!room) {
-    return res.status(404).json({ error: 'Room not found' });
-  }
-
-  if (!compareTokens(adminToken, room.admin_token)) {
-    return res.status(403).json({ error: 'Invalid admin token' });
-  }
+  const room = requireRoomAdmin(req, res);
+  if (!room) return;
 
   const { secure_mode } = req.body || {};
 
@@ -645,19 +585,8 @@ router.post('/rooms/:token/settings', (req, res) => {
  * POST /api/rooms/:token/members/:memberId/status - Update member status (admin only)
  */
 router.post('/rooms/:token/members/:memberId/status', (req, res) => {
-  const adminToken = getToken(req);
-  if (!adminToken) {
-    return res.status(401).json({ error: 'Admin token required' });
-  }
-
-  const room = database.getRoomByToken(req.params.token);
-  if (!room) {
-    return res.status(404).json({ error: 'Room not found' });
-  }
-
-  if (!compareTokens(adminToken, room.admin_token)) {
-    return res.status(403).json({ error: 'Invalid admin token' });
-  }
+  const room = requireRoomAdmin(req, res);
+  if (!room) return;
 
   const { status } = req.body || {};
 
