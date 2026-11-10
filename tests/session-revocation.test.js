@@ -66,12 +66,18 @@ describe('session revocation', () => {
     const old = await join(room, 'Agent');
     const other = await join(room, 'Other');
     const { closed } = await openWs(old);
+    const otherWs = await openWs(other);
+    const seenByOther = [];
+    otherWs.ws.on('message', (d) => seenByOther.push(JSON.parse(d.toString())));
     const poll = fetch(`${BASE}/api/rooms/${room.room_token}/messages/wait?timeout=20000`, { headers: { Authorization: `Bearer ${old}` } });
     await new Promise(r => setTimeout(r, 200));
 
     const fresh = await join(room, 'Agent'); // same name: token rotated
     const c = await withTimeout(closed, 3000, 'ws close after rejoin');
     assert.strictEqual(c.code, 4003);
+    await new Promise(r => setTimeout(r, 300));
+    assert.ok(!seenByOther.some(m => m.type === 'member_left' && m.name === 'Agent'), 'a rotation is not a departure');
+    otherWs.ws.close();
 
     const res = await withTimeout(poll, 3000, 'long-poll release after rejoin');
     assert.strictEqual(res.status, 403);

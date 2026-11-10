@@ -9,6 +9,9 @@ import fs from 'node:fs';
 // a message posted while an agent waits reaches it at once, and a timeout answer never hides a
 // message published just before it.
 
+process.env.DB_PATH = path.join(os.tmpdir(), `hub-test-mcp-wait-unit-${process.pid}.db`);
+const { MAX_WAITERS_PER_ROOM } = await import('../src/services/messages.js');
+
 const PORT = '4172';
 const BASE = `http://localhost:${PORT}`;
 const DB = path.join(os.tmpdir(), `hub-test-mcp-wait-${process.pid}-${Date.now()}.db`);
@@ -29,7 +32,7 @@ describe('mcp wait_for_messages (event-driven)', () => {
   before(async () => {
     proc = spawn('node', ['src/index.js'], {
       cwd: process.cwd(),
-      env: { ...process.env, PORT, PUBLIC_URL: BASE, DB_PATH: DB, LOG_LEVEL: 'error', HUB_RETENTION_DEFAULT_DAYS: '0' },
+      env: { ...process.env, PORT, PUBLIC_URL: BASE, DB_PATH: DB, LOG_LEVEL: 'error', HUB_RETENTION_DEFAULT_DAYS: '0', HUB_RATE_LIMIT_PER_MINUTE: '100000' },
       stdio: 'ignore'
     });
     for (let i = 0; i < 40; i++) {
@@ -42,7 +45,7 @@ describe('mcp wait_for_messages (event-driven)', () => {
   });
   after(() => {
     proc?.kill('SIGTERM');
-    for (const f of [DB, DB + '-wal', DB + '-shm']) try { fs.unlinkSync(f); } catch {}
+    for (const f of [DB, DB + '-wal', DB + '-shm', process.env.DB_PATH, process.env.DB_PATH + '-wal', process.env.DB_PATH + '-shm']) try { fs.unlinkSync(f); } catch {}
   });
 
   test('a message posted during the wait is delivered immediately (not at the next poll tick)', async () => {
@@ -91,18 +94,53 @@ describe('mcp wait_for_messages (event-driven)', () => {
     assert.ok(r2.messages.every(m => m.content === 'theirs'));
   });
 
-  test('the connector dropping the request frees the waiter slot', async () => {
-    const ac = new AbortController();
-    const p = fetch(`${BASE}/mcp`, {
-      method: 'POST', signal: ac.signal,
+  test('the connector dropping the request frees the waiter slot (room filled to the cap)', async () => {
+    const wait = (signal) => fetch(`${BASE}/mcp`, {
+      method: 'POST', signal,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'wait_for_messages', arguments: { member_token: a, timeout: 20000 } } })
-    }).catch(() => null);
-    await new Promise(r => setTimeout(r, 200));
-    ac.abort();
-    await p;
-    // The hub is still healthy and a new wait works
+    });
+    const controllers = [];
+    const pending = [];
+    for (let i = 0; i < MAX_WAITERS_PER_ROOM; i++) {
+      const ac = new AbortController();
+      controllers.push(ac);
+      pending.push(wait(ac.signal).catch(() => null));
+    }
+    await new Promise(r => setTimeout(r, 800));
+    // The room is full: one more is refused
+    const full = (await rpc('wait_for_messages', { member_token: a, timeout: 300 }));
+    assert.strictEqual(full.isError, true);
+    assert.match(full.text, /Too many concurrent wait_for_messages/);
+
+    // Drop one connection: its slot is freed and a new wait is accepted
+    controllers[0].abort();
+    await pending[0];
+    await new Promise(r => setTimeout(r, 300));
     const r = (await rpc('wait_for_messages', { member_token: a, timeout: 300 })).parsed();
     assert.strictEqual(r.messages.length, 0);
+
+    for (const ac of controllers) ac.abort();
+    await Promise.all(pending);
+    await new Promise(r => setTimeout(r, 300));
+    // Every slot is back: a message now reaches a fresh waiter
+    const again = rpc('wait_for_messages', { member_token: a, timeout: 5000 });
+    await new Promise(r => setTimeout(r, 200));
+    await rpc('post_message', { member_token: b, content: 'room drained' });
+    assert.strictEqual((await again).parsed().messages.map(m => m.content).join(), 'room drained');
+  });
+
+  test('a join does not wake a since-mode long-poll with a synthetic id-less entry', async () => {
+    const hist = await (await fetch(`${BASE}/api/rooms/${room.room_token}/messages?limit=1`, { headers: { Authorization: `Bearer ${a}` } })).json();
+    const lastId = hist.messages.length ? hist.messages[hist.messages.length - 1].id : 0;
+    const t0 = Date.now();
+    const poll = fetch(`${BASE}/api/rooms/${room.room_token}/messages/wait?since=${lastId}&timeout=1200`, { headers: { Authorization: `Bearer ${a}` } });
+    await new Promise(r => setTimeout(r, 200));
+    const j = await fetch(`${BASE}/api/rooms/${room.room_token}/join`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Newcomer' }) });
+    assert.strictEqual(j.status, 201);
+    const r = await (await poll).json();
+    assert.deepStrictEqual(r.messages, []);
+    assert.ok(Date.now() - t0 >= 1100, 'the poll ran to its timeout');
+    assert.ok(r.messages.every(m => m.id !== undefined));
   });
 });

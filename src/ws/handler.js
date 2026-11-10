@@ -19,6 +19,7 @@ function closeRoomClients(roomId, predicate, code, reason) {
   for (const client of [...clients]) {
     if (!predicate(client.member)) continue;
     clients.delete(client);
+    client.revoked = true; // the member did not leave: no member_left on close
     try { client.ws.close(code, reason); } catch { /* already closed */ }
   }
   if (clients.size === 0) roomClients.delete(roomId);
@@ -111,7 +112,9 @@ export function setupWebSocket(server) {
         memberName: member.name
       });
 
-      // Notify others of leave
+      // Notify others of leave (not when the socket was revoked: a rejoin or a deleted room
+      // is not a departure, and the member is usually back already on a fresh socket)
+      if (client.revoked) return;
       broadcastToRoom(member.room_id, {
         type: 'member_left',
         name: member.name

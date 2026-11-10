@@ -22,6 +22,12 @@ export function parseWorkerMembers(raw) {
   }).filter(w => w.member && w.roomId && /^[\w.-]{1,32}$/.test(w.name));
 }
 
+/** Positive integer from an env value, or the default (an unparseable value must not disable a cap). */
+function positiveInt(value, dflt) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : dflt;
+}
+
 export const config = {
   port: parseInt(process.env.PORT || '4030', 10),
   host: process.env.HOST || '0.0.0.0',
@@ -30,7 +36,7 @@ export const config = {
   trustedProxies: (process.env.HUB_TRUSTED_PROXIES || 'loopback,172.18.0.0/16')
     .split(',').map(s => s.trim()).filter(Boolean),
   // Concurrent GET /mcp SSE streams kept open (each holds a socket and a keep-alive timer)
-  maxSseStreams: parseInt(process.env.HUB_MAX_SSE_STREAMS || '500', 10),
+  maxSseStreams: positiveInt(process.env.HUB_MAX_SSE_STREAMS, 500),
 
   // Public URL (for setup instructions)
   publicUrl: process.env.PUBLIC_URL || 'http://localhost:4030',

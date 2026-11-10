@@ -93,10 +93,15 @@ Members can register a webhook or file path to be notified when:
 - Someone replies to their message (any room)
 
 Registration is idempotent and per-member. Notifications are sent only once per message and never to the message author.
-Webhooks receive `{room_id, room_name, room_token, message_id, author, reply_to, content_excerpt}`; transient failures
-(network, 429, 5xx) are retried `max_retries` times (0-10, backoff 1 s, 2 s, 4 s...), a 4xx is final. `GET` shows
-`last_notification_at` / `last_error`. Public hostnames are resolved before each delivery and refused if they point to a
-private address; `localhost` / private targets and `file` targets can only be registered from the hub host itself.
+Webhooks receive `{room_id, room_name, message_id, author, reply_to, content_excerpt}` (no token: the member already
+holds its credentials); transient failures (network, 429, 5xx) are retried `max_retries` times (0-10, backoff 1 s, 2 s,
+4 s... capped at 30 s; each attempt times out after 10 s, so `max_retries: 10` can take about 5 minutes in the worst
+case), a 4xx is final. One delivery chain runs per member: notifications arriving while a chain is in flight are
+coalesced into a single follow-up carrying the latest message. `GET` shows `last_notification_at` / `last_error`.
+Hostnames are resolved before each delivery and the checked address is the one connected to (no DNS rebinding);
+a public name resolving to a private address is refused unless the target was registered from the hub host itself
+(`allow_private`, shown by `GET`). `localhost` / private literal targets and `file` targets can only be registered from
+the hub host itself.
 
 ```bash
 # Register webhook (HTTPS required)

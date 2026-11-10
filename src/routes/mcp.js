@@ -623,8 +623,8 @@ async function handleToolCall(name, args, req) {
           return reject(new Error('Too many concurrent wait_for_messages for this room'));
         }
         resp.on('close', onClose);
-        // A message may have been published while the waiter was being registered
-        waiter.tryDeliver(false);
+        // No message can slip in between the check above and this registration: both happen in the
+        // same synchronous turn, and publication runs on this same thread.
       });
     }
 
@@ -905,11 +905,6 @@ router.get('/', (req, res) => {
     clearInterval(keepAlive);
   });
 });
-
-/** Open GET /mcp streams (for tests / health). */
-export function openSseStreams() {
-  return sseStreams;
-}
 
 /**
  * DELETE /mcp - End session

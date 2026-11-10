@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
+import { isPrivateHost } from './utils/net.js';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 
@@ -94,6 +95,7 @@ db.exec(`
     target_path TEXT,
     retry_count INTEGER DEFAULT 0,
     max_retries INTEGER DEFAULT 3,
+    allow_private INTEGER DEFAULT 0,
     last_error TEXT,
     last_notification_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -152,6 +154,22 @@ if (!memberCols.includes('last_read_id')) {
 }
 
 // Migration: message edit / soft delete, and emoji reactions
+// Webhook wake targets registered from the hub host may point at private addresses (a LAN service).
+// Rows created before the column existed were accepted under the old rule (literal private host
+// only from the hub host): keep that trust for them, nothing else.
+const wakeCols = db.prepare('PRAGMA table_info(wake_targets)').all().map(c => c.name);
+if (!wakeCols.includes('allow_private')) {
+  db.transaction(() => {
+    db.exec('ALTER TABLE wake_targets ADD COLUMN allow_private INTEGER DEFAULT 0');
+    const update = db.prepare('UPDATE wake_targets SET allow_private = 1 WHERE id = ?');
+    for (const row of db.prepare("SELECT id, target_url FROM wake_targets WHERE target_type = 'webhook'").all()) {
+      let host = null;
+      try { host = new URL(row.target_url).hostname; } catch { /* unparseable: stays public-only */ }
+      if (host && isPrivateHost(host)) update.run(row.id);
+    }
+  })();
+}
+
 const messageCols = db.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
 if (!messageCols.includes('edited_at')) {
   db.exec(`
@@ -393,8 +411,8 @@ const stmts = {
 
   // Wake targets
   setWakeTarget: db.prepare(`
-    INSERT OR REPLACE INTO wake_targets (member_id, target_type, target_url, target_path, max_retries)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT OR REPLACE INTO wake_targets (member_id, target_type, target_url, target_path, max_retries, allow_private)
+    VALUES (?, ?, ?, ?, ?, ?)
   `),
   getWakeTarget: db.prepare(`
     SELECT * FROM wake_targets WHERE member_id = ?
@@ -818,9 +836,9 @@ export const database = {
   },
 
   // Wake targets operations
-  setWakeTarget(memberId, targetType, targetUrl = null, targetPath = null, maxRetries = 3) {
+  setWakeTarget(memberId, targetType, targetUrl = null, targetPath = null, maxRetries = 3, allowPrivate = false) {
     try {
-      const result = stmts.setWakeTarget.run(memberId, targetType, targetUrl, targetPath, maxRetries);
+      const result = stmts.setWakeTarget.run(memberId, targetType, targetUrl, targetPath, maxRetries, allowPrivate ? 1 : 0);
       return result.lastInsertRowid;
     } catch (err) {
       logger.error('Failed to set wake target', { memberId, targetType, error: err.message });

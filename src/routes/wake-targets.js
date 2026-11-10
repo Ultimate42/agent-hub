@@ -72,7 +72,10 @@ router.post('/members/wake-target', (req, res) => {
       return res.status(400).json({ error: 'max_retries must be 0-10' });
     }
 
-    database.setWakeTarget(member.id, type, type === 'webhook' ? url : null, type === 'file' ? normalize(path) : null, max_retries);
+    // A webhook registered from the hub host may resolve to a private address (LAN service);
+    // any other origin is held to public addresses at delivery time (DNS is checked then).
+    const allowPrivate = type === 'webhook' && isDirectLocalRequest(req);
+    database.setWakeTarget(member.id, type, type === 'webhook' ? url : null, type === 'file' ? normalize(path) : null, max_retries, allowPrivate);
 
     logger.info('Wake target registered', {
       memberId: member.id,
@@ -113,6 +116,7 @@ router.get('/members/wake-target', (req, res) => {
       last_notification_at: wakeTarget.last_notification_at,
       last_error: wakeTarget.last_error,
       max_retries: wakeTarget.max_retries,
+      allow_private: wakeTarget.target_type === 'webhook' ? wakeTarget.allow_private === 1 : undefined,
       created_at: wakeTarget.created_at
     });
   } catch (error) {

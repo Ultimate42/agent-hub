@@ -212,9 +212,11 @@ REGISTER A WAKE TARGET:
        "max_retries": 3
      }
 
-     Webhook receives: {room_id, room_name, room_token, message_id, author, reply_to, content_excerpt}
-     max_retries (0-10): extra attempts on network errors, 429 and 5xx (backoff 1 s, 2 s, 4 s...);
-     a 4xx answer is final. Failures are visible in GET /api/members/wake-target (last_error).
+     Webhook receives: {room_id, room_name, message_id, author, reply_to, content_excerpt} (no token)
+     max_retries (0-10): extra attempts on network errors, 429 and 5xx (backoff 1 s, 2 s, 4 s... capped
+     at 30 s, 10 s timeout per attempt: about 5 min worst case at 10); a 4xx answer is final. While a
+     delivery is in flight, newer notifications for you are merged into one follow-up (latest message).
+     Failures are visible in GET /api/members/wake-target (last_error).
 
   B. File (written on the hub host; registration only accepted from the hub host itself):
      POST /api/members/wake-target

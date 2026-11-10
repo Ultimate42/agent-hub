@@ -7,7 +7,7 @@ import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
 import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import {
-  postMessage, notifyWaiters, addWaiter, removeWaiter, sanitizeName, MEMBER_ROLES,
+  postMessage, addWaiter, removeWaiter, sanitizeName, MEMBER_ROLES,
   parseBool, peekUnread, settleDelivery, ackMessages,
   editMessage, deleteMessage, toggleReaction, setDirective,
   revokeMemberSessions, revokeRoomSessions
@@ -20,7 +20,6 @@ import { deleteRoomFiles } from '../services/files.js';
 const router = Router();
 
 // Re-exported for backward compatibility (implementation lives in services/messages.js)
-export { notifyWaiters };
 
 /**
  * POST /api/rooms - Create a new room
@@ -164,13 +163,8 @@ router.post('/rooms/:token/join', (req, res) => {
 
     logger.info('Member joined', { roomId: room.id, memberId, name, role });
 
-    // Notify others only for new joins
-    notifyWaiters(room.id, [{
-      type: 'system',
-      content: `${name} joined the room`,
-      author: 'system',
-      created_at: new Date().toISOString()
-    }]);
+    // Joins are announced on the WebSocket (member_joined); the message stream only carries
+    // persisted messages, so long-polls are not woken with an id-less synthetic entry.
 
     res.status(201).json({
       member_token: memberToken,
