@@ -870,6 +870,7 @@ router.post('/', async (req, res) => {
 /**
  * GET /mcp - SSE stream for server notifications
  */
+let sseStreams = 0;
 router.get('/', (req, res) => {
   // Check if client accepts text/event-stream
   const accept = req.get('Accept') || '';
@@ -879,6 +880,11 @@ router.get('/', (req, res) => {
       acceptableMediaTypes: ['text/event-stream']
     });
   }
+  // Each stream keeps a socket and a timer: bound them (the endpoint needs no token)
+  if (sseStreams >= config.maxSseStreams) {
+    return res.status(503).json({ error: 'Too many open streams' });
+  }
+  sseStreams++;
 
   res.set({
     'Content-Type': 'text/event-stream',
@@ -894,10 +900,16 @@ router.get('/', (req, res) => {
     res.write(': keepalive\n\n');
   }, 15000);
 
-  req.on('close', () => {
+  res.on('close', () => {
+    sseStreams--;
     clearInterval(keepAlive);
   });
 });
+
+/** Open GET /mcp streams (for tests / health). */
+export function openSseStreams() {
+  return sseStreams;
+}
 
 /**
  * DELETE /mcp - End session

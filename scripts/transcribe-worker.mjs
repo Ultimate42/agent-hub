@@ -126,8 +126,11 @@ export function transcribeCmd(data, job, cmd = CMD) {
   });
 }
 
+// Hub calls: the long-poll waits 25 s server-side, anything past 40 s is a dead socket
+const HUB_TIMEOUT_MS = 40000;
 async function hub(p, options = {}) {
   return fetch(HUB_URL + p, {
+    signal: AbortSignal.timeout(HUB_TIMEOUT_MS),
     ...options,
     headers: {
       Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json',
@@ -140,7 +143,7 @@ async function handle(job) {
   log('job claimed', { id: job.id, filename: job.filename, size: job.size, attempt: job.attempt });
   let result;
   try {
-    const audio = await fetch(job.url);
+    const audio = await fetch(job.url, { signal: AbortSignal.timeout(HUB_TIMEOUT_MS) });
     if (!audio.ok) throw new Error(`download failed: ${audio.status}`);
     const data = Buffer.from(await audio.arrayBuffer());
     const text = HTTP_URL ? await transcribeHttp(data, job) : await transcribeCmd(data, job);

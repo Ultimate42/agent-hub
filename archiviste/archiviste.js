@@ -775,8 +775,11 @@ async function mainLoop() {
     try {
       await joinRoom();
     } catch (err) {
-      console.error('[ARCHIVISTE] Failed to join on startup');
+      // Exit code 1: the wrapper (start-archiviste.sh) only restarts on failure; a clean return
+      // here was read as "exited normally" and the archiviste stayed down after one hub hiccup
+      console.error(`[ARCHIVISTE] Failed to join on startup: ${err.message}`);
       await sleep(BACKOFF_CONFIG.initialDelayMs);
+      process.exitCode = 1;
       return;
     }
   }

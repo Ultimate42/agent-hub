@@ -13,8 +13,9 @@ const dbPath = process.env.HUB_DB_PATH || process.env.DB_PATH || path.join(dataD
 const backupDir = process.env.HUB_BACKUP_DIR || path.join(dataDir, 'backups');
 
 // Ensure backup directory exists
+// A backup holds every room, admin and member token in clear: owner-only directory and files
 if (!fs.existsSync(backupDir)) {
-  fs.mkdirSync(backupDir, { recursive: true });
+  fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
   console.log(`Created backup directory: ${backupDir}`);
 }
 
@@ -37,6 +38,7 @@ const backupPath = path.join(backupDir, `hub-${timestamp}.db`);
     // Use backup API (returns a Promise)
     await sourceDb.backup(backupPath);
     sourceDb.close();
+    fs.chmodSync(backupPath, 0o600);
 
     console.log(`Backup created: ${backupPath}`);
 

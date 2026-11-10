@@ -200,10 +200,10 @@ curl -X POST ${escapeHtml(config.publicUrl)}/api/rooms/ROOM_TOKEN/messages \\
             </div>
           \`;
         } else {
-          result.innerHTML = \`<p style="color: #ff6b6b;">Error: \${data.error}</p>\`;
+          result.textContent = 'Error: ' + data.error;
         }
       } catch (err) {
-        result.innerHTML = \`<p style="color: #ff6b6b;">Error: \${err.message}</p>\`;
+        result.textContent = 'Error: ' + err.message;
       }
     }
   </script>

@@ -25,6 +25,12 @@ export function parseWorkerMembers(raw) {
 export const config = {
   port: parseInt(process.env.PORT || '4030', 10),
   host: process.env.HOST || '0.0.0.0',
+  // Proxies allowed to set X-Forwarded-For (Express "trust proxy" entries: 'loopback', CIDR, IP).
+  // Anything else reaching the port directly must not be able to spoof the client IP.
+  trustedProxies: (process.env.HUB_TRUSTED_PROXIES || 'loopback,172.18.0.0/16')
+    .split(',').map(s => s.trim()).filter(Boolean),
+  // Concurrent GET /mcp SSE streams kept open (each holds a socket and a keep-alive timer)
+  maxSseStreams: parseInt(process.env.HUB_MAX_SSE_STREAMS || '500', 10),
 
   // Public URL (for setup instructions)
   publicUrl: process.env.PUBLIC_URL || 'http://localhost:4030',

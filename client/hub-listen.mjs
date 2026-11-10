@@ -46,8 +46,10 @@ if (!member && joinName) {
 }
 if (!member) die('no member token: use --member-token-file / HUB_MEMBER_TOKEN, or --join NAME with --member-token-file');
 
+// The command gets the message on stdin, never the tokens (env fallbacks are stripped from its environment)
+const childEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^HUB_(MEMBER|ROOM)_TOKEN$/.test(k)));
 const runExec = (line) => new Promise((resolve) => {
-  const p = spawn(execCmd, { shell: true, stdio: ['pipe', 'inherit', 'inherit'] });
+  const p = spawn(execCmd, { shell: true, stdio: ['pipe', 'inherit', 'inherit'], env: childEnv });
   p.on('error', () => resolve(false));
   p.on('close', (code) => resolve(code === 0));
   p.stdin.on('error', () => {});

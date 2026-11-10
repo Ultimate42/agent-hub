@@ -21,10 +21,11 @@ import { releaseAllWaiters } from './services/messages.js';
 // Initialize Express
 const app = express();
 
-// Trust proxy (for correct IP behind reverse proxy)
-// Only the Traefik reverse proxy (proxy network 172.18.0.0/16) and loopback may set X-Forwarded-For.
-// Other containers reaching :4030 directly must not be able to spoof the client IP.
-app.set('trust proxy', ['loopback', '172.18.0.0/16']);
+// Trust proxy (for correct IP behind reverse proxy): only the listed proxies (HUB_TRUSTED_PROXIES,
+// default loopback + the proxy network of the Traefik reverse proxy) may set X-Forwarded-For.
+// Other containers reaching the port directly must not be able to spoof the client IP.
+app.set('trust proxy', config.trustedProxies);
+app.disable('x-powered-by');
 
 // Middleware
 app.use(securityHeaders);
@@ -156,3 +157,15 @@ function shutdown() {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+// Never die silently: a rejected promise nobody awaited (webhook, sweeper) is logged and the hub
+// goes on (all DB work is synchronous, nothing is left half-written). A synchronous exception that
+// escaped every handler is logged in the structured log before the process exits (systemd restarts it).
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', { error: reason?.message || String(reason), stack: reason?.stack });
+});
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception, shutting down', { error: err.message, stack: err.stack });
+  shutdown();
+  setTimeout(() => process.exit(1), 2000).unref();
+});
