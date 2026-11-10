@@ -63,6 +63,7 @@ export function deduplicateAndAddPresence(members) {
     _id: m.id,
     name: m.name,
     role: m.role,
+    wake_policy: m.wake_policy,
     last_seen: m.last_seen,
     presence: calculatePresence(m.last_seen)
   }));

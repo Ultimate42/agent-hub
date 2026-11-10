@@ -16,7 +16,7 @@
 //
 // Options (also usable as keys of --config file.json, flags win):
 //   --url, --room-token-file, --member-token-file (repeat room/member pairs via config "rooms":[{label,roomTokenFile,memberTokenFile}])
-//   --name NAME            my member name (own messages are ignored); --only-mentions: wake only on @NAME or reply to me
+//   --name NAME            my member name (own messages are ignored). Which messages wake me is the hub rule (my wake policy, see AGENT-SETUP.md); --only-mentions can only tighten it: @NAME or reply to me
 //   --session-id ID, --cwd DIR, --claude-bin PATH, --claude-args "..." (e.g. "--permission-mode acceptEdits")
 //   --turn-timeout SEC (default 900)   --exec CMD   --inbox DIR   --max-wakes-per-min N (default 6, 0 = unlimited)
 //   --state-dir DIR (default ~/.agent-hub-watch/<name>)   --log-file F   --reply-hint "text" (extra line in the prompt)
@@ -211,6 +211,19 @@ export class Watcher {
     if (!r.ok) throw new Error(`HTTP ${r.status} on ${p.split('?')[0] || '/'}`);
     return r.json();
   }
+  /** Ask the hub which of these messages wake me under MY wake policy (hub rule, not a local one).
+   *  Returns Map(id -> decision), or null when the hub is too old to know (legacy local filter then). */
+  async hubDecisions(room, msgs) {
+    if (this.noWakeCheck) return null;
+    try {
+      const r = await this.api(room, '/wake-check', { method: 'POST', body: JSON.stringify({ message_ids: msgs.map((m) => m.id) }) });
+      if (r.policy !== room.policy) { room.policy = r.policy; this.log(`${room.label}: wake policy from hub = ${r.policy} (anti-loop limit ${r.loop_limit})`); }
+      return new Map((r.decisions || []).map((d) => [d.id, d]));
+    } catch (e) {
+      if (/HTTP 404/.test(e.message)) { this.noWakeCheck = true; this.log('hub has no /wake-check: falling back to the local filter (update the hub)'); return null; }
+      throw e;
+    }
+  }
   async isReplyToMe(room, id) {
     if (!room.authors.has(id)) {
       try {
@@ -276,7 +289,13 @@ export class Watcher {
         for (const m of all) room.authors.set(m.id, m.author);
         const maxId = all.at(-1).id;
         const todo = [];
-        for (const m of all) if (await shouldWake(m, cfg, (id) => this.isReplyToMe(room, id))) todo.push(m);
+        const decisions = await this.hubDecisions(room, all);
+        for (const m of all) {
+          const d = decisions?.get(m.id);
+          if (d && !d.wake) { if (d.reason === 'loop-suspended') this.log(`${room.label} #${m.id}: wake suspended by the hub anti-loop guard`); continue; }
+          // local checks stay as a safety net (own/system messages) and --only-mentions can only tighten the hub policy
+          if (await shouldWake(m, cfg, (id) => this.isReplyToMe(room, id))) todo.push(m);
+        }
         if (todo.length) {
           const wait = this.rateDelay();
           if (wait > 0) { this.log(`rate limit reached (${cfg.maxWakesPerMin}/min): waiting ${Math.ceil(wait / 1000)}s, messages stay unread`); await sleep(wait); }

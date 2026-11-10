@@ -151,6 +151,25 @@ if (!memberCols.includes('last_read_id')) {
   })();
 }
 
+// Migration (idempotent): per-member wake policy ('all' | 'humans+mentions' | 'mentions'; NULL = default
+// 'humans+mentions') and its change journal (who changed what, when).
+if (!memberCols.includes('wake_policy')) {
+  db.exec('ALTER TABLE members ADD COLUMN wake_policy TEXT');
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS wake_policy_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id INTEGER NOT NULL,
+    member_id INTEGER NOT NULL,
+    member_name TEXT NOT NULL,
+    old_policy TEXT,
+    new_policy TEXT NOT NULL,
+    changed_by TEXT NOT NULL,
+    changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_wake_policy_log_member ON wake_policy_log(member_id, id);
+`);
+
 // Migration: message edit / soft delete, and emoji reactions
 const messageCols = db.prepare('PRAGMA table_info(messages)').all().map(c => c.name);
 if (!messageCols.includes('edited_at')) {
@@ -253,7 +272,7 @@ const stmts = {
     LIMIT 1
   `),
   getMembersByRoom: db.prepare(`
-    SELECT id, name, role, permissions, status, coordination_role, last_heartbeat, last_seen, last_read_id, created_at
+    SELECT id, name, role, permissions, status, coordination_role, last_heartbeat, last_seen, last_read_id, wake_policy, created_at
     FROM members WHERE room_id = ?
   `),
   updateMemberToken: db.prepare(`
@@ -815,6 +834,29 @@ export const database = {
 
   watchdogAlertExists(messageId, toMemberId) {
     return stmts.watchdogAlertExists.get(messageId, toMemberId) !== undefined;
+  },
+
+  // Wake policy
+  setWakePolicy(member, policy, changedBy) {
+    return db.transaction(() => {
+      const old = db.prepare('SELECT wake_policy FROM members WHERE id = ?').get(member.id)?.wake_policy ?? null;
+      db.prepare('UPDATE members SET wake_policy = ? WHERE id = ?').run(policy, member.id);
+      db.prepare('INSERT INTO wake_policy_log (room_id, member_id, member_name, old_policy, new_policy, changed_by) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(member.room_id, member.id, member.name, old, policy, changedBy);
+      return old;
+    })();
+  },
+  getWakePolicyLog(memberId, limit = 20) {
+    return db.prepare('SELECT old_policy, new_policy, changed_by, changed_at FROM wake_policy_log WHERE member_id = ? ORDER BY id DESC LIMIT ?').all(memberId, limit);
+  },
+  /** Messages before `beforeId` in the room, newest first, with author role (for the anti-loop guard). */
+  getRecentForWake(roomId, beforeId, limit) {
+    return db.prepare(`
+      SELECT m.id, m.type, m.content, mem.name as author, mem.role as author_role
+      FROM messages m LEFT JOIN members mem ON m.member_id = mem.id
+      WHERE m.room_id = ? AND m.id < ? AND m.deleted_at IS NULL
+      ORDER BY m.id DESC LIMIT ?
+    `).all(roomId, beforeId, limit);
   },
 
   // Wake targets operations
