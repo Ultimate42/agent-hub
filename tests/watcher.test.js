@@ -47,7 +47,7 @@ describe('watcher contre un vrai hub (DB temporaire)', () => {
     await startHub();
     roomToken = (await api('/api/rooms', 'POST', { name: 'salon-test' })).room_token;
     for (const n of ['Agent', 'Humain', 'Pair']) {
-      tokens[n] = (await api(`/api/rooms/${roomToken}/join`, 'POST', { name: n })).member_token;
+      tokens[n] = (await api(`/api/rooms/${roomToken}/join`, 'POST', { name: n, role: n === 'Humain' ? 'human' : 'agent' })).member_token;
       fs.writeFileSync(path.join(TMP, `${n}.tok`), `member_token=${tokens[n]}\n`);
     }
     fs.writeFileSync(path.join(TMP, 'room.tok'), roomToken);
@@ -140,6 +140,24 @@ describe('watcher contre un vrai hub (DB temporaire)', () => {
     await until(() => fs.existsSync(out), 8000);
     await until(async () => (await unread('Agent')).length === 0);
     await w3.stop();
+  });
+
+  test('le kit suit la politique de réveil du hub (agent sans mention : non par défaut, oui avec all)', async () => {
+    const inbox = path.join(TMP, 'inbox-policy');
+    const w = new Watcher(mkCfg({ mode: 'file', inbox }, 'policy'), { log: () => {} });
+    await w.start();
+    const files = () => (fs.existsSync(inbox) ? fs.readdirSync(inbox).filter((f) => f.endsWith('.json')) : []);
+    await post('Pair', 'agent sans mention (defaut)');
+    await post('Humain', 'humain: reveille');
+    await until(() => files().length === 1, 8000);
+    assert.ok(!fs.readdirSync(inbox).map((f) => fs.readFileSync(path.join(inbox, f), 'utf8')).join('').includes('agent sans mention'));
+    const set = await api('/api/members/wake-policy', 'POST', { policy: 'all' }, tokens.Agent);
+    assert.equal(set.policy, 'all');
+    await post('Pair', 'agent apres policy all');
+    await until(() => files().length === 2, 8000);
+    await api('/api/members/wake-policy', 'POST', { policy: 'humans+mentions' }, tokens.Agent);
+    await until(async () => (await unread('Agent')).length === 0);
+    await w.stop();
   });
 
   test('reconnexion après redémarrage du hub + arrêt propre SIGTERM (processus réel)', async () => {

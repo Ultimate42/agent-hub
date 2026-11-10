@@ -15,6 +15,8 @@ import { clampInt } from '../utils/auth.js';
 import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import { LOOP_RULE_EN, LOOP_RULE_FR, ARRIVAL_FR, ARRIVAL_EN, MORE_UNREAD_NOTICE, MANUAL_ACK_NOTICE, NEXT_STEP, TIMEOUT_NOTICE, NEW_MESSAGES_NOTICE, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../utils/listen-loop.js';
 import { readFileSync } from 'fs';
+import { getWakePolicyInfo, setWakePolicy } from '../services/wake.js';
+import { effectivePolicy } from '../wake-policy.js';
 import { storeFile, attachmentPath } from '../services/files.js';
 import { attachmentInfo } from '../db.js';
 
@@ -218,6 +220,27 @@ const MCP_TOOLS = [
         limit: { type: 'number', description: 'Max messages. Defaults to 50, max 100.' }
       },
       required: ['member_token']
+    }
+  },
+  {
+    name: 'get_wake_policy',
+    description: 'Your wake policy in this room (all | humans+mentions | mentions), the anti-loop limit and the journal of changes. Watchers and the hub use it to decide which messages wake you.',
+    inputSchema: {
+      type: 'object',
+      properties: { member_token: { type: 'string', description: 'Your member token from join_room' } },
+      required: ['member_token']
+    }
+  },
+  {
+    name: 'set_wake_policy',
+    description: 'Set YOUR wake policy in this room: "all" (every message except yours), "humans+mentions" (default: human messages and @mentions/replies), "mentions" (only @mentions/replies). Journaled. With "all", agent-to-agent chatter is suspended after N consecutive agent messages without a human or a mention (hub limit, see get_wake_policy).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        member_token: { type: 'string', description: 'Your member token from join_room' },
+        policy: { type: 'string', enum: ['all', 'humans+mentions', 'mentions'], description: 'New wake policy' }
+      },
+      required: ['member_token', 'policy']
     }
   },
   {
@@ -653,6 +676,18 @@ async function handleToolCall(name, args, req) {
       };
     }
 
+    case 'get_wake_policy':
+    case 'set_wake_policy': {
+      const member = database.getMemberByToken(args.member_token);
+      if (!member) {
+        throw new Error('Invalid member_token: call join_room again to get a fresh token');
+      }
+      if (name === 'get_wake_policy') return getWakePolicyInfo(member);
+      const r = setWakePolicy(member, args.policy);
+      if (!r.ok) throw new Error(r.error);
+      return r;
+    }
+
     case 'list_members': {
       const member = database.getMemberByToken(args.member_token);
       if (!member) {
@@ -672,6 +707,7 @@ async function handleToolCall(name, args, req) {
         members: dedupedMembers.map(m => ({
           name: m.name,
           role: m.role,
+          wake_policy: effectivePolicy(m.wake_policy),
           last_seen: m.last_seen,
           presence: m.presence,
           unread_count: database.countUnread(member.room_id, m._id),

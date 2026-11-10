@@ -84,6 +84,10 @@ export const config = {
   // Logging
   logLevel: process.env.LOG_LEVEL || 'info',
 
+  // Wake policy: after this many consecutive agent messages in a room with no human message (and no
+  // mention of the member), 'all' wake-ups caused by agent messages are suspended
+  wakeLoopLimit: Math.max(1, parseInt(process.env.HUB_WAKE_LOOP_LIMIT || '6', 10) || 6),
+
   // Watchdog
   unreplySeconds: parseInt(process.env.HUB_UNREPLY_SECONDS || '120', 10),
   watchdogIntervalMs: parseInt(process.env.HUB_WATCHDOG_INTERVAL_MS || '15000', 10),

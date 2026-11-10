@@ -15,6 +15,7 @@ import {
 import { exportMessages, exportJson, exportMarkdown } from '../services/export.js';
 import { setRoomRetention, roomRetentionDays } from '../services/retention.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
+import { wakeCheck } from '../services/wake.js';
 import { deleteRoomFiles } from '../services/files.js';
 
 const router = Router();
@@ -413,6 +414,22 @@ router.post('/rooms/:token/ack', (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+/**
+ * POST /api/rooms/:token/wake-check {message_ids:[...]} - for each message: does it wake ME under my wake
+ * policy (and the anti-loop guard)? Used by the watcher kit so it applies the hub's rule, not its own.
+ */
+router.post('/rooms/:token/wake-check', (req, res) => {
+  const member = requireMember(req, res);
+  if (!member) return;
+  const room = database.getRoomByToken(req.params.token);
+  if (!room || room.id !== member.room_id) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  const ids = (req.body || {}).message_ids;
+  if (!Array.isArray(ids) || ids.length > 200) return res.status(400).json({ error: 'message_ids must be an array (max 200)' });
+  res.json(wakeCheck(member, ids.map(Number)));
 });
 
 /**

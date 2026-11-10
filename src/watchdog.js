@@ -4,8 +4,8 @@ import { logger } from './utils/logger.js';
 import { appendFileSync } from 'fs';
 import { generateToken } from './utils/tokens.js';
 import { publishMessage } from './services/messages.js';
-import { isMentioned } from './utils/mentions.js';
 import { parseDbTime } from './utils/time.js';
+import { decideWake } from './wake-policy.js';
 
 const LEGACY_WATCHDOG_TOKEN = 'system-watchdog-token';
 export { parseDbTime };
@@ -16,7 +16,6 @@ let db = null;
 // Prepare statements once on init
 let stmt_getRooms = null;
 let stmt_getMessagesByRoom = null;
-let stmt_getReplyToAuthor = null;
 
 /**
  * Initialize watchdog database access (call after database.js initializes)
@@ -31,32 +30,6 @@ export function initWatchdogDb(dbInstance) {
     WHERE m.room_id = ?
     ORDER BY m.created_at ASC
   `);
-  stmt_getReplyToAuthor = db.prepare(`
-    SELECT mem.id FROM messages m
-    LEFT JOIN members mem ON m.member_id = mem.id
-    WHERE m.id = ?
-  `);
-}
-
-/**
- * Check if a message is addressed to a member
- * (a) content contains "@MemberName" (case-insensitive)
- * (b) reply_to points to member's message, unless the message @mentions other members only
- *     (a reply that names someone else is addressed to them, not to the replied-to author)
- */
-function isMessageAddressedToMember(message, memberId, memberName, memberNames = []) {
-  if (isMentioned(message.content, memberName)) {
-    return true;
-  }
-
-  if (message.reply_to) {
-    const replyToMsg = stmt_getReplyToAuthor.get(message.reply_to);
-    if (replyToMsg?.id === memberId) {
-      return !memberNames.some(n => n !== memberName && isMentioned(message.content, n));
-    }
-  }
-
-  return false;
 }
 
 /**
@@ -115,8 +88,13 @@ export function startWatchdog() {
         const messages = database.getAllMessages(roomId);
         if (messages.length === 0) continue;
 
-        // For each message, check if it's addressed to someone and unresponded
-        for (const msg of messages) {
+        const roleById = new Map(members.map(m => [m.id, m.role]));
+        const authorById = new Map(messages.map(m => [m.id, m.member_id]));
+        const memberNames = members.map(m => m.name);
+
+        // For each message, check if it wakes someone (their wake policy) and is unresponded
+        for (let mi = 0; mi < messages.length; mi++) {
+          const msg = messages[mi];
           // Skip system and watchdog messages
           if (msg.author === 'HubWatchdog' || msg.author === 'system' || msg.author === 'Transcription') continue;
           if (!msg.member_id || msg.deleted_at) continue;
@@ -136,8 +114,24 @@ export function startWatchdog() {
             if (member.id === msg.member_id) continue; // Don't check author
             if (config.watchdogIgnore.includes(member.name.trim().toLowerCase())) continue; // HUB_WATCHDOG_IGNORE
 
-            if (!isMessageAddressedToMember(msg, member.id, member.name, members.map(m => m.name))) {
-              continue; // Not addressed to this member
+            const recent = [];
+            for (let j = mi - 1; j >= 0 && recent.length < config.wakeLoopLimit + 2; j--) {
+              const p = messages[j];
+              if (p.deleted_at) continue;
+              recent.push({ author: p.author, author_role: roleById.get(p.member_id), content: p.content, type: p.type });
+            }
+            const decision = decideWake({
+              policy: member.wake_policy,
+              member: { id: member.id, name: member.name },
+              message: {
+                author_id: msg.member_id, author: msg.author, author_role: roleById.get(msg.member_id),
+                content: msg.content, type: msg.type,
+                reply_to_member_id: msg.reply_to ? authorById.get(msg.reply_to) ?? null : null
+              },
+              recent, memberNames, loopLimit: config.wakeLoopLimit
+            });
+            if (!decision.wake) {
+              continue; // Does not wake this member (policy, own message or loop guard)
             }
 
             // Check if member has replied yet

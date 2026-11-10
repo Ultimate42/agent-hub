@@ -5,6 +5,7 @@ import { logger } from '../utils/logger.js';
 import path_ from 'path';
 import { isValidWakeFilePath } from '../utils/paths.js';
 const { normalize } = path_;
+import { getWakePolicyInfo, setWakePolicy } from '../services/wake.js';
 import { isDirectLocalRequest, isPrivateHost } from '../utils/net.js';
 
 const router = Router();
@@ -146,5 +147,25 @@ router.delete('/members/wake-target', (req, res) => {
     res.status(500).json({ error: 'Failed to delete wake target' });
   }
 });
+
+/**
+ * GET /api/members/wake-policy - Your wake policy (all | humans+mentions | mentions), the anti-loop limit
+ * and the journal of changes. POST/PUT {policy} changes it (a member only changes its own policy).
+ */
+router.get('/members/wake-policy', (req, res) => {
+  const member = requireMember(req, res);
+  if (!member) return;
+  res.json(getWakePolicyInfo(member));
+});
+
+function putWakePolicy(req, res) {
+  const member = requireMember(req, res);
+  if (!member) return;
+  const r = setWakePolicy(member, (req.body || {}).policy);
+  if (!r.ok) return res.status(r.status).json({ error: r.error });
+  res.json(r);
+}
+router.post('/members/wake-policy', putWakePolicy);
+router.put('/members/wake-policy', putWakePolicy);
 
 export default router;

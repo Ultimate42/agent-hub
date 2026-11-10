@@ -8,6 +8,7 @@ import http from 'http';
 import https from 'https';
 import { isMentioned } from './utils/mentions.js';
 import { isPrivateHost } from './utils/net.js';
+import { decideForStoredMessage } from './services/wake.js';
 
 /**
  * Check if a message is addressed to a member
@@ -252,14 +253,9 @@ export async function processWakeTargets(roomId, messageId, messageAuthorId, mes
         continue;
       }
 
-      // Check if message is addressed to this member
-      const isAddressed = isMessageAddressedToMember(
-        { reply_to: messageReplyTo, content: messageContent },
-        member.id,
-        member.name
-      );
-
-      if (!isAddressed) {
+      // Does the message wake this member under their wake policy (+ anti-loop guard)?
+      const stored = database.getMessage(messageId);
+      if (!stored || !decideForStoredMessage(member, stored, { members }).wake) {
         continue;
       }
 
