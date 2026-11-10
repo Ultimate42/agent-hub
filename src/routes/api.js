@@ -7,9 +7,10 @@ import { logger } from '../utils/logger.js';
 import { checkMemberContext } from '../utils/security-check.js';
 import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import {
-  postMessage, notifyWaiters, waitingClients, sanitizeName, MEMBER_ROLES,
+  postMessage, notifyWaiters, addWaiter, removeWaiter, sanitizeName, MEMBER_ROLES,
   parseBool, peekUnread, settleDelivery, ackMessages,
-  editMessage, deleteMessage, toggleReaction, setDirective
+  editMessage, deleteMessage, toggleReaction, setDirective,
+  revokeMemberSessions, revokeRoomSessions
 } from '../services/messages.js';
 import { exportMessages, exportJson, exportMarkdown } from '../services/export.js';
 import { setRoomRetention, roomRetentionDays } from '../services/retention.js';
@@ -20,8 +21,6 @@ const router = Router();
 
 // Re-exported for backward compatibility (implementation lives in services/messages.js)
 export { notifyWaiters };
-
-const MAX_LONGPOLLS_PER_ROOM = 200;
 
 /**
  * POST /api/rooms - Create a new room
@@ -89,6 +88,7 @@ router.delete('/rooms/:token', (req, res) => {
 
   database.deleteRoom(room.id);
   deleteRoomFiles(room.id);
+  revokeRoomSessions(room.id);
   logger.info('Room deleted', { roomId: room.id });
 
   res.json({ success: true });
@@ -124,6 +124,7 @@ router.post('/rooms/:token/join', (req, res) => {
       // Member exists: update token and role, invalidate old token
       const newToken = generateToken(config.tokenLength);
       database.updateMemberToken(existingMember.id, newToken);
+      revokeMemberSessions({ id: existingMember.id, room_id: room.id }, 'Token rotated by a new join');
 
       // Update role if provided
       if (role && role !== 'agent') {
@@ -459,43 +460,42 @@ router.get('/rooms/:token/messages/wait', (req, res) => {
   }
 
   // Set up long-poll waiting
-  if ((waitingClients.get(room.id)?.size || 0) >= MAX_LONGPOLLS_PER_ROOM) {
-    return res.status(429).json({ error: 'Too many concurrent long-polls for this room' });
-  }
-  if (!waitingClients.has(room.id)) {
-    waitingClients.set(room.id, new Set());
-  }
-
   const client = {
     res,
     since,
+    memberId: member.id,
     timeout: setTimeout(() => {
-      const set = waitingClients.get(room.id);
-      set?.delete(client);
-      if (set && set.size === 0) waitingClients.delete(room.id);
+      removeWaiter(room.id, client);
       if (!res.headersSent) respond([]);
-    }, timeout)
+    }, timeout),
+    // Session revoked while waiting (token rotated, member left, room deleted)
+    release: (error) => {
+      if (!res.headersSent) res.status(403).json({ error });
+    }
   };
   if (!since) {
     // Cursor mode: re-read the unread backlog from the DB when something is published
     // (own messages are not unread, so they do not wake the waiter).
     client.tryDeliver = (force) => {
-      if (res.headersSent) return true;
+      if (res.headersSent) { removeWaiter(room.id, client); return true; }
       const msgs = peekUnread(member, config.maxMessagesPerRequest);
       if (msgs.length === 0 && !force) return false;
+      clearTimeout(client.timeout);
+      removeWaiter(room.id, client);
       respond(msgs);
       return true;
     };
   }
 
-  waitingClients.get(room.id).add(client);
+  if (!addWaiter(room.id, client)) {
+    clearTimeout(client.timeout);
+    return res.status(429).json({ error: 'Too many concurrent long-polls for this room' });
+  }
 
   // Clean up on disconnect
   req.on('close', () => {
     clearTimeout(client.timeout);
-    const set = waitingClients.get(room.id);
-    set?.delete(client);
-    if (set && set.size === 0) waitingClients.delete(room.id);
+    removeWaiter(room.id, client);
   });
 });
 
@@ -554,6 +554,7 @@ router.delete('/rooms/:token/leave', (req, res) => {
   }
 
   database.deleteMember(member.id);
+  revokeMemberSessions(member, 'Member left the room');
 
   logger.info('Member left', { roomId: room.id, name: member.name });
 

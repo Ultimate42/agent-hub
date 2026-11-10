@@ -3,11 +3,26 @@ import { database } from '../db.js';
 import { compareTokens, maskToken } from '../utils/tokens.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
-import { postMessage, setWsBroadcaster } from '../services/messages.js';
+import { postMessage, setWsBroadcaster, setWsRevoker } from '../services/messages.js';
 import { checkRateLimit } from '../utils/security.js';
 
 // Track connected clients by room
-const roomClients = new Map(); // roomId -> Set<{ws, member}>
+const roomClients = new Map(); // roomId -> Set<{ws, member, token, alive}>
+
+// Hard cap of live sockets per room (a room has at most config.maxMembersPerRoom members)
+const MAX_WS_PER_ROOM = 200;
+
+/** Close the sockets of a room whose member matches the predicate (token rotated, member left, room deleted). */
+function closeRoomClients(roomId, predicate, code, reason) {
+  const clients = roomClients.get(roomId);
+  if (!clients) return;
+  for (const client of [...clients]) {
+    if (!predicate(client.member)) continue;
+    clients.delete(client);
+    try { client.ws.close(code, reason); } catch { /* already closed */ }
+  }
+  if (clients.size === 0) roomClients.delete(roomId);
+}
 
 /**
  * Set up WebSocket server on existing HTTP server
@@ -21,6 +36,8 @@ export function setupWebSocket(server) {
 
   // Make REST / MCP / watchdog messages reach WebSocket clients too
   setWsBroadcaster((roomId, message) => broadcastToRoom(roomId, message));
+  // Let token rotation / leave / room deletion close the sockets they invalidate
+  setWsRevoker(closeRoomClients);
 
   wss.on('connection', (ws, req) => {
     // Extract token from query string
@@ -51,6 +68,10 @@ export function setupWebSocket(server) {
     // Add to room clients
     if (!roomClients.has(member.room_id)) {
       roomClients.set(member.room_id, new Set());
+    }
+    if (roomClients.get(member.room_id).size >= MAX_WS_PER_ROOM) {
+      ws.close(4029, 'Too many connections for this room');
+      return;
     }
     const client = { ws, member, token, alive: true };
     ws.on('pong', () => { client.alive = true; });
@@ -103,12 +124,12 @@ export function setupWebSocket(server) {
     });
 
     // Send welcome message
-    ws.send(JSON.stringify({
+    safeSend(ws, {
       type: 'connected',
       room_name: database.getRoomById(member.room_id)?.name,
       your_name: member.name,
       unread_count: database.countUnread(member.room_id, member.id)
-    }));
+    });
   });
 
   // Ping clients periodically; terminate the ones that never answered the last ping

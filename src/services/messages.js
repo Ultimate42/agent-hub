@@ -14,13 +14,80 @@ const RESERVED_NAMES = ['hubwatchdog', 'system', 'transcription'];
 // Realtime fan-out: long-poll waiters + WebSocket clients
 // ---------------------------------------------------------------------------
 
-// Long-poll waiting clients: Map<roomId, Set<{res, since, timeout}>>
+// Long-poll waiting clients: Map<roomId, Set<waiter>>
+// waiter = { memberId, timeout, res?, since?, tryDeliver?(force) -> bool, release?(error) }
+//   - REST "since" mode: res.json({messages}) with the published messages
+//   - cursor mode (REST or MCP): tryDeliver re-reads the member's unread backlog from the DB
+//   - release(error): the session is no longer valid (token rotated, member left, room deleted)
 export const waitingClients = new Map();
 
-// WebSocket broadcaster, registered by ws/handler.js (avoids a circular import)
+// Hard cap of concurrent waiters per room (REST long-polls + MCP wait_for_messages)
+export const MAX_WAITERS_PER_ROOM = 200;
+
+/** Register a waiter on a room; returns false when the room is full. */
+export function addWaiter(roomId, waiter) {
+  const set = waitingClients.get(roomId);
+  if ((set?.size || 0) >= MAX_WAITERS_PER_ROOM) return false;
+  if (!set) waitingClients.set(roomId, new Set([waiter]));
+  else set.add(waiter);
+  return true;
+}
+
+export function removeWaiter(roomId, waiter) {
+  const set = waitingClients.get(roomId);
+  if (!set) return;
+  set.delete(waiter);
+  if (set.size === 0) waitingClients.delete(roomId);
+}
+
+// WebSocket hooks, registered by ws/handler.js (avoids a circular import)
 let wsBroadcaster = null;
+let wsRevoker = null;
 export function setWsBroadcaster(fn) {
   wsBroadcaster = fn;
+}
+/** fn(roomId, predicate(member) -> bool, code, reason): closes the matching WebSocket clients. */
+export function setWsRevoker(fn) {
+  wsRevoker = fn;
+}
+
+/** Release the waiters matching the predicate with an error (their session is gone). */
+function releaseWaiters(roomId, predicate, error) {
+  const clients = waitingClients.get(roomId);
+  if (!clients) return;
+  for (const client of [...clients]) {
+    if (!predicate(client)) continue;
+    clearTimeout(client.timeout);
+    clients.delete(client);
+    try { client.release?.(error); } catch (err) {
+      logger.warn('Failed to release waiter', { error: err.message });
+    }
+  }
+  if (clients.size === 0) waitingClients.delete(roomId);
+}
+
+/**
+ * A member's token was rotated (rejoin) or the member left: every live session that used the
+ * previous token (WebSocket, long-poll, MCP wait) is closed. Without this, a rejoin "invalidated"
+ * the old token for new requests only, while old connections kept receiving the room's messages.
+ */
+export function revokeMemberSessions(member, reason = 'Token invalidated') {
+  releaseWaiters(member.room_id, c => c.memberId === member.id, reason);
+  try {
+    wsRevoker?.(member.room_id, m => m.id === member.id, 4003, reason);
+  } catch (err) {
+    logger.warn('WebSocket revoke failed', { error: err.message });
+  }
+}
+
+/** The room was deleted: close every session on it. */
+export function revokeRoomSessions(roomId, reason = 'Room deleted') {
+  releaseWaiters(roomId, () => true, reason);
+  try {
+    wsRevoker?.(roomId, () => true, 4004, reason);
+  } catch (err) {
+    logger.warn('WebSocket revoke failed', { error: err.message });
+  }
 }
 
 /**
@@ -31,14 +98,17 @@ export function notifyWaiters(roomId, messages) {
   if (!clients || clients.size === 0) return;
 
   for (const client of [...clients]) {
-    // Cursor-mode waiters read their own unread backlog from the DB (excluding their own messages);
-    // they only resolve when something is really unread, or when released (empty list = shutdown).
-    if (client.tryDeliver && !client.tryDeliver(messages.length === 0)) continue;
-    clearTimeout(client.timeout);
-    clients.delete(client);
     try {
-      if (client.tryDeliver) { /* already answered by tryDeliver */ }
-      else if (!client.res.headersSent) client.res.json({ messages });
+      // Cursor-mode waiters (REST without since, MCP) read their own unread backlog from the DB
+      // (own messages excluded); they only resolve when something is really unread, or when
+      // forced (empty list = shutdown). They unregister themselves.
+      if (client.tryDeliver) {
+        client.tryDeliver(messages.length === 0);
+        continue;
+      }
+      clearTimeout(client.timeout);
+      clients.delete(client);
+      if (!client.res.headersSent) client.res.json({ messages });
     } catch (err) {
       logger.warn('Failed to notify long-poll waiter', { error: err.message });
     }

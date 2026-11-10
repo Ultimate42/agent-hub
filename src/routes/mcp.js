@@ -5,11 +5,13 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import {
   postMessage, sanitizeName, MEMBER_ROLES, parseBool, peekUnread, settleDelivery, ackMessages,
-  editMessage, deleteMessage, toggleReaction, setDirective
+  editMessage, deleteMessage, toggleReaction, setDirective,
+  revokeMemberSessions, addWaiter, removeWaiter
 } from '../services/messages.js';
 import { exportMessages, exportMarkdown } from '../services/export.js';
 import { setRoomRetention, roomRetentionDays } from '../services/retention.js';
 import { checkRoomCreationLimit } from '../utils/security.js';
+import { clampInt } from '../utils/auth.js';
 import { deduplicateAndAddPresence, countPendingUnreplied } from '../utils/members.js';
 import { LOOP_RULE_EN, LOOP_RULE_FR, ARRIVAL_FR, ARRIVAL_EN, MORE_UNREAD_NOTICE, MANUAL_ACK_NOTICE, NEXT_STEP, TIMEOUT_NOTICE, NEW_MESSAGES_NOTICE, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../utils/listen-loop.js';
 import { readFileSync } from 'fs';
@@ -346,6 +348,7 @@ async function handleToolCall(name, args, req) {
         // Member exists: update token and role, invalidate old token
         const newToken = generateToken(config.tokenLength);
         database.updateMemberToken(existingMember.id, newToken);
+        revokeMemberSessions({ id: existingMember.id, room_id: room.id }, 'Token rotated by a new join');
 
         if (role !== 'agent') {
           database.updateMemberRole(existingMember.id, role);
@@ -578,33 +581,50 @@ async function handleToolCall(name, args, req) {
         return found(existing);
       }
 
-      // Wait for new messages
-      return new Promise((resolve) => {
-        let resolved = false;
-        const timeoutHandle = setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            clearInterval(checkHandle);
-            // Last look: a message posted since the previous 500 ms poll must be delivered now,
-            // not only counted in unread_remaining of an empty "timeout" answer
+      // Wait for new messages: a waiter on the room, woken by publishMessage (no DB polling).
+      // The connector may drop the connection before we answer: the waiter then leaves on the
+      // response 'close' (req 'close' fires as soon as the POST body is consumed, not on disconnect).
+      const resp = req.res;
+      return new Promise((resolve, reject) => {
+        let done = false;
+        const finish = (fn) => {
+          if (done) return true;
+          done = true;
+          clearTimeout(waiter.timeout);
+          removeWaiter(member.room_id, waiter);
+          resp.off('close', onClose);
+          fn();
+          return true;
+        };
+        const waiter = {
+          memberId: member.id,
+          // Called on every publication in the room (and with force on shutdown): deliver if something is there
+          tryDeliver: (force) => {
+            if (done) return true;
+            const msgs = fetchMsgs();
+            if (msgs.length === 0 && !force) return false;
+            return finish(() => resolve(msgs.length > 0 ? found(msgs) : timedOut()));
+          },
+          release: (error) => finish(() => reject(new Error(`Invalid member_token (${error}): call join_room again to get a fresh token`))),
+          timeout: setTimeout(() => {
+            // Last look before answering "nothing": a message published between the check and the
+            // registration must be delivered now, not only counted in unread_remaining
             const late = fetchMsgs();
-            if (late.length > 0) return resolve(found(late));
-            const info = settleDelivery(member, [], { since, autoAck });
-            resolve({ messages: [], last_id: since || info.last_read_id, ...info, next_step: TIMEOUT_NOTICE });
-          }
-        }, timeout);
-
-        const checkHandle = setInterval(() => {
-          if (!resolved) {
-            const newMsgs = fetchMsgs();
-            if (newMsgs.length > 0) {
-              resolved = true;
-              clearInterval(checkHandle);
-              clearTimeout(timeoutHandle);
-              resolve(found(newMsgs));
-            }
-          }
-        }, 500);
+            finish(() => resolve(late.length > 0 ? found(late) : timedOut()));
+          }, timeout)
+        };
+        const timedOut = () => {
+          const info = settleDelivery(member, [], { since, autoAck });
+          return { messages: [], last_id: since || info.last_read_id, ...info, next_step: TIMEOUT_NOTICE };
+        };
+        const onClose = () => finish(() => resolve(timedOut()));
+        if (!addWaiter(member.room_id, waiter)) {
+          clearTimeout(waiter.timeout);
+          return reject(new Error('Too many concurrent wait_for_messages for this room'));
+        }
+        resp.on('close', onClose);
+        // A message may have been published while the waiter was being registered
+        waiter.tryDeliver(false);
       });
     }
 
@@ -678,7 +698,7 @@ async function handleToolCall(name, args, req) {
         throw new Error('Invalid member_token: call join_room again to get a fresh token');
       }
 
-      const limit = Math.min(args.limit || 20, 100);
+      const limit = clampInt(args.limit, 20, 1, 100);
       const history = database.getDirectiveHistory(member.room_id, limit);
 
       return { history };
@@ -691,6 +711,7 @@ async function handleToolCall(name, args, req) {
       }
 
       database.deleteMember(member.id);
+      revokeMemberSessions(member, 'Member left the room');
 
       return { success: true };
     }

@@ -2,7 +2,7 @@ import { database } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { parseDbTime } from '../utils/time.js';
-import { publishMessage } from './messages.js';
+import { publishMessage, revokeRoomSessions } from './messages.js';
 import { deleteRoomFiles } from './files.js';
 import { getOrCreateWatchdogMember } from '../watchdog.js';
 
@@ -64,6 +64,7 @@ export function runRetention(now = Date.now()) {
       if (warnedAt && warnedAt > last && now >= warnedAt + Math.min(config.retentionWarnMs, days * DAY_MS / 2)) {
         database.deleteRoom(room.id);
         deleteRoomFiles(room.id);
+        revokeRoomSessions(room.id);
         deleted.push(room.id);
         logger.info('Room deleted for inactivity', { roomId: room.id, days });
         continue;
