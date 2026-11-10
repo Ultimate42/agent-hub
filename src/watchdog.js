@@ -5,7 +5,7 @@ import { appendFileSync } from 'fs';
 import { generateToken } from './utils/tokens.js';
 import { publishMessage } from './services/messages.js';
 import { parseDbTime } from './utils/time.js';
-import { decideWake } from './wake-policy.js';
+import { decideWake, expectsReply, inAlertWindow } from './wake-policy.js';
 
 const LEGACY_WATCHDOG_TOKEN = 'system-watchdog-token';
 export { parseDbTime };
@@ -105,8 +105,8 @@ export function startWatchdog() {
           const nowTime = Date.now();
           const elapsedSeconds = (nowTime - msgTime) / 1000;
 
-          if (elapsedSeconds < config.unreplySeconds) {
-            continue; // Not old enough yet
+          if (!inAlertWindow(elapsedSeconds, config.unreplySeconds, config.watchdogMaxAgeSeconds)) {
+            continue; // Not old enough yet, or too old (history): never alert
           }
 
           // Check each member to see if this message is addressed to them
@@ -133,6 +133,12 @@ export function startWatchdog() {
             if (!decision.wake) {
               continue; // Does not wake this member (policy, own message or loop guard)
             }
+            // Being woken is not being asked: only a mention, a direct reply or a sole-recipient human message
+            if (!expectsReply({
+              message: { author_id: msg.member_id, author: msg.author, author_role: roleById.get(msg.member_id),
+                content: msg.content, reply_to_member_id: msg.reply_to ? authorById.get(msg.reply_to) ?? null : null },
+              member, members
+            })) continue;
 
             // Check if member has replied yet
             const hasReply = messages.some(m =>

@@ -91,6 +91,9 @@ export const config = {
   // Watchdog
   unreplySeconds: parseInt(process.env.HUB_UNREPLY_SECONDS || '120', 10),
   watchdogIntervalMs: parseInt(process.env.HUB_WATCHDOG_INTERVAL_MS || '15000', 10),
+  // Never alert about a message older than this (seconds, default 24 h; 0 = no limit): no flood of
+  // alerts about history after a restart
+  watchdogMaxAgeSeconds: Math.max(0, parseInt(process.env.HUB_WATCHDOG_MAX_AGE || '86400', 10) || 0),
   // Members never alerted about (comma-separated names, case-insensitive), e.g. humans
   watchdogIgnore: (process.env.HUB_WATCHDOG_IGNORE || '')
     .split(',').map(n => n.trim().toLowerCase()).filter(Boolean),

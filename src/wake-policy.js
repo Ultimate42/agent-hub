@@ -81,3 +81,28 @@ export function decideWake({ policy, member, message, recent = [], memberNames =
   if (streak > limit) return { wake: false, reason: 'loop-suspended', streak };
   return { wake: true, reason: 'all', streak };
 }
+
+/**
+ * Did `message` genuinely wait for an answer from `member`? (watchdog: "no reply" alerts)
+ * A wake-up is not enough: with humans+mentions every human message wakes every member, which is no
+ * request for a reply. A reply is expected only when
+ *  - the member is explicitly mentioned or the message replies directly to one of their messages, or
+ *  - a human posts in a room where the member is the only possible non-human recipient.
+ * Hub-internal members (system, HubWatchdog, Transcription, auto-*) and observers never owe a reply.
+ * `members` = room members {id, name, role}; `message` as for decideWake.
+ */
+export function expectsReply({ message, member, members = [] }) {
+  if (isSystemAuthor(member.name) || String(member.role || '').toLowerCase() === 'observer') return false;
+  if (isSystemAuthor(message.author)) return false;
+  if (isAddressed(message, member, members.map(m => m.name))) return true;
+  if (!isHumanRole(message.author_role)) return false;
+  const recipients = members.filter(m => m.id !== message.author_id && !isHumanRole(m.role)
+    && String(m.role || '').toLowerCase() !== 'observer' && !isSystemAuthor(m.name));
+  return recipients.length === 1 && recipients[0].id === member.id;
+}
+
+/** Old enough to be worth an alert, but not so old that it is history (e.g. after a restart). */
+export function inAlertWindow(elapsedSeconds, minSeconds, maxSeconds) {
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds < minSeconds) return false;
+  return !(Number.isFinite(maxSeconds) && maxSeconds > 0 && elapsedSeconds > maxSeconds);
+}
