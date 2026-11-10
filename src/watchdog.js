@@ -169,8 +169,11 @@ export function startWatchdog() {
             }
 
             // Post alert message
-            const lastSeen = member.last_seen ? ` (last seen ${member.last_seen})` : '';
-            const alertContent = `No reply from ${member.name} to message #${msg.id} after ${Math.floor(elapsedSeconds)}s${lastSeen}. ${msg.author}: ${member.name} may be asleep; the user has been alerted if the hub is configured with a notifier.`;
+            // French, readable aloud: Alice reads these alerts in his rooms
+            const seenAt = member.last_seen ? new Date(parseDbTime(member.last_seen)).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', minute: '2-digit' }) : null;
+            const mins = Math.max(1, Math.round(elapsedSeconds / 60));
+            const lastSeen = seenAt ? `, dernière activité à ${seenAt}` : '';
+            const alertContent = `${member.name} n'a pas encore répondu au message #${msg.id} de ${msg.author} (${mins} min d'attente${lastSeen}). Il est peut-être occupé ou endormi.`;
 
             // Create alert as HubWatchdog
             const alertMsgId = database.createMessage(

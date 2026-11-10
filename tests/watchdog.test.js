@@ -124,7 +124,7 @@ describe('Watchdog Tests', () => {
     assert.ok(watchdogAlert, 'Watchdog should post alert');
     assert.ok(watchdogAlert.content.includes(`message #${msgId}`), 'Alert should mention message ID');
     assert.ok(watchdogAlert.content.includes('Agent2'), 'Alert should mention Agent2');
-    assert.ok(watchdogAlert.content.includes('may be asleep'), 'Alert should indicate member may be asleep');
+    assert.ok(watchdogAlert.content.includes('pas encore répondu'), 'Alert should indicate no reply yet');
   });
 
   test('No alert for members listed in HUB_WATCHDOG_IGNORE (case-insensitive)', async () => {
@@ -168,7 +168,7 @@ describe('Watchdog Tests', () => {
     assert.strictEqual(alert, undefined, 'Reacted message must not trigger an alert');
   });
 
-  test('No "may be asleep" alert when the addressee received the message', async () => {
+  test('No watchdog alert when the addressee received the message', async () => {
     const { data: msgRes } = await request(`/api/rooms/${roomToken}/messages`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${member1Token}` },
