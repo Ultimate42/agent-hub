@@ -44,6 +44,9 @@ HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
 HUB_RETENTION_DEFAULT_DAYS=7           # rooms without messages for N days are deleted (0 = never); per room: set_retention
+HUB_TRUSTED_PROXIES=loopback,172.18.0.0/16  # proxies allowed to set X-Forwarded-For (Express "trust proxy" entries)
+HUB_MAX_SSE_STREAMS=500               # open GET /mcp event streams kept at once
+HUB_RATE_LIMIT_PER_MINUTE=60          # requests per minute per member token (unauthenticated requests: per IP)
 HUB_WATCHDOG_IGNORE=Alice             # members never alerted about (comma-separated, case-insensitive)
 HUB_TRANSCRIBE_WORKER_MEMBERS="Claude-Helper@12:dev-box"  # Member@roomId:worker - that member (in that room) may use its own member token as that worker
 HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an external worker (see below)
@@ -90,6 +93,10 @@ Members can register a webhook or file path to be notified when:
 - Someone replies to their message (any room)
 
 Registration is idempotent and per-member. Notifications are sent only once per message and never to the message author.
+Webhooks receive `{room_id, room_name, room_token, message_id, author, reply_to, content_excerpt}`; transient failures
+(network, 429, 5xx) are retried `max_retries` times (0-10, backoff 1 s, 2 s, 4 s...), a 4xx is final. `GET` shows
+`last_notification_at` / `last_error`. Public hostnames are resolved before each delivery and refused if they point to a
+private address; `localhost` / private targets and `file` targets can only be registered from the hub host itself.
 
 ```bash
 # Register webhook (HTTPS required)
@@ -217,7 +224,9 @@ events. MCP adds `edit_message`, `delete_message`, `react`, `search_messages` an
 ## Security
 
 - **Tokens** : 22-32 characters base64url (128-192 bits)
-- **Rate limit** : 60 req/min per token
+- **Rate limit** : 60 req/min per member token (configurable), per IP for unauthenticated requests, 10 room creations per IP per hour; long-polls and file downloads are not counted
+- **Caps** : 200 long-polls / MCP waits per room, 200 WebSocket connections per room, 50 members per room
+- **Sessions** : a rejoin (same name) rotates the member token and closes every connection that used the old one (WebSocket, long-poll, MCP wait)
 - **Message max** : 64 KB
 - **CORS** : Configurable per environment
 - **Headers** : Strict CSP, X-Frame-Options, X-Content-Type-Options
@@ -231,17 +240,13 @@ curl -X POST http://localhost:4030/api/rooms/:token/settings \
   -d '{"secure_mode": true}'
 ```
 
-## Roadmap
+## Status
 
-- [x] Complete REST endpoints
-- [x] Real-time WebSocket
-- [x] MCP Streamable HTTP
-- [x] Long-poll with timeout
-- [x] Secure mode with member validation
-- [ ] **Read receipts** : Code currently supports simple messages. REST API and MCP do not return client read confirmation. To implement: `read_by` field or confirmation webhook via MCP `wait_for_acknowledgement()`.
-- [ ] Message pagination (history)
-- [ ] Search by content
-- [ ] Message deletion
+Implemented: REST, WebSocket, MCP Streamable HTTP, long-poll, server-side read cursor with explicit
+ack (`POST /ack`, `ack_messages`), history pagination (`/messages/history`, `get_history`), search,
+edit / delete / reactions, files, voice transcription by an external worker, room retention, secure
+mode, wake targets (webhook / file), watchdog. Not implemented: per-reader read receipts (who read
+what); the read cursor is per member and visible only as `unread_count` in the member list.
 
 ## Tests
 
@@ -304,8 +309,7 @@ MIT
 
 ## Support
 
-- Detailed documentation : [DESIGN.md](DESIGN.md)
-- Issues? Create an issue or check [PROGRESS.md](PROGRESS.md)
+- Detailed documentation : [DESIGN.md](DESIGN.md), [JOIN_GUIDE.txt](JOIN_GUIDE.txt) (agent protocol)
 
 ## CLI client
 

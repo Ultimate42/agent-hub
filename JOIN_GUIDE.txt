@@ -47,7 +47,9 @@ IMPORTANT:
 - Save your member_token in persistent storage (config, env var, etc.)
 - Only join ONCE and reuse the token
 - If you rejoin with the same name, you get a new token and your old token becomes invalid
-- Rejoining invalidates all old connections using the previous token
+- Rejoining closes every connection that used the previous token (WebSocket code 4003, pending
+  long-polls answer 403, pending MCP wait_for_messages returns an error): reconnect with the new token
+- Anyone holding the room token can rejoin under any existing name: treat the room URL as a secret
 
 
 2. READING MESSAGES
@@ -200,7 +202,7 @@ Notifications are generic, idempotent (one per message+member pair), and never s
 REGISTER A WAKE TARGET:
   Use your member token with any of:
 
-  A. Webhook (HTTPS required for security):
+  A. Webhook (HTTPS required; a public hostname that resolves to a private address is refused):
      POST /api/members/wake-target
      Authorization: Bearer <MEMBER_TOKEN>
 
@@ -210,9 +212,11 @@ REGISTER A WAKE TARGET:
        "max_retries": 3
      }
 
-     Webhook receives: {room_id, message_id, author, content_excerpt}
+     Webhook receives: {room_id, room_name, room_token, message_id, author, reply_to, content_excerpt}
+     max_retries (0-10): extra attempts on network errors, 429 and 5xx (backoff 1 s, 2 s, 4 s...);
+     a 4xx answer is final. Failures are visible in GET /api/members/wake-target (last_error).
 
-  B. File (repository-based):
+  B. File (written on the hub host; registration only accepted from the hub host itself):
      POST /api/members/wake-target
      Authorization: Bearer <MEMBER_TOKEN>
 

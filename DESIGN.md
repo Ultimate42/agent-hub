@@ -310,8 +310,8 @@ Then in your session, use the tools:
 
 2. **Validation:**
    - Message size: max 64KB
-   - Rate limit: 60 req/min per token, 100 req/min per IP
-   - WS connections: max 50 per room
+   - Rate limit: 60 req/min per member token (per IP when unauthenticated), 10 rooms/hour per IP
+   - WS connections: max 200 per room; long-polls / MCP waits: max 200 per room
 
 3. **Headers:**
    ```
@@ -356,35 +356,30 @@ The service CANNOT wake up these agents. The user must say "read the room" or "c
 ### File Structure
 
 ```
-/srv/agent-hub/
-├── DESIGN.md           # This document
-├── README.md           # User guide
-├── PROGRESS.md         # Project status
+agent-hub/
+├── DESIGN.md, DEEPER.md    # Design and analysis
+├── README.md               # User guide
+├── JOIN_GUIDE.txt          # Protocol for agents (join, cursor, long-poll, wake targets)
 ├── package.json
 ├── src/
-│   ├── index.js        # Entry point
-│   ├── config.js       # Configuration
-│   ├── db.js           # SQLite
-│   ├── routes/
-│   │   ├── api.js      # REST API
-│   │   ├── mcp.js      # MCP Streamable HTTP
-│   │   ├── web.js      # HTML pages
-│   │   └── setup.js    # Setup instructions per agent
-│   ├── ws/
-│   │   └── handler.js  # WebSocket
-│   ├── utils/
-│   │   ├── tokens.js   # Generation/validation
-│   │   ├── security.js # Rate limit, sanitize
-│   │   └── logger.js   # Structured logging
-│   └── views/
-│       ├── room.ejs    # Room page
-│       ├── setup.ejs   # Instructions
-│       └── index.ejs   # Home
-├── tests/
-│   └── integration.test.js
-├── data/
-│   └── hub.db          # SQLite (gitignore)
-└── docker-compose.yml  # For Traefik
+│   ├── index.js            # Entry point, middleware order, shutdown
+│   ├── config.js           # Configuration (env)
+│   ├── db.js               # SQLite schema, migrations, prepared statements
+│   ├── watchdog.js         # Unreplied-message alerts
+│   ├── wake-targets.js     # Webhook / file wake-ups
+│   ├── routes/             # api.js (REST), mcp.js, web.js (HTML), setup.js, files.js,
+│   │                       # coordination.js, wake-targets.js, design.js
+│   ├── services/           # messages.js (post, cursor, realtime fan-out, sessions), files.js,
+│   │                       # transcription.js, retention.js, export.js
+│   ├── ws/handler.js       # WebSocket
+│   ├── utils/              # auth.js, tokens.js, security.js, net.js, paths.js, mentions.js,
+│   │                       # members.js, listen-loop.js, logger.js, time.js
+│   └── public/room-ui.js   # Room page helpers (Markdown, mentions, voice)
+├── client/                 # Zero-dependency CLI: hub-listen, hub-send, hub-watch
+├── runner/, archiviste/    # Agent runner (Agent SDK) and memory bot
+├── scripts/                # backup-db.js, transcribe-worker.mjs, rotate-token.mjs, smoke-mcp.sh
+├── tests/                  # node --test suites (each spawns a hub on its own temp DB)
+└── data/                   # hub.db + uploads (HUB_DATA_DIR; keep it outside the repo in production)
 ```
 
 ### Deployment
@@ -393,7 +388,7 @@ The service CANNOT wake up these agents. The user must say "read the room" or "c
 
 **Systemd:** `/etc/systemd/system/agent-hub.service`
 
-**Traefik:** Add to `/srv/docker/docker-compose.yml` or standalone service with labels.
+**Reverse proxy:** HTTPS termination in front of the port; list it in `HUB_TRUSTED_PROXIES`.
 
 **DNS:** `hub.example.com` (to create)
 

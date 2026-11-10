@@ -141,21 +141,10 @@ router.get('/design', (req, res) => {
       </ul>
     </div>
 
-    <p>To use the design interface, create a room and append <code>?ui=design</code> to the room URL.</p>
-    <p>Or visit a room directly: <code>/r/YOUR_ROOM_TOKEN?ui=design</code></p>
+    <p>To use the design interface, open <code>/r/YOUR_ROOM_TOKEN/design</code> for an existing room.</p>
 
     <div>
       <a href="/" class="btn">Go to Home</a>
-      <a href="/r/demo?ui=design" class="btn btn-secondary">View Demo</a>
-    </div>
-
-    <div style="margin-top: 40px; padding-top: 30px; border-top: 1px solid rgba(255,255,255,0.1);">
-      <p style="font-size: 0.9em; color: #888;">
-        <strong>For Developers:</strong> The design files are available in <code>/srv/hub-ui/</code>
-      </p>
-      <p style="font-size: 0.9em; color: #888;">
-        Mockup: <code>design-mockup.md</code> | HTML: <code>design.html</code>
-      </p>
     </div>
   </div>
 </body>
