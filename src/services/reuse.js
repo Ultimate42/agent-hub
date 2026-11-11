@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
-  mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, readdirSync, statSync
+  mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, readdirSync, statSync, lstatSync, existsSync
 } from 'fs';
 import { dbInstance as db } from '../db.js';
 import { config } from '../config.js';
@@ -87,6 +87,10 @@ const q = {
   byName: db.prepare('SELECT * FROM reuse_jobs WHERE batch = ? AND name = ?'),
   list: db.prepare('SELECT * FROM reuse_jobs WHERE (@batch IS NULL OR batch = @batch) AND (@status IS NULL OR status = @status) ORDER BY batch, name LIMIT 5000'),
   deleteBatch: db.prepare('DELETE FROM reuse_jobs WHERE batch = ?'),
+  batchRows: db.prepare('SELECT id, status, lease_until FROM reuse_jobs WHERE batch = ?'), // every row: no LIMIT, unlike list
+  ids: db.prepare('SELECT id, status FROM reuse_jobs'),
+  lost: db.prepare(`UPDATE reuse_jobs SET status = 'failed', error = 'input audio is missing on the hub', lease_until = NULL
+                    WHERE id = ? AND status IN ('pending', 'claimed')`),
   // A claimed job whose lease ran out is claimable again
   next: db.prepare(`SELECT * FROM reuse_jobs
                     WHERE status = 'pending' OR (status = 'claimed' AND lease_until < ?)
@@ -146,8 +150,45 @@ export const outputPath = (id) => path.join(config.reuseDir, `${Number(id)}.out.
 function writeAtomic(file, data) {
   mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, data);
-  renameSync(tmp, file);
+  try {
+    writeFileSync(tmp, data);
+    renameSync(tmp, file);
+  } catch (e) {
+    rmSync(tmp, { force: true }); // disk full, permissions: no half-written file left behind
+    throw e;
+  }
+}
+
+/** A job whose source audio is gone can never be computed: failed for good, never handed out again. */
+export function inputLost(id) {
+  if (q.lost.run(Number(id)).changes) logger.error('RE-USE job failed permanently: input audio is missing on the hub', { id: Number(id) });
+}
+
+/**
+ * Startup sweep of the storage folder. A hub stopped in the middle of a write, or a database restored from a
+ * backup, leaves audio that no row accounts for: it would fill the disk outside the storage cap, forever.
+ * Only files this module names itself (<id>.in.flac, <id>.out.flac and their temporary copies) are touched.
+ * Conversely a waiting job whose source is gone is failed now rather than handed to workers.
+ * One hub per storage folder: a second hub with another database would see the first one's audio as orphans.
+ */
+export function sweepReuseStorage() {
+  const rows = new Map(q.ids.all().map(r => [r.id, r.status]));
+  let names = [];
+  try { names = readdirSync(config.reuseDir); } catch { /* no folder yet */ }
+  const removed = [];
+  for (const n of names) {
+    const m = /^(\d+)\.(in|out)\.flac(\.\d+\.tmp)?$/.exec(n);
+    if (!m) continue;
+    const status = rows.get(Number(m[1]));
+    const wanted = !m[3] && (m[2] === 'in' ? status !== undefined : status === 'done');
+    if (wanted) continue;
+    try { rmSync(path.join(config.reuseDir, n), { force: true }); removed.push(n); } catch { /* next start */ }
+  }
+  if (removed.length) logger.warn('RE-USE storage: orphan files removed', { count: removed.length, files: removed.slice(0, 20) });
+  for (const [id, status] of rows) {
+    if ((status === 'pending' || status === 'claimed') && !existsSync(inputPath(id))) inputLost(id);
+  }
+  return removed.length;
 }
 
 function parseParams(raw) {
@@ -251,7 +292,7 @@ export function cancelJob(id) {
 
 /** Remove a whole batch (rows and audio) once its outputs have been fetched. Refused while a job is being computed. */
 export function deleteBatch(batch, now = Date.now()) {
-  const rows = q.list.all({ batch, status: null });
+  const rows = q.batchRows.all(String(batch));
   if (rows.length === 0) return err(404, 'Unknown batch');
   if (rows.some(j => j.status === 'claimed' && j.lease_until >= now)) return err(409, 'A job of this batch is being computed: cancel it first');
   q.deleteBatch.run(batch);
@@ -393,6 +434,13 @@ export function completeJob(id, name, { data, sha256: announced, computeS, backe
     return { ...err(422, problem), retry };
   }
 
+  // The cap is checked at submission assuming a result about as big as its source; a much bigger one
+  // (higher bit depth) must not push the disk past the cap. Not the worker's fault: no attempt burnt,
+  // it keeps its work and sends again once room has been made.
+  if (q.stored.get().bytes + data.length > config.reuseMaxStorage) {
+    return err(507, 'RE-USE storage is full on the hub: fetch the outputs of finished batches and delete them (DELETE /api/reuse/batches/:batch)');
+  }
+
   const seconds = Number(computeS);
   const compute = Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
   db.transaction(() => {
@@ -404,6 +452,8 @@ export function completeJob(id, name, { data, sha256: announced, computeS, backe
   logger.info('RE-USE job done', { id: job.id, worker: name, computeS: compute });
   return { ok: true, job: jobView(q.byId.get(job.id)) };
 }
+
+sweepReuseStorage();
 
 // ---------------------------------------------------------------------------
 // Workers: state and remote orders
@@ -464,15 +514,21 @@ export function workerManifest() {
   const dir = workerDir();
   let names = [];
   try {
+    // lstat: a symbolic link is never followed (it could publish a file from outside the directory)
     names = readdirSync(dir).filter(n => SAFE_NAME.test(n) && !n.startsWith('.') && !/\.(md|bak.*|config\.json)$/i.test(n)
-      && statSync(path.join(dir, n)).isFile()).sort();
+      && lstatSync(path.join(dir, n)).isFile()).sort();
   } catch { /* no worker directory: empty manifest */ }
-  const stamp = names.map(n => { const s = statSync(path.join(dir, n)); return `${n}:${s.size}:${s.mtimeMs}`; }).join('|');
-  if (stamp === manifestCache.stamp) return manifestCache.manifest;
-  const files = names.map(n => {
-    const data = readFileSync(path.join(dir, n));
-    return { name: n, sha256: sha256(data), size: data.length };
-  });
+  let stamp, files;
+  try {
+    stamp = names.map(n => { const s = statSync(path.join(dir, n)); return `${n}:${s.size}:${s.mtimeMs}`; }).join('|');
+    if (stamp === manifestCache.stamp) return manifestCache.manifest;
+    files = names.map(n => {
+      const data = readFileSync(path.join(dir, n));
+      return { name: n, sha256: sha256(data), size: data.length };
+    });
+  } catch {
+    return manifestCache.manifest; // a file vanished while being replaced (deploy in progress): keep the last good manifest
+  }
   const version = files.length ? sha256(Buffer.from(files.map(f => `${f.name}:${f.sha256}`).join('\n'))).slice(0, 12) : 'none';
   manifestCache = { stamp, manifest: { version, files } };
   return manifestCache.manifest;

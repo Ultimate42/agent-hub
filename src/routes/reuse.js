@@ -5,7 +5,7 @@ import { config } from '../config.js';
 import {
   reuseEnabled, identifyReuseCaller, submitJob, listJobs, getJob, jobView, retryJob, cancelJob, deleteBatch,
   noteReusePoll, claimJob, claimView, canReadInput, heartbeat, failJob, completeJob,
-  listWorkers, orderWorker, workerOrders, workerManifest, workerFilePath, inputPath, outputPath
+  listWorkers, orderWorker, workerOrders, workerManifest, workerFilePath, inputPath, outputPath, inputLost
 } from '../services/reuse.js';
 
 // ---------------------------------------------------------------------------
@@ -35,6 +35,20 @@ function requireCaller(req, res, role) {
   return caller;
 }
 
+/**
+ * Route guard, placed BEFORE the body parser: an unknown caller never gets a body read into memory
+ * (up to 32 MB per request otherwise). The caller is left in req.reuseCaller.
+ */
+const guard = (role) => (req, res, next) => {
+  const caller = requireCaller(req, res, role);
+  if (!caller) return;
+  req.reuseCaller = caller;
+  next();
+};
+
+/** A query value as one string (?batch[]=a or a repeated key gives an array: refused, never bound to SQL). */
+const one = (v) => (typeof v === 'string' ? v : undefined);
+
 const answer = (res, result, status = 200) => {
   if (!result.ok) return res.status(result.status).json({ error: result.error, ...(result.retry !== undefined ? { retry: result.retry } : {}) });
   const { ok, ...body } = result;
@@ -44,7 +58,7 @@ const answer = (res, result, status = 200) => {
 function sendFlac(res, file, name) {
   if (!existsSync(file)) return res.status(404).json({ error: 'Audio file is missing on the hub' });
   res.set({ 'Content-Type': 'audio/flac', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store' });
-  res.sendFile(path.resolve(file), { cacheControl: false }, (e) => { if (e && !res.headersSent) res.status(e.status || 500).end(); });
+  res.sendFile(path.resolve(file), { cacheControl: false, dotfiles: 'allow' }, (e) => { if (e && !res.headersSent) res.status(e.status || 500).end(); });
 }
 
 // ----- Admin -----------------------------------------------------------------
@@ -53,33 +67,29 @@ function sendFlac(res, file, name) {
  * POST /api/reuse/jobs?batch=extrait01&name=extrait01_000.flac[&priority=0][&chunk_s=5][&overlap_s=2.5]
  * Raw mono FLAC body. 201 {job} (200 when the same audio was already queued under that name, 409 if it differs).
  */
-router.post('/api/reuse/jobs', raw, (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.post('/api/reuse/jobs', guard('admin'), raw, (req, res) => {
   const result = submitJob({
-    batch: req.query.batch, name: req.query.name, priority: req.query.priority,
-    params: { chunk_s: req.query.chunk_s, overlap_s: req.query.overlap_s },
+    batch: one(req.query.batch), name: one(req.query.name), priority: one(req.query.priority),
+    params: { chunk_s: one(req.query.chunk_s), overlap_s: one(req.query.overlap_s) },
     data: Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0)
   });
   answer(res, result, result.created ? 201 : 200);
 });
 
 /** GET /api/reuse/jobs[?batch=][&status=] - Jobs and a summary (counts, audio seconds, measured speed, time left). */
-router.get('/api/reuse/jobs', (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
-  res.json(listJobs({ batch: req.query.batch, status: req.query.status }));
+router.get('/api/reuse/jobs', guard('admin'), (req, res) => {
+  res.json(listJobs({ batch: one(req.query.batch), status: one(req.query.status) }));
 });
 
 /** GET /api/reuse/jobs/:id - One job (admin). */
-router.get('/api/reuse/jobs/:id', (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.get('/api/reuse/jobs/:id', guard('admin'), (req, res) => {
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'Unknown job' });
   res.json(jobView(job));
 });
 
 /** GET /api/reuse/jobs/:id/output - Cleaned FLAC of a done job, named <stem>_clean.flac (admin). */
-router.get('/api/reuse/jobs/:id/output', (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.get('/api/reuse/jobs/:id/output', guard('admin'), (req, res) => {
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'Unknown job' });
   if (job.status !== 'done') return res.status(409).json({ error: `Job is ${job.status}` });
@@ -88,30 +98,25 @@ router.get('/api/reuse/jobs/:id/output', (req, res) => {
 });
 
 /** POST /api/reuse/jobs/:id/retry | /cancel (admin) */
-router.post('/api/reuse/jobs/:id/retry', (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.post('/api/reuse/jobs/:id/retry', guard('admin'), (req, res) => {
   answer(res, retryJob(req.params.id));
 });
-router.post('/api/reuse/jobs/:id/cancel', (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.post('/api/reuse/jobs/:id/cancel', guard('admin'), (req, res) => {
   answer(res, cancelJob(req.params.id));
 });
 
 /** DELETE /api/reuse/batches/:batch - Remove a batch and its audio from the hub once the outputs are fetched (admin). */
-router.delete('/api/reuse/batches/:batch', (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.delete('/api/reuse/batches/:batch', guard('admin'), (req, res) => {
   answer(res, deleteBatch(req.params.batch));
 });
 
 /** GET /api/reuse/workers - Every worker: last poll, version, GPU, state, pause, speed (admin). */
-router.get('/api/reuse/workers', (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.get('/api/reuse/workers', guard('admin'), (req, res) => {
   res.json(listWorkers());
 });
 
 /** POST /api/reuse/workers/:name/order {pause: true|false} and/or {update: true} (admin). */
-router.post('/api/reuse/workers/:name/order', json, (req, res) => {
-  if (!requireCaller(req, res, 'admin')) return;
+router.post('/api/reuse/workers/:name/order', guard('admin'), json, (req, res) => {
   answer(res, orderWorker(req.params.name, req.body || {}));
 });
 
@@ -121,9 +126,8 @@ router.post('/api/reuse/workers/:name/order', json, (req, res) => {
  * POST /api/reuse/next {wait: 25, info: {version, backend, device, os, state}} - Long-poll for a job.
  * Always 200 {job: {...}|null, orders: {paused, update, worker_version}}. Returns early when an order changes.
  */
-router.post('/api/reuse/next', json, (req, res) => {
-  const caller = requireCaller(req, res, 'worker');
-  if (!caller) return;
+router.post('/api/reuse/next', guard('worker'), json, (req, res) => {
+  const caller = req.reuseCaller;
   const body = req.body || {};
   const deadline = Date.now() + Math.min(Math.max(parseInt(body.wait, 10) || 0, 0), 25) * 1000;
   let closed = false;
@@ -144,27 +148,29 @@ router.post('/api/reuse/next', json, (req, res) => {
 });
 
 /** POST /api/reuse/worker/status {info} - Report state without claiming anything (startup, install failure). {orders} */
-router.post('/api/reuse/worker/status', json, (req, res) => {
-  const caller = requireCaller(req, res, 'worker');
-  if (!caller) return;
+router.post('/api/reuse/worker/status', guard('worker'), json, (req, res) => {
+  const caller = req.reuseCaller;
   res.json({ orders: noteReusePoll(caller.name, (req.body || {}).info) });
 });
 
 /** GET /api/reuse/jobs/:id/input - Source FLAC (the worker holding the job, or admin). */
-router.get('/api/reuse/jobs/:id/input', (req, res) => {
-  const caller = requireCaller(req, res, 'any');
-  if (!caller) return;
+router.get('/api/reuse/jobs/:id/input', guard('any'), (req, res) => {
+  const caller = req.reuseCaller;
   const allowed = canReadInput(caller, req.params.id);
   if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
   const job = getJob(req.params.id);
+  if (!existsSync(inputPath(job.id))) {
+    // Nothing to compute from: fail the job for good instead of handing it to workers again and again
+    inputLost(job.id);
+    return res.status(404).json({ error: 'Audio file is missing on the hub' });
+  }
   res.set('X-Sha256', job.in_sha256);
   sendFlac(res, inputPath(job.id), job.name);
 });
 
 /** POST /api/reuse/jobs/:id/heartbeat {progress: 0..1, info} - Renew the lease. 409 = the job is no longer yours, stop. */
-router.post('/api/reuse/jobs/:id/heartbeat', json, (req, res) => {
-  const caller = requireCaller(req, res, 'worker');
-  if (!caller) return;
+router.post('/api/reuse/jobs/:id/heartbeat', guard('worker'), json, (req, res) => {
+  const caller = req.reuseCaller;
   answer(res, heartbeat(req.params.id, caller.name, req.body || {}));
 });
 
@@ -172,37 +178,33 @@ router.post('/api/reuse/jobs/:id/heartbeat', json, (req, res) => {
  * POST /api/reuse/jobs/:id/result?compute_s=12.3&backend=vulkan - Raw cleaned FLAC, header X-Sha256.
  * 422 when the audio is not a faithful cleaning (length, rate, channels): the attempt is counted and the job re-queued.
  */
-router.post('/api/reuse/jobs/:id/result', raw, (req, res) => {
-  const caller = requireCaller(req, res, 'worker');
-  if (!caller) return;
+router.post('/api/reuse/jobs/:id/result', guard('worker'), raw, (req, res) => {
+  const caller = req.reuseCaller;
   answer(res, completeJob(req.params.id, caller.name, {
     data: Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0),
-    sha256: req.get('X-Sha256'), computeS: req.query.compute_s, backend: req.query.backend
+    sha256: req.get('X-Sha256'), computeS: one(req.query.compute_s), backend: one(req.query.backend)
   }));
 });
 
 /** POST /api/reuse/jobs/:id/fail {error} - Give the job back (counted as an attempt). */
-router.post('/api/reuse/jobs/:id/fail', json, (req, res) => {
-  const caller = requireCaller(req, res, 'worker');
-  if (!caller) return;
+router.post('/api/reuse/jobs/:id/fail', guard('worker'), json, (req, res) => {
+  const caller = req.reuseCaller;
   answer(res, failJob(req.params.id, caller.name, req.body || {}));
 });
 
 // ----- Worker program (self-update) --------------------------------------------
 
 /** GET /api/reuse/worker/manifest - {version, files: [{name, sha256, size}]} of the published worker (any token). */
-router.get('/api/reuse/worker/manifest', (req, res) => {
-  if (!requireCaller(req, res, 'any')) return;
+router.get('/api/reuse/worker/manifest', guard('any'), (req, res) => {
   res.json(workerManifest());
 });
 
 /** GET /api/reuse/worker/files/:name - One file of the manifest (any token). */
-router.get('/api/reuse/worker/files/:name', (req, res) => {
-  if (!requireCaller(req, res, 'any')) return;
+router.get('/api/reuse/worker/files/:name', guard('any'), (req, res) => {
   const file = workerFilePath(req.params.name);
   if (!file) return res.status(404).json({ error: 'Not a published worker file' });
   res.set({ 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' });
-  res.sendFile(file, { cacheControl: false }, (e) => { if (e && !res.headersSent) res.status(e.status || 500).end(); });
+  res.sendFile(file, { cacheControl: false, dotfiles: 'allow' }, (e) => { if (e && !res.headersSent) res.status(e.status || 500).end(); });
 });
 
 export default router;

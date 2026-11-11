@@ -102,6 +102,9 @@ Désinstaller : `install-and-run.ps1 -RemoveStartup` (Linux : `--remove-startup`
   l'ancienne dans `app.prev`, puis se relance. Une version qui plante trois fois au démarrage est annulée :
   retour à la précédente, et elle n'est plus réessayée tant que le hub n'en publie pas une autre. La
   vérification de mise à jour passe avant tout le reste : publier un correctif répare donc une machine bloquée.
+  Quand la file est pleine, la mise à jour se fait entre deux jobs, sans attendre que la file soit vide.
+- **Résultat refusé par le hub** (trop gros, par exemple) : la machine rend le job en comptant l'essai, au lieu
+  de le recalculer sans fin ; au bout de trois essais le job passe en échec.
 - **Moteur en panne sur une machine** : elle attend de plus en plus longtemps entre deux essais au lieu
   d'épuiser les trois essais de chaque job.
 
@@ -155,7 +158,14 @@ Sans ces variables, toutes les routes `/api/reuse/*` répondent 404. Générer u
 
 Si un reverse proxy limite la taille des requêtes, autoriser 32 Mo sur `/api/reuse/`. Le hub garde les sources
 et les résultats sur disque (environ 230 Mo par heure d'audio) jusqu'au `DELETE` du lot ; au-delà de 6 Go en
-tout, il refuse les nouveaux morceaux (507) plutôt que de remplir le disque.
+tout, il refuse les nouveaux morceaux (507) plutôt que de remplir le disque ; un résultat qui ferait dépasser
+ce plafond est refusé de la même façon, sans compter d'essai (la machine le garde et le renvoie une fois la
+place faite). Le jeton est vérifié avant la lecture du corps : sans jeton valide, rien n'est gardé en mémoire.
+
+Au démarrage, le hub nettoie ce dossier : fichiers `<id>.in.flac` / `<id>.out.flac` sans job correspondant et
+écritures interrompues sont supprimés (journal « orphan files removed »), et un job en attente dont la source a
+disparu passe en échec. Un seul hub par dossier `HUB_REUSE_DIR` : un second hub, avec une autre base, y
+verrait des orphelins.
 
 ## Limites connues
 

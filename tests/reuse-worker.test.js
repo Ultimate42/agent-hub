@@ -138,4 +138,19 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.notStrictEqual(fixed.info.version, good);
     assert.strictEqual(fixed.info.rolled_back_from, undefined);
   });
+
+  test('a new version is taken between two jobs, not only once the queue is empty', async () => {
+    const before = (await worker()).info.version;
+    const flac = fs.readFileSync(path.join(tmp, 'in.flac'));
+    const N = 8;
+    for (let i = 0; i < N; i++) await admin(`/api/reuse/jobs?batch=busy&name=busy_${i}.flac`, { method: 'POST', body: flac });
+    const counts = async () => (await admin('/api/reuse/jobs?batch=busy')).summary;
+    await until('first job taken', async () => { const c = await counts(); return (c.claimed || 0) + (c.done || 0) > 0; });
+    publishWorker(src => src + '\n# v4 published while the queue is full\n');
+    await until('updated', async () => { const x = await worker(); return x.up_to_date && x.info.version !== before; });
+    const doneAtUpdate = (await counts()).done || 0;
+    assert.ok(doneAtUpdate < N, `updated after ${doneAtUpdate} of ${N} jobs (before the fix: only after the last one)`);
+    await until('queue finished on the new version', async () => (await counts()).done === N, 60);
+    assert.deepStrictEqual(fs.readdirSync(path.join(pc, 'work')), [], 'nothing left behind');
+  });
 });

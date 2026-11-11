@@ -20,6 +20,7 @@ import logging.handlers
 import os
 import platform
 import py_compile
+import re
 import shutil
 import socket
 import ssl
@@ -106,6 +107,19 @@ def read_json(path, default=None):
 
 def rmtree(path):
     shutil.rmtree(path, ignore_errors=True)
+
+
+def safe_file_name(name):
+    """Nom de fichier publié par le hub, selon la même règle que lui : lettres ASCII, chiffres, « _ . - »,
+    120 caractères au plus, sans point en tête (ni dossier, ni lecteur « C: », ni flux « a:b » de Windows)."""
+    return isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,119}', name) is not None
+
+
+# Contrôle de syntaxe d'un lanceur PowerShell. Le chemin passe par une variable d'environnement, jamais dans le
+# texte de la commande : aucun caractère du chemin ($, accent grave, apostrophe, guillemet) ne peut y être interprété.
+PS_CHECK_VAR = 'REUSE_PS1_TO_CHECK'
+PS_CHECK = ('$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($env:%s,[ref]$null,[ref]$e);'
+            'if($e.Count){exit 1}' % PS_CHECK_VAR)
 
 
 def fmt_duration(seconds):
@@ -707,8 +721,8 @@ class Worker:
             new.mkdir(parents=True)
             for f in manifest['files']:
                 name = f['name']
-                if Path(name).name != name or not name or name.startswith('.'):
-                    raise ValueError('nom de fichier refusé : %r' % name)
+                if not safe_file_name(name):
+                    raise ValueError('nom de fichier refusé : %r' % (name,))
                 status, _ = self.hub.request('GET', '/api/reuse/worker/files/' + name, dest=new / name, timeout=120)
                 if status != 200 or sha256_file(new / name) != f['sha256']:
                     raise ValueError('fichier %s : empreinte incorrecte, mise à jour abandonnée' % name)
@@ -751,10 +765,9 @@ class Worker:
             return False
         try:
             if self.launcher.suffix == '.ps1':
-                check = ('$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile("%s",[ref]$null,[ref]$e);'
-                         'if($e.Count){exit 1}' % str(fresh).replace('"', '`"'))
                 shell = shutil.which('powershell') or shutil.which('pwsh')
-                ok = bool(shell) and subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command', check], timeout=120,
+                ok = bool(shell) and subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command', PS_CHECK], timeout=120,
+                                                    env=dict(os.environ, **{PS_CHECK_VAR: str(fresh)}), stdin=subprocess.DEVNULL,
                                                     creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0).returncode == 0
             else:
                 ok = subprocess.run(['bash', '-n', str(fresh)], timeout=60).returncode == 0
@@ -860,6 +873,10 @@ class Worker:
             log.error('Job %d : %s. Le hub le remettra en file.', jid, e)
             self.state['last_error'] = 'job %d : %s' % (jid, e)
             rmtree(jobdir)
+            # Un refus que le hub n'a pas compté lui-même (résultat trop gros, par exemple) laisse le bail à cette
+            # machine : sans ce signalement, elle reprendrait le même job et le recalculerait sans fin.
+            # Si le hub l'a déjà remis en file (422), il répond 409 et rien ne change.
+            self.give_back(jid, e)
         except OSError as e:
             # Hub injoignable trop longtemps : on garde le travail fait, il repartira à la reconnexion
             log.error('Job %d en attente : %s. Le travail fait est gardé dans %s.', jid, e, jobdir)
@@ -869,13 +886,17 @@ class Worker:
             self.state['last_error'] = 'job %d : %s' % (jid, e)
             self.engine_failures += 1
             rmtree(jobdir)
-            try:
-                self.hub.request('POST', '/api/reuse/jobs/%d/fail' % jid, body={'error': str(e)[:300]}, timeout=30)
-            except OSError:
-                pass
+            self.give_back(jid, e)
         finally:
             finished.set()
             self.set_state('en attente')
+
+    def give_back(self, jid, reason):
+        """Rend le job au hub en comptant l'essai (au bout de trois, le hub le déclare en échec)."""
+        try:
+            self.hub.request('POST', '/api/reuse/jobs/%d/fail' % jid, body={'error': str(reason)[:300]}, timeout=30)
+        except OSError:
+            pass
 
     def single_instance(self):
         """Verrou tenu tant que ce processus vit : jamais deux workers dans le même dossier (lanceur relancé
@@ -922,6 +943,7 @@ class Worker:
         (self.app / '.ok').write_text(time.strftime('%Y-%m-%d %H:%M:%S'))   # cette version démarre : le lanceur ne reviendra pas en arrière
         self.set_state('en attente')
         job = None
+        orders = {}
         errors = 0
         while True:
             if (self.base / 'STOP').exists():
@@ -930,6 +952,9 @@ class Worker:
             if job:
                 self.process(job)
                 job = None
+                # Ordres reçus avec ce job (mise à jour publiée ou forcée) : appliqués entre deux jobs, sinon une
+                # file jamais vide retarderait indéfiniment un correctif du worker
+                self.apply_orders(orders)
                 if self.engine_failures:
                     # Moteur en panne ici : attendre de plus en plus avant de reprendre un job, pour ne pas
                     # épuiser les essais de toute la file alors qu'une autre machine pourrait la traiter

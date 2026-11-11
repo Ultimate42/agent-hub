@@ -2,6 +2,7 @@
 import array
 import importlib.util
 import io
+import json
 import math
 import os
 import struct
@@ -135,6 +136,101 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             w.download(src.as_uri(), d / 'ko.bin', '0' * 64, 'test')
         self.assertFalse((d / 'ko.bin').exists())
+
+
+class NamesTest(unittest.TestCase):
+    def test_published_file_names(self):
+        for good in ('reuse_worker.py', 'install-and-run.ps1', 'a', 'version.txt', '-x.py', 'x' * 120):
+            self.assertTrue(w.safe_file_name(good), good)
+        for bad in ('', '.hidden', '../x.py', 'sub/x.py', 'sub\\x.py', 'C:x.py', 'x.py:flux', 'é.py', 'x y.py', 'x' * 121, None, 3):
+            self.assertFalse(w.safe_file_name(bad), repr(bad))
+
+    def test_launcher_check_never_puts_the_path_in_the_powershell_command(self):
+        # Faux « powershell » : note ce qu'il reçoit. Le dossier contient tout ce que PowerShell interpréterait.
+        d = Path(tempfile.mkdtemp())
+        tools = d / 'bin'
+        tools.mkdir()
+        seen = d / 'seen.txt'
+        fake = tools / 'powershell'
+        fake.write_text('#!/bin/sh\nprintf "%s\\n%s\\n" "$REUSE_PS1_TO_CHECK" "$*" > "$SEEN"\nexit "${FAKE_PS_EXIT:-0}"\n')
+        fake.chmod(0o755)
+        base = d / "O'Brien $(calc) `x \"q"
+        (base / 'app').mkdir(parents=True)
+        (base / 'logs').mkdir()
+        (base / 'reuse-worker.config.json').write_text(json.dumps({'hub_url': 'https://hub.invalid', 'token': 'jeton-de-test'}))
+        launcher = base / 'install-and-run.ps1'
+        launcher.write_text('# ancien')
+        fresh = base / 'app' / 'install-and-run.ps1'
+        fresh.write_text('# nouveau')
+        old_path, os.environ['PATH'] = os.environ['PATH'], str(tools) + os.pathsep + os.environ['PATH']
+        os.environ['SEEN'] = str(seen)
+        try:
+            worker = w.Worker(base, launcher)
+            os.environ['FAKE_PS_EXIT'] = '1'           # erreur de syntaxe : l'ancien lanceur reste
+            self.assertFalse(worker.update_launcher(base / 'app'))
+            self.assertEqual(launcher.read_text(), '# ancien')
+            os.environ['FAKE_PS_EXIT'] = '0'
+            self.assertTrue(worker.update_launcher(base / 'app'))
+        finally:
+            os.environ['PATH'] = old_path
+            os.environ.pop('SEEN'), os.environ.pop('FAKE_PS_EXIT')
+        path_seen, command = seen.read_text().split('\n')[:2]
+        self.assertEqual(path_seen, str(fresh))
+        self.assertNotIn('Brien', command)
+        self.assertIn('$env:REUSE_PS1_TO_CHECK', command)
+        self.assertEqual(launcher.read_text(), '# nouveau')
+        self.assertEqual(Path(str(launcher) + '.prev').read_text(), '# ancien')
+
+
+class FakeHub:
+    """Hub de test : répond ce qu'on lui dit à l'envoi du résultat, note tous les appels."""
+    def __init__(self, result_status):
+        self.result_status = result_status
+        self.calls = []
+
+    def request(self, method, path, body=None, raw=None, headers=None, timeout=60, dest=None):
+        self.calls.append((method, path.split('?')[0], body))
+        if path.endswith('/heartbeat'):
+            return 200, {}
+        if '/result' in path:
+            return self.result_status, {'error': 'refus de test'}
+        return 200, {}
+
+    def retrying(self, what, fn, tries=8):
+        return fn()
+
+
+class RefusedResultTest(unittest.TestCase):
+    def worker_with_finished_job(self, result_status):
+        """Worker dont le job 7 est déjà nettoyé sur le disque (reprise) : il ne reste qu'à envoyer le résultat."""
+        base = Path(tempfile.mkdtemp())
+        (base / 'logs').mkdir()
+        (base / 'reuse-worker.config.json').write_text(json.dumps({'hub_url': 'https://hub.invalid', 'token': 'jeton-de-test'}))
+        worker = w.Worker(base, None)
+        worker.hub = FakeHub(result_status)
+        jobdir = base / 'work' / 'job-7'
+        jobdir.mkdir(parents=True)
+        (jobdir / 'out.flac').write_bytes(b'fLaC resultat')
+        w.write_json(jobdir / 'done.json', {'in_sha256': 'abc', 'out_sha256': w.sha256_file(jobdir / 'out.flac'), 'compute_s': 1.0})
+        job = {'id': 7, 'name': 'p_007.flac', 'samples': 24000, 'rate': 24000, 'attempt': 1, 'sha256': 'abc', 'lease_s': 600}
+        return worker, job, jobdir
+
+    def test_a_refusal_the_hub_did_not_count_gives_the_job_back(self):
+        # 413 : le hub (ou le proxy) refuse le résultat sans toucher au job. Sans signalement, le bail reste à
+        # cette machine, qui reprendrait le même job et le recalculerait sans fin.
+        worker, job, jobdir = self.worker_with_finished_job(413)
+        worker.process(job)
+        fails = [c for c in worker.hub.calls if c[1] == '/api/reuse/jobs/7/fail']
+        self.assertEqual(len(fails), 1)
+        self.assertIn('413', fails[0][2]['error'])
+        self.assertFalse(jobdir.exists())
+        self.assertEqual(worker.engine_failures, 0)   # ce n'est pas une panne du moteur : pas de pause
+
+    def test_an_accepted_result_reports_no_failure(self):
+        worker, job, jobdir = self.worker_with_finished_job(200)
+        worker.process(job)
+        self.assertEqual([c for c in worker.hub.calls if c[1].endswith('/fail')], [])
+        self.assertFalse(jobdir.exists())
 
 
 if __name__ == '__main__':

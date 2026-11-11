@@ -352,3 +352,137 @@ describe('RE-USE queue storage cap', () => {
     }
   });
 });
+
+describe('RE-USE queue hardening', () => {
+  const P = '4158';
+  const URL_ = `http://localhost:${P}`;
+  const MAX_FILE = 4096;
+  let tmp, reuseDir, workerDir, hub;
+  const startHub = async () => {
+    hub = spawn('node', ['src/index.js'], {
+      cwd: process.cwd(), stdio: 'ignore',
+      env: {
+        ...process.env, PORT: P, PUBLIC_URL: URL_, DB_PATH: path.join(tmp, '.state', 'hub.db'), HUB_REUSE_ADMIN_TOKEN: ADMIN,
+        HUB_REUSE_WORKER_TOKENS: `gpu-box:${AMD}`, HUB_REUSE_WORKER_DIR: workerDir,
+        HUB_REUSE_MAX_FILE_SIZE: String(MAX_FILE), HUB_REUSE_MAX_STORAGE: '1000', HUB_RATE_LIMIT_PER_MINUTE: '1000'
+      }
+    });
+    for (let i = 0; i < 75; i++) {
+      try { if ((await fetch(`${URL_}/health`)).ok) return; } catch { /* starting */ }
+      await sleep(200);
+    }
+    assert.fail('hub did not start');
+  };
+  const stopHub = async () => {
+    const gone = new Promise(r => hub.once('exit', r));
+    hub.kill('SIGTERM');
+    await gone;
+  };
+  const http = async (p, { method = 'GET', token, body, headers = {} } = {}) => {
+    const res = await fetch(URL_ + p, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, body });
+    const buf = Buffer.from(await res.arrayBuffer());
+    let data = null;
+    try { data = JSON.parse(buf.toString()); } catch { /* binary */ }
+    return { status: res.status, data, buf };
+  };
+  const put = (name, flac, q = `batch=h&name=${name}`) => http(`/api/reuse/jobs?${q}`, { method: 'POST', token: ADMIN, body: flac });
+  const claim = () => http('/api/reuse/next', { method: 'POST', token: AMD, body: JSON.stringify({ wait: 0 }), headers: { 'Content-Type': 'application/json' } });
+  const send = (id, flac) => http(`/api/reuse/jobs/${id}/result?compute_s=1&backend=cpu`, { method: 'POST', token: AMD, body: flac, headers: { 'X-Sha256': sha(flac) } });
+  const view = async (id) => (await http(`/api/reuse/jobs/${id}`, { token: ADMIN })).data;
+
+  before(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-hard-'));
+    reuseDir = path.join(tmp, '.state', 'reuse'); // under a dot folder on purpose (downloads must still work)
+    workerDir = path.join(tmp, 'worker-files');
+    fs.mkdirSync(path.join(tmp, '.state'));
+    fs.mkdirSync(workerDir);
+    fs.writeFileSync(path.join(workerDir, 'reuse_worker.py'), 'print("v1")\n');
+    fs.writeFileSync(path.join(tmp, 'outside.txt'), 'not part of the worker program');
+    fs.symlinkSync(path.join(tmp, 'outside.txt'), path.join(workerDir, 'linked.txt'));
+    await startHub();
+  });
+
+  after(async () => {
+    hub?.kill('SIGTERM');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('the token is checked before the body is read: no token, no upload held in memory', async () => {
+    const big = Buffer.concat([fakeFlac(), Buffer.alloc(MAX_FILE * 2)]);
+    // Before the fix the body parser ran first and these answered 413: the body had been read
+    assert.strictEqual((await http('/api/reuse/jobs?batch=h&name=big.flac', { method: 'POST', body: big })).status, 403);
+    assert.strictEqual((await http('/api/reuse/jobs?batch=h&name=big.flac', { method: 'POST', token: 'wrong-token-0123456789', body: big })).status, 403);
+    assert.strictEqual((await http('/api/reuse/jobs/1/result', { method: 'POST', token: ADMIN, body: big })).status, 403, 'admin is not a worker');
+    const tooBig = await put('big.flac', big);
+    assert.strictEqual(tooBig.status, 413);
+    assert.match(tooBig.data.error, /Audio file too large/);
+  });
+
+  test('a query parameter given as a list is refused, never a 500', async () => {
+    assert.strictEqual((await put('x.flac', fakeFlac(), 'batch[]=h&name=x.flac')).status, 400);
+    assert.strictEqual((await put('x.flac', fakeFlac(), 'batch=h&name=x.flac&name=y.flac')).status, 400);
+    assert.strictEqual((await http('/api/reuse/jobs?batch[]=h&status[]=done', { token: ADMIN })).status, 200);
+  });
+
+  test('audio is served even when the storage folder sits under a dot folder', async () => {
+    const flac = fakeFlac({ salt: 'dot' });
+    const id = (await put('dot.flac', flac)).data.job.id;
+    assert.strictEqual((await claim()).data.job.id, id);
+    const input = await http(`/api/reuse/jobs/${id}/input`, { token: AMD });
+    assert.strictEqual(input.status, 200);
+    assert.strictEqual(sha(input.buf), sha(flac));
+    const out = fakeFlac({ salt: 'dot-clean' });
+    assert.strictEqual((await send(id, out)).status, 200);
+    const got = await http(`/api/reuse/jobs/${id}/output`, { token: ADMIN });
+    assert.strictEqual(got.status, 200);
+    assert.strictEqual(sha(got.buf), sha(out));
+  });
+
+  test('a result that would push the disk past the cap is refused without burning the attempt', async () => {
+    const id = (await put('fat.flac', fakeFlac({ salt: 'fat' }))).data.job.id;
+    assert.strictEqual((await claim()).data.job.id, id);
+    const fat = fakeFlac({ salt: 'x'.repeat(900) });
+    assert.ok(fat.length < MAX_FILE);
+    const refused = await send(id, fat);
+    assert.strictEqual(refused.status, 507);
+    assert.ok(!fs.existsSync(path.join(reuseDir, `${id}.out.flac`)));
+    const j = await view(id);
+    assert.strictEqual(j.status, 'claimed');
+    assert.strictEqual(j.attempts, 1);
+    assert.strictEqual((await send(id, fakeFlac({ salt: 'fat-clean' }))).status, 200, 'same attempt, a result that fits');
+  });
+
+  test('a job whose source audio is gone is failed for good instead of being handed out again', async () => {
+    const id = (await put('gone.flac', fakeFlac({ salt: 'gone' }))).data.job.id;
+    assert.strictEqual((await claim()).data.job.id, id);
+    fs.rmSync(path.join(reuseDir, `${id}.in.flac`));
+    assert.strictEqual((await http(`/api/reuse/jobs/${id}/input`, { token: AMD })).status, 404);
+    const j = await view(id);
+    assert.strictEqual(j.status, 'failed');
+    assert.match(j.error, /missing on the hub/);
+    assert.strictEqual((await claim()).data.job, null, 'before the fix the same job came back at every poll');
+  });
+
+  test('worker program: a symbolic link is never published', async () => {
+    const manifest = (await http('/api/reuse/worker/manifest', { token: AMD })).data;
+    assert.deepStrictEqual(manifest.files.map(f => f.name), ['reuse_worker.py']);
+    assert.strictEqual((await http('/api/reuse/worker/files/linked.txt', { token: AMD })).status, 404);
+  });
+
+  test('startup sweep: orphan audio and half-written files go, known audio stays, a job without source fails', async () => {
+    const kept = (await put('kept.flac', fakeFlac({ salt: 'kept' }))).data.job.id;
+    const lost = (await put('lost.flac', fakeFlac({ salt: 'lost' }))).data.job.id;
+    const done = (await http('/api/reuse/jobs?batch=h&status=done', { token: ADMIN })).data.jobs[0].id;
+    await stopHub();
+    fs.rmSync(path.join(reuseDir, `${lost}.in.flac`));
+    const orphans = ['99999.in.flac', '99999.out.flac', `${kept}.out.flac`, `${kept}.in.flac.4242.tmp`, '99998.out.flac.4242.tmp'];
+    for (const n of orphans) fs.writeFileSync(path.join(reuseDir, n), 'orphan');
+    fs.writeFileSync(path.join(reuseDir, 'notes.txt'), 'not ours: never touched');
+    await startHub();
+    const left = fs.readdirSync(reuseDir);
+    for (const n of orphans) assert.ok(!left.includes(n), `${n} removed`);
+    for (const n of [`${kept}.in.flac`, `${done}.in.flac`, `${done}.out.flac`, 'notes.txt']) assert.ok(left.includes(n), `${n} kept`);
+    assert.strictEqual((await view(lost)).status, 'failed');
+    assert.strictEqual((await claim()).data.job.id, kept);
+  });
+});

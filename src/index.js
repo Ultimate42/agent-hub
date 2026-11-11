@@ -82,6 +82,9 @@ app.use((err, req, res, next) => {
   // Handle payload too large errors from body-parser
   if (err.type === 'entity.too.large' || err.message?.includes('payload too large') || err.status === 413) {
     logger.warn('Payload too large', { error: err.message, contentLength: req.get('content-length') });
+    if (req.path.startsWith('/api/reuse/')) {
+      return res.status(413).json({ error: `Audio file too large (max ${Math.round(config.reuseMaxFileSize / 1024 / 1024)}MB): cut it into shorter pieces` });
+    }
     const isUpload = req.path.endsWith('/files') || req.path.startsWith('/mcp');
     return res.status(413).json({ error: isUpload ? `File too large (max ${Math.round(config.maxFileSize / 1024 / 1024)}MB)` : 'Message too large (max 64KB)' });
   }
