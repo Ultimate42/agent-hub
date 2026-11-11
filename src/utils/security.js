@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { database } from '../db.js';
+import { identifyReuseCaller } from '../services/reuse.js';
 
 // In-memory rate limit store (per token and per IP)
 const rateLimits = new Map();
@@ -147,6 +148,8 @@ export function rateLimitMiddleware(req, res, next) {
   const auth = req.get('Authorization');
   const token = (auth?.startsWith('Bearer ') ? auth.slice(7) : null) ||
                 (typeof req.query.token === 'string' ? req.query.token : null);
+  // RE-USE queue: a valid admin/worker token is not rate limited (a batch is ~130 uploads, workers long-poll)
+  if (req.path.startsWith('/api/reuse/') && token && token.length <= 128 && identifyReuseCaller(token)) return next();
   let key = req.ip;
   if (token && token.length <= 128) {
     try {

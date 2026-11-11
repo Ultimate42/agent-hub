@@ -58,6 +58,18 @@ export const config = {
   transcribeWorkerMembers: parseWorkerMembers(process.env.HUB_TRANSCRIBE_WORKER_MEMBERS),
   transcribeLeaseMs: 5 * 60 * 1000,
   transcribeMaxAttempts: 3,
+  // RE-USE cleaning queue (src/services/reuse.js, worker program in reuse-worker/); disabled when both are unset.
+  // Admin = whoever submits audio and reads results (the manager); one token per worker machine, revocable one by one.
+  reuseAdminToken: (process.env.HUB_REUSE_ADMIN_TOKEN || '').length >= 16 ? process.env.HUB_REUSE_ADMIN_TOKEN : null,
+  reuseWorkerTokens: parseWorkerTokens(process.env.HUB_REUSE_WORKER_TOKENS),
+  reuseDir: process.env.HUB_REUSE_DIR || path.join(path.dirname(process.env.DB_PATH || path.join(dataDir, 'hub.db')), 'reuse'),
+  reuseWorkerDir: process.env.HUB_REUSE_WORKER_DIR || null, // default: <repo>/reuse-worker
+  reuseMaxFileSize: positiveInt(process.env.HUB_REUSE_MAX_FILE_SIZE, 32 * 1024 * 1024), // held in memory: 5 min of FLAC is under 10 MB
+  reuseMaxStorage: positiveInt(process.env.HUB_REUSE_MAX_STORAGE, 6 * 1024 * 1024 * 1024), // sources + results kept on disk
+  // A worker renews its lease with a heartbeat every minute while it computes; silent for this long = job handed to another
+  reuseLeaseMs: positiveInt(process.env.HUB_REUSE_LEASE_SECONDS, 600) * 1000,
+  reuseMaxAttempts: 3,
+  reuseMinRate: 24000, // cleaned audio is never accepted under 24 kHz
   // Rooms are deleted after this many days without messages (0 = never); agents can change it
   // per room (set_retention). A warning is posted retentionWarnMs before deletion.
   retentionDefaultDays: parseFloat(process.env.HUB_RETENTION_DEFAULT_DAYS ?? '7'),

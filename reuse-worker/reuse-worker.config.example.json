@@ -1,0 +1,5 @@
+{
+  "hub_url": "https://hub.example.com",
+  "token": "JETON-DE-CETTE-MACHINE (voir README, jamais dans le depot)",
+  "backend": "auto"
+}

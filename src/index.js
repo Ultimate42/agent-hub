@@ -12,6 +12,7 @@ import designRoutes from './routes/design.js';
 import coordinationRoutes from './routes/coordination.js';
 import wakeTargetsRoutes from './routes/wake-targets.js';
 import filesRoutes from './routes/files.js';
+import reuseRoutes from './routes/reuse.js';
 import { startFileSweeper, stopFileSweeper } from './services/files.js';
 import { startRetentionSweeper, stopRetentionSweeper } from './services/retention.js';
 import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
@@ -34,6 +35,7 @@ app.use(rateLimitMiddleware);
 
 // Shared files: raw uploads + downloads (mounted before the 64KB JSON parser)
 app.use(filesRoutes);
+app.use(reuseRoutes); // /api/reuse/* (raw audio bodies: mounted before the JSON parser)
 
 // MCP carries files as base64 (upload_file): its JSON limit follows the max file size
 app.use('/mcp', express.json({ limit: Math.ceil(config.maxFileSize * 4 / 3) + 64 * 1024 }));
