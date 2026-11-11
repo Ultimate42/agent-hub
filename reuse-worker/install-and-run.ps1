@@ -46,7 +46,13 @@ function Say([string]$Message) {
     try { Add-Content -Path (Join-Path $LogDir 'worker.log') -Value $line -Encoding UTF8 } catch { }
 }
 
-function Get-Sha256([string]$Path) { (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLower() }
+# SHA-256 par .NET plutot que Get-FileHash : lance depuis un pwsh 7, powershell.exe herite de PSModulePath
+# et Get-FileHash peut etre introuvable.
+function Get-Sha256([string]$Path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $fs = [IO.File]::OpenRead($Path)
+    try { ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLower() } finally { $fs.Dispose(); $sha.Dispose() }
+}
 
 function Remove-Startup {
     if ($IsWin) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue }
@@ -57,7 +63,11 @@ function Remove-Startup {
 # tourne deja, Windows ne lance rien (IgnoreNew), et un verrou protege en plus contre les doublons.
 function Install-Startup {
     if (-not $IsWin) { return }
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Self`" -NoStartup" -WorkingDirectory $Base
+    # conhost --headless (Windows 11) : aucune fenetre, meme pas le bref clignotement de -WindowStyle Hidden.
+    $psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Self`" -NoStartup"
+    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    if (Test-Path $conhost) { $action = New-ScheduledTaskAction -Execute $conhost -Argument "--headless powershell.exe $psArgs" -WorkingDirectory $Base }
+    else { $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArgs -WorkingDirectory $Base }
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'Nettoyage de voix RE-USE pilote par le hub' -Force | Out-Null
