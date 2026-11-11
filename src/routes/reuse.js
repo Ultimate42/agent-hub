@@ -10,7 +10,7 @@ import {
 
 // ---------------------------------------------------------------------------
 // RE-USE cleaning queue API. 404 when disabled. Bearer token = admin (HUB_REUSE_ADMIN_TOKEN) or
-// one worker machine (HUB_REUSE_WORKER_TOKENS="name:token,..."). See reuse-worker/README.md.
+// one worker machine (HUB_REUSE_WORKER_TOKENS="name:token,name:sha256:<fingerprint>,..."). See reuse-worker/README.md.
 // ---------------------------------------------------------------------------
 const router = Router();
 const json = express.json({ limit: '64kb' });

@@ -11,12 +11,13 @@
 #
 #   -NoStartup      ne pas s'inscrire au demarrage        -RemoveStartup  retirer l'inscription et sortir
 #   -CrashTest      essai complet sans hub ni jeton (reuse_worker.py pose a cote) : rapport logs\crash-test.json
+#   -Fingerprint    afficher l'empreinte du jeton de cette machine (le cree s'il n'existe pas) et sortir
 #   Arreter : creer un fichier nomme STOP dans le dossier (le supprimer pour repartir).
 #   Journal : logs\worker.log      Etat : logs\state.json
 #
 # Ce fichier reste volontairement court et en ASCII : toute la logique est dans app\reuse_worker.py,
 # que le hub met a jour. Ici : installation de Python, premier telechargement, relance, retour arriere.
-param([switch]$NoStartup, [switch]$RemoveStartup, [switch]$CrashTest)
+param([switch]$NoStartup, [switch]$RemoveStartup, [switch]$CrashTest, [switch]$Fingerprint)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -63,6 +64,29 @@ function Install-Startup {
     Say "Inscrit au demarrage (tache planifiee '$TaskName', verification toutes les 5 minutes)."
 }
 
+# Jeton cree sur ce PC : il ne quitte jamais ce dossier. Seule son empreinte SHA-256 est affichee,
+# a declarer au hub sous la forme nom:sha256:... (l'empreinte ne permet pas de retrouver le jeton).
+function New-LocalToken {
+    $bytes = New-Object byte[] 32
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Get-Fingerprint([string]$Token) {
+    $hash = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($Token))
+    return 'sha256:' + (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Write-Config([string]$Url, [string]$Token) {
+    $json = (@{ hub_url = $Url.Trim(); token = $Token.Trim(); backend = 'auto' } | ConvertTo-Json)
+    [IO.File]::WriteAllText($ConfigPath, $json, (New-Object Text.UTF8Encoding($false)))
+    Say "Config ecrite : $ConfigPath"
+}
+
+function Show-Fingerprint([string]$Token) {
+    Say "Empreinte a declarer au hub (ce n'est pas le jeton) : $(Get-Fingerprint $Token.Trim())"
+}
+
 function Read-Config {
     if (-not (Test-Path $ConfigPath)) {
         if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) {
@@ -73,11 +97,14 @@ function Read-Config {
         Write-Host 'Premiere installation du worker RE-USE.'
         $url = Read-Host 'Adresse du hub (Entree = https://hub.example.com)'
         if (-not $url) { $url = 'https://hub.example.com' }
-        $token = Read-Host 'Jeton de cette machine'
-        if (-not $token) { Say 'Jeton vide : abandon.'; exit 2 }
-        $json = (@{ hub_url = $url.Trim(); token = $token.Trim(); backend = 'auto' } | ConvertTo-Json)
-        [IO.File]::WriteAllText($ConfigPath, $json, (New-Object Text.UTF8Encoding($false)))
-        Say "Config ecrite : $ConfigPath"
+        $token = Read-Host 'Jeton de cette machine (Entree = en creer un ici)'
+        if ($token -and $token.Trim()) { Write-Config $url $token }
+        else {
+            $token = New-LocalToken
+            Write-Config $url $token
+            Show-Fingerprint $token
+            Say "Le worker reessaie seul chaque minute jusqu'a ce que le hub connaisse cette empreinte."
+        }
     }
     $cfg = Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json
     if (-not $cfg.hub_url -or -not $cfg.token) { Say "Config incomplete (hub_url, token) : $ConfigPath"; exit 2 }
@@ -156,6 +183,20 @@ if ($CrashTest) {
     $python = Get-Python
     & $python $script --base $Base --crash-test
     exit $LASTEXITCODE
+}
+
+# Empreinte du jeton de cette machine, sans rien lancer. Le jeton est cree s'il n'y a pas encore de config.
+if ($Fingerprint) {
+    if (Test-Path $ConfigPath) {
+        $token = ''
+        try { $token = [string](Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json).token } catch { }   # l'erreur citerait le contenu
+        if (-not $token.Trim()) { Say "Config illisible ou sans jeton : $ConfigPath"; exit 2 }
+    } else {
+        $token = New-LocalToken
+        Write-Config 'https://hub.example.com' $token
+    }
+    Show-Fingerprint $token
+    exit 0
 }
 
 # Un seul lanceur a la fois par dossier

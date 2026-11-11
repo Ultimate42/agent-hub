@@ -6,7 +6,6 @@ import {
 } from 'fs';
 import { dbInstance as db } from '../db.js';
 import { config } from '../config.js';
-import { compareTokens } from '../utils/tokens.js';
 import { logger } from '../utils/logger.js';
 
 // ---------------------------------------------------------------------------
@@ -23,16 +22,20 @@ const WORKER_NAME = /^[\w.-]{1,32}$/;
 const SAFE_NAME = /^[\w.-]{1,120}$/;
 
 export function reuseEnabled() {
-  return Boolean(config.reuseAdminToken) || config.reuseWorkerTokens.length > 0;
+  return Boolean(config.reuseAdminDigest) || config.reuseWorkerTokens.length > 0;
 }
 
-/** {role:'admin'} | {role:'worker', name} | null */
+/**
+ * {role:'admin'} | {role:'worker', name} | null. The hub only holds SHA-256 digests (config.parseTokenSpec):
+ * the presented token is hashed and the two 32-byte digests are compared in constant time.
+ */
 export function identifyReuseCaller(token) {
-  if (!token) return null;
+  if (!token || typeof token !== 'string') return null;
+  const digest = crypto.createHash('sha256').update(token, 'utf8').digest();
   for (const w of config.reuseWorkerTokens) {
-    if (compareTokens(token, w.token)) return { role: 'worker', name: w.name };
+    if (crypto.timingSafeEqual(digest, w.digest)) return { role: 'worker', name: w.name };
   }
-  if (config.reuseAdminToken && compareTokens(token, config.reuseAdminToken)) return { role: 'admin' };
+  if (config.reuseAdminDigest && crypto.timingSafeEqual(digest, config.reuseAdminDigest)) return { role: 'admin' };
   return null;
 }
 

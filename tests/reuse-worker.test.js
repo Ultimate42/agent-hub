@@ -1,6 +1,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -153,4 +154,86 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     await until('queue finished on the new version', async () => (await counts()).done === N, 60);
     assert.deepStrictEqual(fs.readdirSync(path.join(pc, 'work')), [], 'nothing left behind');
   });
+});
+
+// The token is created on the machine; only its fingerprint is shown, and the hub accepts the token from it.
+const PWSH = process.env.REUSE_TEST_PWSH || (has('pwsh') ? 'pwsh' : null);
+describe('launcher --fingerprint: token made locally, only its SHA-256 shown', { skip: !(process.platform === 'linux' && has('python3') && has('bash')) }, () => {
+  const P = '4164', URL_ = `http://localhost:${P}`;
+  const launchers = [
+    { name: 'pc-sh', file: 'install-and-run.sh', run: (f, args = ['--fingerprint']) => spawnSync('bash', [f, ...args], { encoding: 'utf8' }) },
+    ...(PWSH ? [{ name: 'pc-ps1', file: 'install-and-run.ps1', run: (f, args = ['-Fingerprint']) => spawnSync(PWSH, ['-NoProfile', '-File', f, ...args], { encoding: 'utf8' }) }] : [])
+  ];
+  let tmp, hub;
+
+  before(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reuse-fp-'));
+    for (const l of launchers) {
+      l.dir = path.join(tmp, l.name);
+      fs.mkdirSync(l.dir);
+      l.path = path.join(l.dir, l.file);
+      fs.copyFileSync(path.join(SRC, l.file), l.path);
+      l.first = l.run(l.path);
+      l.fingerprint = (l.first.stdout.match(/sha256:[0-9a-f]{64}/) || [])[0];
+    }
+    hub = spawn('node', ['src/index.js'], {
+      cwd: process.cwd(), stdio: 'ignore',
+      env: {
+        ...process.env, PORT: P, PUBLIC_URL: URL_, DB_PATH: path.join(tmp, 'hub.db'), HUB_REUSE_ADMIN_TOKEN: ADMIN,
+        HUB_REUSE_WORKER_TOKENS: launchers.filter(l => l.fingerprint).map(l => `${l.name}:${l.fingerprint}`).join(',')
+      }
+    });
+    for (let i = 0; i < 75; i++) {
+      try { if ((await fetch(`${URL_}/health`)).ok) break; } catch { /* starting */ }
+      await sleep(200);
+    }
+  });
+
+  after(() => {
+    hub?.kill('SIGTERM');
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  for (const l of launchers) {
+    test(`${l.file}: creates the config, prints the fingerprint and never the token; the hub accepts that token`, async () => {
+      assert.strictEqual(l.first.status, 0, l.first.stdout + l.first.stderr);
+      const configFile = path.join(l.dir, 'reuse-worker.config.json');
+      const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+      assert.strictEqual(config.hub_url, 'https://hub.example.com');
+      assert.match(config.token, /^[\w-]{43}$/, '32 random bytes, base64url');
+      const expected = `sha256:${crypto.createHash('sha256').update(config.token).digest('hex')}`;
+      assert.strictEqual(l.fingerprint, expected);
+      const log = fs.readFileSync(path.join(l.dir, 'logs', 'worker.log'), 'utf8');
+      for (const text of [l.first.stdout, l.first.stderr, log]) assert.ok(!text.includes(config.token), 'the token is never shown or logged');
+      assert.deepStrictEqual(fs.readdirSync(l.dir).sort(), [l.file, 'logs', 'reuse-worker.config.json'].sort(), 'nothing installed, nothing started');
+      if (l.file.endsWith('.sh')) assert.strictEqual(fs.statSync(configFile).mode & 0o777, 0o600);
+
+      // Asked again: same token, same fingerprint
+      const again = l.run(l.path);
+      assert.strictEqual(again.status, 0);
+      assert.ok(again.stdout.includes(expected));
+      assert.strictEqual(JSON.parse(fs.readFileSync(configFile, 'utf8')).token, config.token);
+
+      const status = async (token) => (await fetch(`${URL_}/api/reuse/worker/status`, {
+        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+      })).status;
+      assert.strictEqual(await status(config.token), 200);
+      assert.strictEqual(await status(expected), 403, 'the fingerprint is not a token');
+      const listed = (await (await fetch(`${URL_}/api/reuse/workers`, { headers: { Authorization: `Bearer ${ADMIN}` } })).json()).workers.find(w => w.name === l.name);
+      assert.strictEqual(listed.has_token, true);
+      assert.strictEqual(listed.online, true);
+    });
+
+    test(`${l.file}: a config without a token is reported, never replaced`, () => {
+      const dir = path.join(tmp, `${l.name}-empty`);
+      fs.mkdirSync(dir);
+      fs.copyFileSync(path.join(SRC, l.file), path.join(dir, l.file));
+      const configFile = path.join(dir, 'reuse-worker.config.json');
+      fs.writeFileSync(configFile, '{"hub_url":"https://hub.invalid","token":" "}');
+      const r = l.run(path.join(dir, l.file));
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert.ok(!/sha256:/.test(r.stdout));
+      assert.strictEqual(fs.readFileSync(configFile, 'utf8'), '{"hub_url":"https://hub.invalid","token":" "}');
+    });
+  }
 });

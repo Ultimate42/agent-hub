@@ -116,6 +116,8 @@ server.listen(config.port, config.host, () => {
     host: config.host,
     publicUrl: config.publicUrl
   });
+  // A token entry the hub could not use is said out loud (position and reason only, never the value)
+  for (const problem of config.reuseTokenProblems) logger.warn(`RE-USE tokens: ${problem}`);
 
   console.log(`
 ========================================

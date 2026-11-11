@@ -486,3 +486,115 @@ describe('RE-USE queue hardening', () => {
     assert.strictEqual((await claim()).data.job.id, kept);
   });
 });
+
+describe('RE-USE tokens declared by fingerprint', () => {
+  const P = '4163', URL_ = `http://localhost:${P}`;
+  const HASHED = 'pc-hash-token-made-on-the-pc-0123456789';   // never given to the hub
+  const UPPER = 'pc-upper-token-made-on-the-pc-0123456789';
+  const ADMIN_LOCAL = 'admin-token-made-locally-0123456789';
+  const LOST = 'token-pasted-without-a-name-0123456789';
+  const BARE = sha('a fingerprint pasted without its prefix');
+  const fp = (t) => `sha256:${sha(t)}`;
+  let hub, tmp, out = '';
+
+  before(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-fp-'));
+    hub = spawn('node', ['src/index.js'], {
+      cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env, PORT: P, PUBLIC_URL: URL_, DB_PATH: path.join(tmp, 'hub.db'), LOG_LEVEL: 'info',
+        HUB_REUSE_ADMIN_TOKEN: fp(ADMIN_LOCAL),
+        HUB_REUSE_WORKER_TOKENS: [
+          `gpu-box:${AMD}`, `pc-hash:${fp(HASHED)}`, `pc-upper:SHA256:${sha(UPPER).toUpperCase()}`,
+          LOST, 'pc-bad:sha256:abc123', 'pc-short:tooshort', `bad name:${NV}`, `pc-bare:${BARE}`, ''
+        ].join(', ')
+      }
+    });
+    hub.stdout.on('data', d => { out += d; });
+    hub.stderr.on('data', d => { out += d; });
+    for (let i = 0; i < 75; i++) {
+      try { if ((await fetch(`${URL_}/health`)).ok) break; } catch { /* starting */ }
+      await sleep(200);
+    }
+  });
+
+  after(() => {
+    hub?.kill('SIGTERM');
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const claim = async (token) => (await fetch(`${URL_}/api/reuse/next`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{"wait":0}'
+  })).status;
+  const workers = async (token) => {
+    const res = await fetch(`${URL_}/api/reuse/workers`, { headers: { Authorization: `Bearer ${token}` } });
+    return { status: res.status, data: res.status === 200 ? await res.json() : null };
+  };
+
+  test('a worker declared by fingerprint is accepted with its token, any hex case; a clear entry still works', async () => {
+    assert.strictEqual(await claim(HASHED), 200);
+    assert.strictEqual(await claim(UPPER), 200);
+    assert.strictEqual(await claim(AMD), 200, 'clear entry, as before');
+    const list = await workers(ADMIN_LOCAL);
+    assert.strictEqual(list.status, 200, 'admin declared by fingerprint');
+    const byName = Object.fromEntries(list.data.workers.map(w => [w.name, w]));
+    for (const name of ['gpu-box', 'pc-hash', 'pc-upper']) assert.strictEqual(byName[name]?.has_token, true, name);
+    for (const name of ['pc-bad', 'pc-short', 'bad name']) assert.strictEqual(byName[name], undefined, name);
+  });
+
+  test('a wrong token is refused, and a fingerprint is never a token', async () => {
+    assert.strictEqual(await claim(`${HASHED}x`), 403);
+    assert.strictEqual(await claim(HASHED.slice(0, -1)), 403);
+    assert.strictEqual(await claim(fp(HASHED)), 403, 'the published fingerprint does not open the door');
+    assert.strictEqual(await claim(sha(HASHED)), 403);
+    assert.strictEqual(await claim(sha(UPPER).toUpperCase()), 403);
+    assert.strictEqual((await workers(fp(ADMIN_LOCAL))).status, 403);
+    assert.strictEqual((await workers(sha(ADMIN_LOCAL))).status, 403);
+    assert.strictEqual((await workers(HASHED)).status, 403, 'a worker is not the admin');
+    assert.strictEqual(await claim(ADMIN_LOCAL), 403, 'the admin is not a worker');
+    for (const refused of [LOST, 'abc123', 'tooshort', NV]) assert.strictEqual(await claim(refused), 403);
+  });
+
+  test('a malformed entry is reported at startup by its position, never by its value', async () => {
+    const warned = out.split('\n').filter(l => l.includes('RE-USE tokens:'));
+    for (const n of [4, 5, 6, 7]) assert.ok(warned.some(l => l.includes(`entry ${n} ignored`)), `entry ${n} reported:\n${warned.join('\n')}`);
+    assert.ok(warned.some(l => l.includes('entry 8') && l.includes('without its \\"sha256:\\" prefix')), 'bare fingerprint pointed out');
+    assert.strictEqual(warned.length, 5, 'valid entries and the empty one are not reported');
+    assert.ok(warned.every(l => JSON.parse(l).level === 'warn'));
+    for (const secret of [LOST, LOST.slice(0, 12), 'abc123', 'tooshort', NV, AMD, HASHED, BARE, sha(HASHED), ADMIN_LOCAL, 'pc-bad', 'pc-short', 'bad name']) {
+      assert.ok(!out.includes(secret), 'nothing of a refused or accepted entry reaches the log');
+    }
+  });
+});
+
+describe('RE-USE token parsing', () => {
+  test('clear and fingerprint forms give the same digest; malformed forms give a reason without the value', async () => {
+    const { parseTokenSpec, parseReuseWorkerTokens, parseReuseAdminToken } = await import('../src/config.js');
+    const token = 'made-on-the-pc-0123456789';
+    const digest = crypto.createHash('sha256').update(token).digest();
+    assert.deepStrictEqual(parseTokenSpec(token), { digest });
+    assert.deepStrictEqual(parseTokenSpec(`sha256:${sha(token)}`), { digest });
+    assert.deepStrictEqual(parseTokenSpec(`sha256:${sha(token).toUpperCase()}`), { digest });
+    for (const bad of ['', 'short', 'sha256:', 'sha256:xyz', `sha256:${sha(token)}0`, `sha256:${sha(token).slice(1)}`, `sha256: ${sha(token)}`, `sha256:${'g'.repeat(64)}`]) {
+      const r = parseTokenSpec(bad);
+      assert.ok(r.problem && !r.digest, bad);
+      if (bad.length > 7) assert.ok(!r.problem.includes(bad.slice(7)), 'reason without the value');
+    }
+    const parsed = parseReuseWorkerTokens(` a:${token} ,, b:sha256:${sha(token)}, c:sha256:12, ${token}, d:with:colons-0123456789 `);
+    assert.deepStrictEqual(parsed.workers.map(w => w.name), ['a', 'b', 'd']);
+    assert.ok(parsed.workers[0].digest.equals(digest) && parsed.workers[1].digest.equals(digest));
+    assert.ok(parsed.workers[2].digest.equals(crypto.createHash('sha256').update('with:colons-0123456789').digest()), 'a clear token may contain colons');
+    assert.strictEqual(parsed.problems.length, 2);
+    assert.match(parsed.problems[0], /entry 4 ignored/);
+    assert.match(parsed.problems[1], /entry 5 ignored/);
+    assert.ok(!parsed.problems.join(' ').includes(token));
+    assert.deepStrictEqual(parseReuseWorkerTokens(undefined), { workers: [], problems: [] });
+    assert.deepStrictEqual(parseReuseAdminToken(undefined), { digest: null, problems: [] });
+    assert.ok(parseReuseAdminToken(`sha256:${sha(token)}`).digest.equals(digest));
+    assert.ok(parseReuseAdminToken(token).digest.equals(digest));
+    const short = parseReuseAdminToken('tooshort');
+    assert.strictEqual(short.digest, null);
+    assert.strictEqual(short.problems.length, 1);
+    assert.ok(!short.problems[0].includes('tooshort'));
+  });
+});

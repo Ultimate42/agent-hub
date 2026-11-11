@@ -57,12 +57,56 @@ Linux : `bash install-and-run.sh --crash-test`, mêmes critères, rapport dans `
 
 ## Installation sur le PC (une fois)
 
-1. Créer le jeton de la machine côté hub (voir « Déploiement côté hub »).
-2. Poser `install-and-run.ps1` (Windows) ou `install-and-run.sh` (Linux) dans un dossier vide, par exemple
+1. Poser `install-and-run.ps1` (Windows) ou `install-and-run.sh` (Linux) dans un dossier vide, par exemple
    `C:\reuse-worker`.
-3. Le lancer : clic droit › « Exécuter avec PowerShell », ou
+2. Le lancer : clic droit › « Exécuter avec PowerShell », ou
    `powershell -ExecutionPolicy Bypass -File install-and-run.ps1` (Linux : `bash install-and-run.sh`).
-4. Répondre aux deux questions (adresse du hub, jeton). C'est fini.
+3. Répondre aux deux questions : l'adresse du hub, puis le jeton. **Appuyer sur Entrée à la question du jeton**
+   pour qu'il soit créé sur place : le script affiche alors une ligne `Empreinte à déclarer au hub : sha256:…`.
+4. Transmettre cette empreinte (et le nom choisi pour la machine) à qui gère le hub. Elle peut passer par un
+   salon : elle ne permet ni de retrouver le jeton ni de s'en servir. Le worker réessaie seul chaque minute et
+   démarre dès que le hub la connaît (voir « Déploiement côté hub »). C'est fini.
+
+Le jeton lui-même ne quitte jamais le PC : il n'est écrit que dans `reuse-worker.config.json`, jamais affiché
+ni journalisé. Ne jamais l'envoyer, même pour un dépannage : en cas de doute, supprimer la config et recommencer.
+
+### Jeton créé sur le PC, empreinte seule publiée
+
+Sans rien installer ni lancer (pour un agent, ou pour relire l'empreinte plus tard) :
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\reuse-worker\install-and-run.ps1 -Fingerprint
+```
+
+```bash
+bash install-and-run.sh --fingerprint
+```
+
+S'il n'y a pas encore de config, la commande crée le jeton (32 octets aléatoires) et la config, avec l'adresse
+`https://hub.example.com` (à corriger dans le fichier pour un autre hub). S'il y en a une, elle n'y touche pas.
+Dans les deux cas elle affiche la seule empreinte, `sha256:` suivi de 64 caractères, puis sort.
+
+Sans le lanceur, à la main, dans le dossier du worker. PowerShell (Windows PowerShell 5.1 ou plus récent) :
+
+```powershell
+$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+$t = [Convert]::ToBase64String($b).TrimEnd('=').Replace('+','-').Replace('/','_')
+[IO.File]::WriteAllText((Join-Path $PWD.Path 'reuse-worker.config.json'), (@{ hub_url = 'https://hub.example.com'; token = $t; backend = 'auto' } | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+'sha256:' + (([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($t)) | ForEach-Object { $_.ToString('x2') }) -join '')
+```
+
+bash :
+
+```bash
+T=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')
+( umask 077; printf '{"hub_url": "https://hub.example.com", "token": "%s", "backend": "auto"}\n' "$T" > reuse-worker.config.json )
+printf '%s' "$T" | sha256sum | awk '{print "sha256:" $1}'
+```
+
+L'empreinte est le SHA-256 du jeton exact, en UTF-8, sans retour à la ligne. Seule la dernière ligne de chaque
+bloc affiche quelque chose : c'est elle qu'on publie.
+
+Un jeton fourni par le hub reste accepté : le coller à la question du jeton au lieu d'appuyer sur Entrée.
 
 Le script écrit `reuse-worker.config.json` à côté de lui, installe tout **dans ce dossier** (rien ailleurs,
 aucun droit administrateur), s'inscrit au démarrage, puis travaille. Pour préparer la config à la main, copier
@@ -74,7 +118,7 @@ hub le voit. Le verdict est mémorisé par carte.
 
 | Fichier | Rôle |
 |---|---|
-| `reuse-worker.config.json` | adresse du hub, jeton, réglages (jamais dans le dépôt) |
+| `reuse-worker.config.json` | adresse du hub, jeton, réglages (jamais dans le dépôt, jamais envoyé) |
 | `logs/worker.log` | journal lisible (5 Mo × 4) |
 | `logs/state.json` | état courant : version, carte, job, dernière erreur |
 | `STOP` | créer ce fichier vide pour arrêter ; le supprimer pour repartir |
@@ -147,14 +191,31 @@ une machine a dû revenir en arrière, `info.rolled_back_from`.
 Variables d'environnement du service (jamais dans le dépôt) :
 
 ```
-HUB_REUSE_ADMIN_TOKEN=<32 caractères aléatoires>                 # le manager
-HUB_REUSE_WORKER_TOKENS=gpu-box:<jeton>,dev-box:<jeton>            # un jeton par machine, révocable en retirant l'entrée
+HUB_REUSE_ADMIN_TOKEN=<32 caractères aléatoires>                 # le manager (ou sha256:<empreinte>)
+HUB_REUSE_WORKER_TOKENS=gpu-box:sha256:<empreinte>,dev-box:<jeton> # une entrée par machine, révocable en la retirant
 # optionnels : HUB_REUSE_DIR (audio en file, défaut <dossier de la base>/reuse), HUB_REUSE_WORKER_DIR (défaut ce dossier),
 #              HUB_REUSE_MAX_FILE_SIZE (32 Mo par fichier), HUB_REUSE_MAX_STORAGE (6 Go en tout), HUB_REUSE_LEASE_SECONDS (600)
 ```
 
-Sans ces variables, toutes les routes `/api/reuse/*` répondent 404. Générer un jeton :
-`node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`.
+Sans ces variables, toutes les routes `/api/reuse/*` répondent 404.
+
+Une entrée de machine s'écrit de deux façons, mélangeables dans la même liste :
+
+- `nom:sha256:<64 caractères hexadécimaux>` : l'**empreinte** du jeton, publiée par le PC (voir « Jeton créé sur
+  le PC »). C'est la forme à préférer : le hub ne voit jamais le jeton, et rien de secret ne circule.
+- `nom:<jeton>` : le jeton en clair (16 caractères au moins), comme avant. Il faut alors le remettre au PC par
+  un canal sûr. En générer un : `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`.
+
+`HUB_REUSE_ADMIN_TOKEN` accepte les deux mêmes formes (`sha256:<empreinte>` ou le jeton en clair). Dans tous les
+cas le hub ne garde en mémoire que des empreintes : il calcule le SHA-256 du jeton présenté et le compare en
+temps constant. Présenter l'empreinte à la place du jeton est refusé. Le nom est libre (lettres, chiffres,
+`.`, `_`, `-`, 32 au plus) ; c'est celui que montre `GET /api/reuse/workers`, avec `has_token: true`.
+
+Les variables sont lues au démarrage : ajouter ou retirer une machine demande de redémarrer le hub. Une entrée
+inutilisable (pas de nom, empreinte qui ne fait pas 64 caractères hexadécimaux, jeton trop court) est ignorée
+et **signalée dans le journal du hub au démarrage**, par sa position dans la liste et la raison, jamais par sa
+valeur : `RE-USE tokens: HUB_REUSE_WORKER_TOKENS entry 2 ignored: …`. Une empreinte collée sans son préfixe
+`sha256:` est signalée aussi : elle serait prise pour un jeton en clair, et l'empreinte publiée ouvrirait la porte.
 
 Si un reverse proxy limite la taille des requêtes, autoriser 32 Mo sur `/api/reuse/`. Le hub garde les sources
 et les résultats sur disque (environ 230 Mo par heure d'audio) jusqu'au `DELETE` du lot ; au-delà de 6 Go en
