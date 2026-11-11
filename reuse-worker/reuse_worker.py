@@ -294,7 +294,7 @@ class Hub:
 
     def request(self, method, path, body=None, raw=None, headers=None, timeout=60, dest=None):
         """-> (statut, json ou None). Les erreurs réseau et 5xx lèvent OSError ; les 4xx sont renvoyés tels quels."""
-        h = {'Authorization': 'Bearer ' + self.token, 'User-Agent': 'reuse-worker'}
+        h = {'User-Agent': 'reuse-worker'}
         data = None
         if raw is not None:
             data, h['Content-Type'] = raw, 'audio/flac'
@@ -302,6 +302,9 @@ class Hub:
             data, h['Content-Type'] = json.dumps(body).encode(), 'application/json'
         h.update(headers or {})
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=h)
+        # urllib recopie les en-têtes ordinaires sur la cible d'une redirection, quel que soit l'hôte :
+        # le jeton n'est donc jamais posé que sur la requête faite au hub lui-même.
+        req.add_unredirected_header('Authorization', 'Bearer ' + self.token)
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
                 if dest is not None:

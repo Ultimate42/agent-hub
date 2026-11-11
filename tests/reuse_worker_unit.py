@@ -138,6 +138,42 @@ class ArchiveTest(unittest.TestCase):
         self.assertFalse((d / 'ko.bin').exists())
 
 
+class HubTokenTest(unittest.TestCase):
+    def test_the_token_never_follows_a_redirect(self):
+        # Un hub qui redirige (proxy mal réglé, http -> https, hub compromis) ne doit pas faire partir le jeton ailleurs
+        import http.server
+        import threading
+        seen = {}
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen['target'] = self.headers.get('Authorization')
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+            def log_message(self, *a):
+                pass
+
+        class Hub(Target):
+            def do_GET(self):
+                seen['hub'] = self.headers.get('Authorization')
+                self.send_response(302)
+                self.send_header('Location', 'http://127.0.0.1:%d/ailleurs' % target.server_port)
+                self.end_headers()
+
+        target = http.server.HTTPServer(('127.0.0.1', 0), Target)
+        hub = http.server.HTTPServer(('127.0.0.1', 0), Hub)
+        for srv in (target, hub):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+        w.Hub('http://127.0.0.1:%d' % hub.server_port, 'jeton-de-test').request('GET', '/api/reuse/worker/manifest')
+        self.assertEqual(seen['hub'], 'Bearer jeton-de-test')
+        self.assertIn('target', seen)
+        self.assertIsNone(seen['target'])
+
+
 class NamesTest(unittest.TestCase):
     def test_published_file_names(self):
         for good in ('reuse_worker.py', 'install-and-run.ps1', 'a', 'version.txt', '-x.py', 'x' * 120):

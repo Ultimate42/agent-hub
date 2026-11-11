@@ -130,7 +130,8 @@ import hashlib, json, os, re, sys, urllib.request
 cfg = json.load(open(sys.argv[1], encoding='utf-8-sig'))
 hub, dest = cfg['hub_url'].rstrip('/'), sys.argv[2]
 def get(path):
-    req = urllib.request.Request(hub + path, headers={'Authorization': 'Bearer ' + cfg['token'], 'User-Agent': 'reuse-worker'})
+    req = urllib.request.Request(hub + path, headers={'User-Agent': 'reuse-worker'})
+    req.add_unredirected_header('Authorization', 'Bearer ' + cfg['token'])  # jamais recopié vers une redirection
     return urllib.request.urlopen(req, timeout=120).read()
 manifest = json.loads(get('/api/reuse/worker/manifest'))
 os.makedirs(dest)
