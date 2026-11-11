@@ -303,6 +303,76 @@ describe('RE-USE cleaning queue', () => {
     assert.deepStrictEqual(fs.readdirSync(path.join(TMP_DIR, 'reuse')), [], 'audio removed from disk');
     assert.strictEqual((await call('/api/reuse/batches/p55', { method: 'DELETE', token: ADMIN })).status, 404);
   });
+
+  test('schedule: outside its window a worker gets no new job, finishes the one it holds, and the state is visible', async () => {
+    const put = (name, schedule, token = ADMIN) => call(`/api/reuse/workers/${name}/schedule`, { method: 'PUT', token, body: schedule });
+    const worker = async (name) => (await call('/api/reuse/workers', { token: ADMIN })).data.workers.find(w => w.name === name);
+    const NEVER = { timezone: 'Europe/Paris', days: {} };
+    const ALWAYS = { timezone: 'Europe/Paris', days: { mon: ['00:00-24:00'], tue: ['00:00-24:00'], wed: ['00:00-24:00'], thu: ['00:00-24:00'], fri: ['00:00-24:00'], sat: ['00:00-24:00'], sun: ['00:00-24:00'] } };
+
+    // No schedule: always available, and the admin view says so
+    assert.deepStrictEqual((await call('/api/reuse/workers/gpu-box/schedule', { token: ADMIN })).data,
+      { success: true, worker: 'gpu-box', schedule: null, in_window: true, next_window_start: null, next_window_end: null });
+    assert.strictEqual((await worker('gpu-box')).in_window, true);
+    assert.strictEqual((await worker('gpu-box')).schedule, null);
+
+    // Admin only, known worker only, valid schedule only
+    assert.strictEqual((await put('gpu-box', NEVER, AMD)).status, 403);
+    assert.strictEqual((await call('/api/reuse/workers/gpu-box/schedule', { token: AMD })).status, 403);
+    assert.strictEqual((await put('nobody', NEVER)).status, 404);
+    assert.strictEqual((await put('gpu-box', { timezone: 'Europe/Paris', days: { monday: ['20:00-08:00'] } })).status, 400);
+    assert.strictEqual((await put('gpu-box', {})).status, 400);
+
+    // gpu-box holds a job when its window closes
+    const held = (await submit('p55_040.flac', fakeFlac({ salt: 'j' }))).data.job.id;
+    const waiting = (await submit('p55_041.flac', fakeFlac({ salt: 'k' }))).data.job.id;
+    assert.strictEqual((await next(AMD)).data.job.id, held);
+    const closed = await put('gpu-box', NEVER);
+    assert.strictEqual(closed.status, 200);
+    assert.strictEqual(closed.data.in_window, false);
+
+    // The job in progress goes on: heartbeat, resume after a restart, result
+    assert.strictEqual((await call(`/api/reuse/jobs/${held}/heartbeat`, { method: 'POST', token: AMD, body: { progress: 0.5 } })).status, 200);
+    assert.strictEqual((await next(AMD)).data.job.id, held, 'restarted mid-job: it resumes its own job');
+    assert.strictEqual((await result(held, AMD, fakeFlac({ salt: 'j-clean' }))).status, 200);
+
+    // ... but no new one: same answer as an empty queue, which every worker version already handles
+    const refused = await next(AMD);
+    assert.strictEqual(refused.status, 200);
+    assert.strictEqual(refused.data.job, null);
+    assert.strictEqual(refused.data.orders.paused, false, 'not a pause: the worker is told nothing new');
+    assert.strictEqual((await job(waiting)).status, 'pending');
+    assert.strictEqual((await job(waiting)).attempts, 0);
+
+    // Still online (it keeps polling), shown out of window with its schedule
+    const amd = await worker('gpu-box');
+    assert.strictEqual(amd.online, true);
+    assert.strictEqual(amd.in_window, false);
+    assert.deepStrictEqual(amd.schedule, NEVER);
+    assert.strictEqual(amd.next_window_start, null);
+    assert.strictEqual((await worker('dev-box')).in_window, true, 'the other worker is not concerned');
+
+    // A weekly schedule announces its next window
+    const day = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'][new Date(Date.now() + 2 * 24 * 3600 * 1000).getUTCDay()];
+    const later = await put('gpu-box', { timezone: 'UTC', days: { [day]: ['00:00-06:00'] } });
+    assert.strictEqual(later.data.in_window, false);
+    assert.ok(Date.parse(later.data.next_window_start) > Date.now());
+    assert.strictEqual(Date.parse(later.data.next_window_end) - Date.parse(later.data.next_window_start), 6 * 3600 * 1000);
+    assert.strictEqual((await next(AMD)).data.job, null);
+
+    // Window open again: the waiting job is served. Then the schedule is removed.
+    assert.strictEqual((await put('gpu-box', ALWAYS)).data.in_window, true);
+    assert.strictEqual((await next(AMD)).data.job.id, waiting);
+    await result(waiting, AMD, fakeFlac({ salt: 'k-clean' }));
+    await put('gpu-box', NEVER);
+    const cleared = await call('/api/reuse/workers/gpu-box/schedule', { method: 'DELETE', token: ADMIN });
+    assert.strictEqual(cleared.status, 200);
+    assert.strictEqual(cleared.data.schedule, null);
+    assert.strictEqual(cleared.data.in_window, true);
+    const last = (await submit('p55_042.flac', fakeFlac({ salt: 'l' }))).data.job.id;
+    assert.strictEqual((await next(AMD)).data.job.id, last, 'no schedule: served again');
+    await call(`/api/reuse/jobs/${last}/cancel`, { method: 'POST', token: ADMIN });
+  });
 });
 
 describe('RE-USE queue disabled', () => {

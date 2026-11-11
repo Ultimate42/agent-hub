@@ -173,6 +173,7 @@ curl -H "$A" "$H/api/reuse/workers"                         # machines : en lign
 curl -X POST -H "$A" -H 'Content-Type: application/json' -d '{"pause":true}'  "$H/api/reuse/workers/gpu-box/order"
 curl -X POST -H "$A" -H 'Content-Type: application/json' -d '{"pause":false}' "$H/api/reuse/workers/gpu-box/order"
 curl -X POST -H "$A" -H 'Content-Type: application/json' -d '{"update":true}' "$H/api/reuse/workers/gpu-box/order"
+curl -H "$A" "$H/api/reuse/workers/gpu-box/schedule"         # planning horaire de la machine (voir plus bas)
 curl -X POST -H "$A" "$H/api/reuse/jobs/12/retry"           # ou /cancel
 curl -X DELETE -H "$A" "$H/api/reuse/batches/extrait01"     # libère le disque du hub une fois les sorties récupérées
 ```
@@ -187,6 +188,71 @@ un redémarrage, une seule fois.
 version est l'empreinte du contenu ; aucun numéro à incrémenter, aucun redémarrage du hub. Les machines la
 prennent en moins d'une minute (à la fin du job en cours). `GET /api/reuse/workers` montre `up_to_date` et, si
 une machine a dû revenir en arrière, `info.rolled_back_from`.
+
+## Planning horaire par machine
+
+Une machine qui sert aussi de poste de travail ne calcule qu'aux heures convenues. Le planning est une donnée,
+pas du code : fichier `<HUB_REUSE_DIR>/schedules.json` sur le serveur du hub, une entrée par machine. Une
+machine sans entrée est toujours disponible (cas de `dev-box`).
+
+```json
+{
+  "gpu-box": {
+    "timezone": "Europe/Paris",
+    "days": {
+      "mon": ["00:00-08:00", "20:00-08:00"],
+      "tue": ["20:00-08:00"],
+      "wed": ["20:00-08:00"],
+      "thu": ["20:00-08:00"],
+      "fri": ["20:00-24:00"],
+      "sat": ["00:00-24:00"],
+      "sun": ["00:00-24:00"]
+    }
+  }
+}
+```
+
+Ce planning est celui du PC GPU : du lundi au vendredi de 19:00 à 09:00 le lendemain, et tout le week-end
+(du vendredi 19:00 au lundi 09:00), heure de Paris.
+
+- Une plage s'écrit `HH:MM-HH:MM`, en heure locale du fuseau, sous le jour où elle **commence** (`sun`, `mon`,
+  `tue`, `wed`, `thu`, `fri`, `sat`). Si la fin n'est pas après le début, la plage passe minuit et se termine
+  le lendemain : `"20:00-08:00"` sous `mon` va du lundi 19:00 au mardi 09:00. `24:00` est la fin du jour. Un
+  jour absent est fermé.
+- Tout est calculé sur l'heure locale : au changement d'heure d'été ou d'hiver, 19:00 reste 19:00.
+- **Hors créneau** : la machine ne reçoit aucun nouveau job. `POST /api/reuse/next` lui répond `job: null`,
+  la même réponse qu'une file vide, donc aucune version du worker n'a à changer. Elle reste en ligne
+  (elle continue d'interroger le hub) et prend les mises à jour.
+- **Job en cours à la fermeture du créneau : il est terminé**, pas arrêté. Un morceau de 5 minutes demande
+  quelques minutes de calcul ; l'arrêter jetterait ce travail pour libérer la machine à peine plus tôt. La
+  machine peut donc calculer encore quelques minutes après l'heure de fin. Pour libérer la machine tout de
+  suite, fichier `STOP` dans son dossier (ou fermer le worker) : le bail expire et une autre machine reprend.
+- La pause (`order`) et le planning se cumulent : une machine en pause ne reçoit rien, même dans son créneau.
+
+Lire, changer, retirer (jeton admin) :
+
+```bash
+curl -H "$A" "$H/api/reuse/workers/gpu-box/schedule"
+curl -X PUT -H "$A" -H 'Content-Type: application/json' \
+     -d '{"timezone":"Europe/Paris","days":{"sat":["00:00-24:00"],"sun":["00:00-24:00"]}}' "$H/api/reuse/workers/gpu-box/schedule"
+curl -X DELETE -H "$A" "$H/api/reuse/workers/gpu-box/schedule"   # plus de planning : toujours disponible
+```
+
+Le `PUT` remplace le planning entier de la machine ; il est refusé (400, avec la raison) s'il est mal écrit.
+Le fichier peut aussi être modifié à la main : il est relu dès qu'il change, sans redémarrer le hub. Chaque
+changement fait par l'API est noté dans `<HUB_REUSE_DIR>/schedules.log.jsonl` avec l'ancienne valeur
+(`previous`), ce qui suffit à revenir en arrière.
+
+`GET /api/reuse/workers` montre pour chaque machine `schedule` (`null` = pas de planning), `in_window`,
+`next_window_start` et `next_window_end` (UTC). Dans un créneau, `next_window_end` est la fin du créneau en
+cours et `next_window_start` l'ouverture du suivant ; hors créneau, ce sont le début et la fin du prochain.
+Les deux sont `null` sans planning, ou si le planning ne change jamais d'état.
+
+Erreur dans le fichier : une entrée incompréhensible (jour mal nommé, plage mal écrite) **ferme la machine
+concernée** et la raison apparaît dans `schedule_error` ; un fichier illisible en entier ferme toutes les
+machines jusqu'à sa réparation. Le choix est volontaire : une faute de frappe ne doit pas faire calculer un
+poste de travail en pleine journée, et une file qui n'avance plus se voit tout de suite. L'API refuse alors
+d'écrire (409) pour ne pas écraser ce qu'un humain doit corriger.
 
 ## Ce que le hub garantit
 

@@ -7,6 +7,7 @@ import {
 import { dbInstance as db } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { workerWindow, workerInWindow, setWorkerSchedule, clearWorkerSchedule } from './reuse-schedule.js';
 
 // ---------------------------------------------------------------------------
 // RE-USE cleaning queue (speech enhancement done by remote GPU workers)
@@ -338,6 +339,9 @@ export function noteReusePoll(name, info = {}) {
 /**
  * Next job for this worker, or null. A worker that still holds a live lease gets that same job back
  * (it restarted mid-job: it resumes instead of taking a second one). Jobs out of attempts are failed.
+ * Outside its schedule (reuse-schedule.js) a worker is given no NEW job, exactly like an empty queue; the job
+ * it already holds is left to finish (heartbeats, result and resume after a restart are not gated): stopping
+ * it would throw away minutes of computation to free the machine a few minutes earlier.
  */
 export function claimJob(name, now = Date.now()) {
   return db.transaction(() => {
@@ -347,6 +351,7 @@ export function claimJob(name, now = Date.now()) {
       q.renew.run(now + config.reuseLeaseMs, null, mine.id);
       return q.byId.get(mine.id);
     }
+    if (!workerInWindow(name, now)) return null;
     for (;;) {
       const job = q.next.get(now);
       if (!job) return null;
@@ -477,6 +482,8 @@ export function listWorkers(now = Date.now()) {
         online: Boolean(w.last_poll_at) && now - w.last_poll_at < 90 * 1000,
         paused: Boolean(w.paused),
         update_requested: Boolean(w.update_requested),
+        // schedule (null = always available), in_window, next_window_start, next_window_end[, schedule_error]
+        ...workerWindow(w.name, now),
         up_to_date: info.version ? info.version === published : null,
         done: w.done || 0,
         failed: w.failed || 0,
@@ -499,6 +506,22 @@ export function orderWorker(name, { pause, update } = {}) {
   if (update === true) q.setUpdate.run(crypto.randomInt(1, 2 ** 31), name);
   logger.info('RE-USE worker order', { worker: name, pause, update });
   return { ok: true, orders: workerOrders(name) };
+}
+
+const knownWorker = (name) => config.reuseWorkerTokens.some(w => w.name === name) || Boolean(q.worker.get(name));
+
+/** Schedule of one worker and where it stands now. */
+export function getSchedule(name) {
+  if (!WORKER_NAME.test(name || '')) return err(400, 'Invalid worker name');
+  if (!knownWorker(name)) return err(404, 'Unknown worker');
+  return { ok: true, worker: name, ...workerWindow(name) };
+}
+
+/** Set ({timezone, days}) or remove (null) the schedule of one worker. Applied at its next poll. */
+export function setSchedule(name, schedule) {
+  if (!WORKER_NAME.test(name || '')) return err(400, 'Invalid worker name');
+  if (!knownWorker(name)) return err(404, 'Unknown worker');
+  return schedule === null ? clearWorkerSchedule(name) : setWorkerSchedule(name, schedule);
 }
 
 // ---------------------------------------------------------------------------

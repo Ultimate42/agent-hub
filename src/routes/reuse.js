@@ -5,7 +5,7 @@ import { config } from '../config.js';
 import {
   reuseEnabled, identifyReuseCaller, submitJob, listJobs, getJob, jobView, retryJob, cancelJob, deleteBatch,
   noteReusePoll, claimJob, claimView, canReadInput, heartbeat, failJob, completeJob,
-  listWorkers, orderWorker, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost
+  listWorkers, orderWorker, getSchedule, setSchedule, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost
 } from '../services/reuse.js';
 
 // ---------------------------------------------------------------------------
@@ -110,7 +110,10 @@ router.delete('/api/reuse/batches/:batch', guard('admin'), (req, res) => {
   answer(res, deleteBatch(req.params.batch));
 });
 
-/** GET /api/reuse/workers - Every worker: last poll, version, GPU, state, pause, speed (admin). */
+/**
+ * GET /api/reuse/workers - Every worker: last poll, version, GPU, state, pause, speed, and its schedule:
+ * schedule (null = always available), in_window, next_window_start, next_window_end (admin).
+ */
 router.get('/api/reuse/workers', guard('admin'), (req, res) => {
   res.json(listWorkers());
 });
@@ -118,6 +121,23 @@ router.get('/api/reuse/workers', guard('admin'), (req, res) => {
 /** POST /api/reuse/workers/:name/order {pause: true|false} and/or {update: true} (admin). */
 router.post('/api/reuse/workers/:name/order', guard('admin'), json, (req, res) => {
   answer(res, orderWorker(req.params.name, req.body || {}));
+});
+
+/**
+ * GET /api/reuse/workers/:name/schedule - {worker, schedule, in_window, next_window_start, next_window_end} (admin).
+ * PUT - body {timezone: "Europe/Paris", days: {mon: ["00:00-08:00", "20:00-08:00"], fri: ["20:00-24:00"], ...}}:
+ *       ranges in local time under the day they start; an end not after the start runs into the next day.
+ * DELETE - no schedule any more: the worker is always available.
+ * Outside its schedule a worker gets no new job (POST /api/reuse/next answers job: null); it finishes the one it holds.
+ */
+router.get('/api/reuse/workers/:name/schedule', guard('admin'), (req, res) => {
+  answer(res, getSchedule(req.params.name));
+});
+router.put('/api/reuse/workers/:name/schedule', guard('admin'), json, (req, res) => {
+  answer(res, setSchedule(req.params.name, req.body));
+});
+router.delete('/api/reuse/workers/:name/schedule', guard('admin'), (req, res) => {
+  answer(res, setSchedule(req.params.name, null));
 });
 
 // ----- Worker ----------------------------------------------------------------
