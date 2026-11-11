@@ -541,3 +541,72 @@ export function workerManifest() {
 export function workerFilePath(name) {
   return workerManifest().files.some(f => f.name === name) ? path.join(workerDir(), name) : null;
 }
+
+// ---------------------------------------------------------------------------
+// Portable Python for the Windows launcher, served as a fallback when the PC cannot reach python.org
+// ---------------------------------------------------------------------------
+// One source of truth: the version and the checksum are read from the published install-and-run.ps1, so the
+// hub serves exactly the archive that launcher accepts. The official zip is fetched once from python.org,
+// checked against that checksum, and kept beside the audio (<reuseDir>/runtime, outside the repository).
+const PYTHON_MAX_BYTES = 64 * 1024 * 1024;
+const pythonChecked = new Map(); // "<file>:<size>:<mtime>" -> sha256 (a cached archive is hashed once, not per request)
+let pythonFetch = null;          // one download at a time, shared by concurrent requests
+
+/** {version, sha256, name, url} announced by the published Windows launcher, or null. */
+export function pythonRuntimeSpec() {
+  const launcher = workerFilePath('install-and-run.ps1');
+  if (!launcher) return null;
+  let src;
+  try { src = readFileSync(launcher, 'utf8'); } catch { return null; }
+  const version = /^\$PyVersion\s*=\s*'(\d+\.\d+\.\d+)'/m.exec(src)?.[1];
+  const digest = /^\$PySha256\s*=\s*'([0-9a-fA-F]{64})'/m.exec(src)?.[1]?.toLowerCase();
+  if (!version || !digest) return null;
+  const name = `python-${version}-embed-amd64.zip`;
+  return { version, sha256: digest, name, url: `${config.reusePythonBaseUrl.replace(/\/+$/, '')}/${version}/${name}` };
+}
+
+function pythonCached(file, expected) {
+  let s;
+  try { s = statSync(file); } catch { return false; }
+  const key = `${file}:${s.size}:${s.mtimeMs}`;
+  if (!pythonChecked.has(key)) {
+    pythonChecked.clear();
+    pythonChecked.set(key, sha256(readFileSync(file)));
+  }
+  return pythonChecked.get(key) === expected;
+}
+
+async function downloadPython(spec, file) {
+  const res = await fetch(spec.url, { headers: { 'User-Agent': 'agent-hub-reuse/1.0' }, signal: AbortSignal.timeout(120000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (Number(res.headers.get('content-length')) > PYTHON_MAX_BYTES) throw new Error('archive larger than expected');
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of res.body) {
+    size += chunk.length;
+    if (size > PYTHON_MAX_BYTES) throw new Error('archive larger than expected');
+    chunks.push(chunk);
+  }
+  const data = Buffer.concat(chunks);
+  const got = sha256(data);
+  if (got !== spec.sha256) throw new Error(`checksum ${got} is not the one the launcher expects`);
+  writeAtomic(file, data);
+  logger.info('RE-USE: portable Python cached for the launchers', { version: spec.version, bytes: data.length });
+}
+
+/** {ok, file, spec} once the archive is on disk with the expected checksum; never serves anything else. */
+export async function pythonRuntime() {
+  const spec = pythonRuntimeSpec();
+  if (!spec) return err(404, 'The published worker has no Windows launcher announcing a Python version');
+  const file = path.join(config.reuseDir, 'runtime', spec.name);
+  if (pythonCached(file, spec.sha256)) return { ok: true, file, spec };
+  if (!pythonFetch) pythonFetch = downloadPython(spec, file).finally(() => { pythonFetch = null; });
+  try {
+    await pythonFetch;
+  } catch (e) {
+    logger.warn('RE-USE: portable Python could not be fetched', { url: spec.url, error: e.message });
+    return err(502, `The hub could not fetch Python ${spec.version}: ${e.message}`);
+  }
+  // Checked again from the disk: a download started for a previous launcher version is not served for this one
+  return pythonCached(file, spec.sha256) ? { ok: true, file, spec } : err(503, 'Python archive is being replaced: try again');
+}

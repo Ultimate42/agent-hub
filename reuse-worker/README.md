@@ -147,6 +147,15 @@ Désinstaller : `install-and-run.ps1 -RemoveStartup` (Linux : `--remove-startup`
   retour à la précédente, et elle n'est plus réessayée tant que le hub n'en publie pas une autre. La
   vérification de mise à jour passe avant tout le reste : publier un correctif répare donc une machine bloquée.
   Quand la file est pleine, la mise à jour se fait entre deux jobs, sans attendre que la file soit vide.
+- **Python portable (Windows)** : le lanceur le prend sur python.org ; si python.org refuse ou ne répond pas
+  (vu : 403 depuis un PC), il prend la même archive officielle sur le hub (`GET /api/reuse/worker/python`, jeton
+  de la machine). Le hub lit la version et l'empreinte dans le `install-and-run.ps1` publié, télécharge l'archive
+  une fois, la vérifie et la garde dans `<HUB_REUSE_DIR>/runtime/`. Dans les deux cas le lanceur n'accepte que
+  l'empreinte inscrite dans son propre fichier.
+- **Lanceur bloqué avant Python** : tant que l'installation échoue, le programme ne tourne pas et ne peut donc
+  pas remplacer le lanceur ; le lanceur Windows compare alors lui-même son fichier à celui que publie le hub et
+  le remplace (empreinte et syntaxe vérifiées, ancien gardé en `.prev`). Un lanceur antérieur à ce mécanisme
+  doit être remplacé une fois à la main.
 - **Résultat refusé par le hub** (trop gros, par exemple) : la machine rend le job en comptant l'essai, au lieu
   de le recalculer sans fin ; au bout de trois essais le job passe en échec.
 - **Moteur en panne sur une machine** : elle attend de plus en plus longtemps entre deux essais au lieu

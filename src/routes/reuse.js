@@ -5,7 +5,7 @@ import { config } from '../config.js';
 import {
   reuseEnabled, identifyReuseCaller, submitJob, listJobs, getJob, jobView, retryJob, cancelJob, deleteBatch,
   noteReusePoll, claimJob, claimView, canReadInput, heartbeat, failJob, completeJob,
-  listWorkers, orderWorker, workerOrders, workerManifest, workerFilePath, inputPath, outputPath, inputLost
+  listWorkers, orderWorker, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost
 } from '../services/reuse.js';
 
 // ---------------------------------------------------------------------------
@@ -205,6 +205,22 @@ router.get('/api/reuse/worker/files/:name', guard('any'), (req, res) => {
   if (!file) return res.status(404).json({ error: 'Not a published worker file' });
   res.set({ 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' });
   res.sendFile(file, { cacheControl: false, dotfiles: 'allow' }, (e) => { if (e && !res.headersSent) res.status(e.status || 500).end(); });
+});
+
+/**
+ * GET /api/reuse/worker/python - Official python.org embed zip the published Windows launcher expects
+ * (same version, same sha256), for a PC that cannot reach python.org. Any RE-USE token, like the other
+ * worker files: the archive is public, but the route makes the hub download and send 12 MB.
+ */
+router.get('/api/reuse/worker/python', guard('any'), async (req, res) => {
+  let runtime;
+  try { runtime = await pythonRuntime(); } catch (e) { runtime = { ok: false, status: 500, error: `Python archive unavailable: ${e.message}` }; }
+  if (!runtime.ok) return res.status(runtime.status).json({ error: runtime.error });
+  res.set({
+    'Content-Type': 'application/zip', 'Content-Disposition': `attachment; filename="${runtime.spec.name}"`,
+    'X-Sha256': runtime.spec.sha256, 'Cache-Control': 'no-store'
+  });
+  res.sendFile(runtime.file, { cacheControl: false, dotfiles: 'allow' }, (e) => { if (e && !res.headersSent) res.status(e.status || 500).end(); });
 });
 
 export default router;

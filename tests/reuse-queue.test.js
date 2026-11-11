@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import http from 'node:http';
 
 const PORT = '4151';
 const BASE_URL = `http://localhost:${PORT}`;
@@ -484,6 +485,103 @@ describe('RE-USE queue hardening', () => {
     for (const n of [`${kept}.in.flac`, `${done}.in.flac`, `${done}.out.flac`, 'notes.txt']) assert.ok(left.includes(n), `${n} kept`);
     assert.strictEqual((await view(lost)).status, 'failed');
     assert.strictEqual((await claim()).data.job.id, kept);
+  });
+});
+
+describe('RE-USE portable Python fallback', () => {
+  const P = '4159';
+  const URL_ = `http://localhost:${P}`;
+  const zip = Buffer.concat([Buffer.from('PK\x03\x04'), crypto.randomBytes(2000)]);
+  const launcher = (digest, version = '3.14.10') => `$PyVersion = '${version}'\n$PySha256 = '${digest}'\n`;
+  let tmp, workerDir, hub, origin, originUrl, hits, served;
+  const get = async (token) => {
+    const res = await fetch(`${URL_}/api/reuse/worker/python`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    return { status: res.status, headers: res.headers, buf: Buffer.from(await res.arrayBuffer()) };
+  };
+  const cached = () => path.join(tmp, 'reuse', 'runtime', 'python-3.14.10-embed-amd64.zip');
+  const publish = (text) => fs.writeFileSync(path.join(workerDir, 'install-and-run.ps1'), text);
+
+  before(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-py-'));
+    workerDir = path.join(tmp, 'worker-files');
+    fs.mkdirSync(workerDir);
+    fs.writeFileSync(path.join(workerDir, 'reuse_worker.py'), 'print("v1")\n');
+    hits = [];
+    served = zip;
+    origin = http.createServer((req, res) => {
+      hits.push(req.url);
+      if (!served) { res.writeHead(403); return res.end('Forbidden'); }
+      res.writeHead(200, { 'Content-Type': 'application/zip' });
+      res.end(served);
+    });
+    await new Promise(r => origin.listen(0, '127.0.0.1', r));
+    originUrl = `http://127.0.0.1:${origin.address().port}/ftp/python`;
+    hub = spawn('node', ['src/index.js'], {
+      cwd: process.cwd(), stdio: 'ignore',
+      env: {
+        ...process.env, PORT: P, PUBLIC_URL: URL_, DB_PATH: path.join(tmp, 'hub.db'), HUB_REUSE_ADMIN_TOKEN: ADMIN,
+        HUB_REUSE_WORKER_TOKENS: `gpu-box:${AMD}`, HUB_REUSE_WORKER_DIR: workerDir, HUB_REUSE_PYTHON_BASE_URL: originUrl
+      }
+    });
+    for (let i = 0; i < 75; i++) {
+      try { if ((await fetch(`${URL_}/health`)).ok) return; } catch { /* starting */ }
+      await sleep(200);
+    }
+    assert.fail('hub did not start');
+  });
+
+  after(() => {
+    hub?.kill('SIGTERM');
+    origin?.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('needs a RE-USE token, and a published Windows launcher', async () => {
+    assert.strictEqual((await get()).status, 403);
+    assert.strictEqual((await get('x'.repeat(30))).status, 403);
+    assert.strictEqual((await get(AMD)).status, 404, 'no install-and-run.ps1 published: nothing to serve');
+    assert.deepStrictEqual(hits, [], 'nothing fetched for an unknown caller or an unknown version');
+  });
+
+  test('an archive whose checksum is not the launcher\'s is never cached nor served', async () => {
+    publish(launcher(sha(Buffer.from('another archive'))));
+    const res = await get(AMD);
+    assert.strictEqual(res.status, 502);
+    assert.ok(!res.buf.includes(zip.subarray(0, 64)), 'the refused bytes do not leak into the answer');
+    assert.ok(!fs.existsSync(cached()));
+    assert.deepStrictEqual(hits, ['/ftp/python/3.14.10/python-3.14.10-embed-amd64.zip']);
+  });
+
+  test('an origin that refuses (403) gives a clear 502', async () => {
+    publish(launcher(sha(zip)));
+    served = null;
+    const res = await get(AMD);
+    assert.strictEqual(res.status, 502);
+    assert.match(JSON.parse(res.buf.toString()).error, /HTTP 403/);
+    served = zip;
+  });
+
+  test('fetched once, verified, then served from the cache to workers and admin', async () => {
+    hits.length = 0;
+    const [a, b] = await Promise.all([get(AMD), get(AMD)]);
+    for (const res of [a, b, await get(ADMIN)]) {
+      assert.strictEqual(res.status, 200);
+      assert.ok(res.buf.equals(zip));
+      assert.strictEqual(res.headers.get('x-sha256'), sha(zip));
+    }
+    assert.strictEqual(hits.length, 1, 'concurrent and later requests share one download');
+    assert.ok(fs.readFileSync(cached()).equals(zip));
+    served = null; // python.org now unreachable: the cache is enough
+    assert.strictEqual((await get(AMD)).status, 200);
+  });
+
+  test('a cached file that no longer matches is fetched again, not served', async () => {
+    fs.writeFileSync(cached(), 'tampered');
+    assert.strictEqual((await get(AMD)).status, 502, 'origin down: refuses rather than serving the tampered file');
+    served = zip;
+    const res = await get(AMD);
+    assert.strictEqual(res.status, 200);
+    assert.ok(res.buf.equals(zip));
   });
 });
 

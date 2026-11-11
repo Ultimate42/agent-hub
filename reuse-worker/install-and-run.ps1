@@ -32,11 +32,12 @@ $LogDir = Join-Path $Base 'logs'
 $TaskName = 'RE-USE worker'
 $IsWin = ($env:OS -eq 'Windows_NT')
 
-# Python portable officiel (python.org), empreinte verifiee avant decompression
+# Python portable officiel (python.org, sinon la meme archive relayee par le hub), empreinte verifiee avant decompression
 $PyVersion = '3.14.10'
 $PyUrl = "https://www.python.org/ftp/python/$PyVersion/python-$PyVersion-embed-amd64.zip"
 $PySha256 = '90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159'
 $PyDir = Join-Path $Base "runtime\python-$PyVersion"
+$UserAgent = 'reuse-worker-launcher/1.0 (Windows; PowerShell)'
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -121,7 +122,22 @@ function Read-Config {
     return $cfg
 }
 
-function Get-Python {
+# Telecharge l'archive Python depuis une source ; $true seulement si son empreinte est celle attendue.
+function Save-PythonZip([string]$Url, [string]$Dest, [hashtable]$Headers, [string]$From) {
+    try {
+        if (Test-Path $Dest) { Remove-Item $Dest -Force }
+        Invoke-WebRequest -Uri $Url -Headers $Headers -UserAgent $UserAgent -OutFile $Dest -UseBasicParsing -TimeoutSec 300
+        $got = Get-Sha256 $Dest
+        if ($got -eq $PySha256) { return $true }
+        Say "Python depuis $From : empreinte inattendue ($got), fichier rejete."
+    } catch {
+        Say "Python depuis $From : telechargement impossible ($($_.Exception.Message))."
+    }
+    if (Test-Path $Dest) { Remove-Item $Dest -Force -ErrorAction SilentlyContinue }
+    return $false
+}
+
+function Get-Python($Config) {
     if (-not $IsWin) {   # hors Windows (tests) : Python du systeme
         foreach ($name in 'python3', 'python') { $c = Get-Command $name -ErrorAction SilentlyContinue; if ($c) { return $c.Source } }
         throw 'python3 introuvable'
@@ -131,8 +147,17 @@ function Get-Python {
     Say "Installation de Python $PyVersion portable (12 Mo)..."
     $zip = Join-Path $Base 'runtime\python.zip'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $zip) | Out-Null
-    Invoke-WebRequest -Uri $PyUrl -OutFile $zip -UseBasicParsing
-    if ((Get-Sha256 $zip) -ne $PySha256) { Remove-Item $zip -Force; throw 'Python telecharge : empreinte inattendue, abandon.' }
+    # python.org d'abord ; s'il refuse ou ne repond pas, la meme archive officielle relayee par le hub.
+    # Le jeton n'est envoye qu'au hub. Quelle que soit la source, seule l'empreinte attendue est acceptee.
+    $sources = @(@{ Name = 'python.org'; Url = $PyUrl; Headers = @{} })
+    if ($Config -and $Config.hub_url -and $Config.token) {
+        $sources += @{ Name = 'le hub'; Url = "$($Config.hub_url.TrimEnd('/'))/api/reuse/worker/python"; Headers = @{ Authorization = "Bearer $($Config.token)" } }
+    }
+    $ready = $false
+    foreach ($s in $sources) {
+        if (Save-PythonZip $s.Url $zip $s.Headers $s.Name) { Say "Python telecharge depuis $($s.Name), empreinte verifiee."; $ready = $true; break }
+    }
+    if (-not $ready) { throw "Python $PyVersion introuvable (sources essayees : $(($sources | ForEach-Object { $_.Name }) -join ', '))" }
     if (Test-Path $PyDir) { Remove-Item $PyDir -Recurse -Force }
     Expand-Archive -Path $zip -DestinationPath $PyDir -Force
     Remove-Item $zip -Force
@@ -158,6 +183,41 @@ function Install-App($cfg) {
     [IO.File]::WriteAllText((Join-Path $tmp 'version.txt'), [string]$manifest.version)
     Move-Item $tmp $App
     Say "Programme installe (version $($manifest.version))."
+}
+
+# Tant que l'installation echoue, le programme (qui met d'habitude ce lanceur a jour) ne tourne pas :
+# le lanceur va alors chercher lui-meme sa version publiee par le hub. $true s'il vient d'etre remplace.
+function Update-Self($Config) {
+    $headers = @{ Authorization = "Bearer $($Config.token)" }
+    $hub = $Config.hub_url.TrimEnd('/')
+    $name = Split-Path -Leaf $Self
+    $manifest = Invoke-RestMethod -Uri "$hub/api/reuse/worker/manifest" -Headers $headers -TimeoutSec 60
+    $entry = $manifest.files | Where-Object { $_.name -eq $name } | Select-Object -First 1
+    if (-not $entry -or $entry.sha256 -eq (Get-Sha256 $Self)) { return $false }
+    $new = "$Self.new"
+    try {
+        Invoke-WebRequest -Uri "$hub/api/reuse/worker/files/$name" -Headers $headers -OutFile $new -UseBasicParsing -TimeoutSec 120
+        if ((Get-Sha256 $new) -ne $entry.sha256) { throw 'empreinte incorrecte' }
+        $errors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($new, [ref]$null, [ref]$errors)
+        if ($errors.Count) { throw 'erreur de syntaxe' }
+        Copy-Item $Self "$Self.prev" -Force
+        Move-Item $new $Self -Force
+    } catch {
+        if (Test-Path $new) { Remove-Item $new -Force -ErrorAction SilentlyContinue }
+        Say "Nouveau lanceur refuse ($($_.Exception.Message)) : l'ancien reste en place."
+        return $false
+    }
+    return $true
+}
+
+# Passe la main au lanceur qui vient d'etre remplace (le verrou est rendu avant)
+function Restart-Self {
+    Say 'Lanceur mis a jour : relance.'
+    $script:lock.Close(); $script:lock = $null
+    if ($IsWin) { Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$Self`" -NoStartup" }
+    else { & $Self -NoStartup }
+    exit 0
 }
 
 function Get-AppVersion {
@@ -190,7 +250,7 @@ if ($CrashTest) {
     $script = Join-Path $App 'reuse_worker.py'
     if (-not (Test-Path $script)) { $script = Join-Path $Base 'reuse_worker.py' }
     if (-not (Test-Path $script)) { Say 'Essai impossible : poser reuse_worker.py a cote de ce script.'; exit 2 }
-    $python = Get-Python
+    $python = Get-Python $null   # essai sans hub : python.org seulement
     & $python $script --base $Base --crash-test
     exit $LASTEXITCODE
 }
@@ -220,10 +280,13 @@ $fails = 0
 while ($true) {
     if (Test-Path (Join-Path $Base 'STOP')) { Say 'Fichier STOP present : arret. Le supprimer pour repartir.'; break }
     try {
-        $python = Get-Python
+        $python = Get-Python $cfg
         if (-not (Test-Path (Join-Path $App 'reuse_worker.py'))) { Install-App $cfg }
     } catch {
         Say "Installation impossible pour l'instant ($($_.Exception.Message)). Nouvel essai dans 60 s."
+        $replaced = $false
+        try { $replaced = Update-Self $cfg } catch { }   # hub injoignable : meme attente, meme nouvel essai
+        if ($replaced) { Restart-Self }
         Start-Sleep -Seconds 60
         continue
     }
@@ -232,13 +295,7 @@ while ($true) {
     $code = $LASTEXITCODE
     if ($code -eq 0) { break }                       # arret demande
     if ($code -eq 42) { $fails = 0; continue }       # mise a jour installee : relancer tout de suite
-    if ($code -eq 43) {                              # le lanceur a ete remplace : relancer le nouveau
-        Say 'Lanceur mis a jour : relance.'
-        $lock.Close(); $lock = $null
-        if ($IsWin) { Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$Self`" -NoStartup" }
-        else { & $Self -NoStartup }
-        exit 0
-    }
+    if ($code -eq 43) { Restart-Self }               # le lanceur a ete remplace : relancer le nouveau
     if ($code -eq 2) { Say 'Config refusee (voir le message ci-dessus dans le journal). Nouvel essai dans 5 minutes.'; Start-Sleep -Seconds 300; continue }
     if ($code -eq 3) { Say 'Installation du moteur incomplete (voir ci-dessus). Nouvel essai dans 60 s.'; Start-Sleep -Seconds 60; continue }
     # Plantage. Une version n'est jugee mauvaise que si elle n'a jamais fini de demarrer (pas de app\.ok).

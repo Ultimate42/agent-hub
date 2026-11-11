@@ -120,6 +120,7 @@ export const config = {
   reuseTokenProblems: [...reuseAdmin.problems, ...reuseWorkers.problems], // logged at startup, values never quoted
   reuseDir: process.env.HUB_REUSE_DIR || path.join(path.dirname(process.env.DB_PATH || path.join(dataDir, 'hub.db')), 'reuse'),
   reuseWorkerDir: process.env.HUB_REUSE_WORKER_DIR || null, // default: <repo>/reuse-worker
+  reusePythonBaseUrl: process.env.HUB_REUSE_PYTHON_BASE_URL || 'https://www.python.org/ftp/python', // origin of the portable Python zip (tests)
   reuseMaxFileSize: positiveInt(process.env.HUB_REUSE_MAX_FILE_SIZE, 32 * 1024 * 1024), // held in memory: 5 min of FLAC is under 10 MB
   reuseMaxStorage: positiveInt(process.env.HUB_REUSE_MAX_STORAGE, 6 * 1024 * 1024 * 1024), // sources + results kept on disk
   // A worker renews its lease with a heartbeat every minute while it computes; silent for this long = job handed to another
