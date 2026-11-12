@@ -72,8 +72,8 @@
             "text_encoder": { "type": "enum", "values": ["cpu", "gpu"], "default": "cpu", "admin": true,
                               "cli": { "gpu": "gpu", "cpu": "te=cpu,gpu" },
                               "notes": "Où calculer l'encodeur texte Qwen3-4B (4 Go), une fois par image. Mesuré le 12/11 en 1024 : 13,3 s par étape avec cpu, 21,7 s avec gpu (encodeur, DiT et tampon de 4,4 Go dans 16 Go : la mémoire vidéo déborde)." },
-            "mmap": { "type": "bool", "default": false, "admin": true,
-                       "notes": "Charger les poids par projection mémoire (--mmap) au lieu de std::ifstream. Mesuré le 12/11 : les fichiers se lisent à 953 Mo/s d'un seul lecteur, mais sd.cpp les relit à 25 Mo/s par ifstream, même en cache." },
+            "mmap": { "type": "bool", "default": true, "admin": true,
+                       "notes": "Charger les poids par projection mémoire (--mmap) au lieu de std::ifstream. Mesuré le 12/11 : les fichiers se lisent à 953 Mo/s d'un seul lecteur, mais sd.cpp les relit à 25 Mo/s par ifstream, même en cache. Avec --mmap (job 15) : poids chargés en 1 s environ, premier démarrage en 131 s au lieu de 559 s, étape inchangée (13,2 s)." },
             "threads": { "type": "int", "min": 0, "max": 64, "default": 0, "admin": true,
                          "notes": "Fils du moteur, lecture des poids comprise (0 = un par cœur). Le premier chargement lit le disque à 25 Mo/s environ avec la valeur par défaut." }
           },

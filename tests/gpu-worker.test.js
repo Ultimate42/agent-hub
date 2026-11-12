@@ -231,7 +231,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.strictEqual(server.args[server.args.indexOf('--flash-attn') + 1], 'auto', 'sd.cpp decides (measured: forcing it is slower on RDNA2)');
     assert.ok(server.args.includes('--vae-tiling'));
     assert.ok(!server.args.includes('-t'), 'threads left to the engine by default');
-    assert.ok(!server.args.includes('--mmap'), 'mmap off by default until measured on gpu-box');
+    assert.ok(server.args.includes('--mmap'), 'weights mapped, not read through std::ifstream (25 MB/s on gpu-box)');
     const req = runs().find(r => r.engine === 'sd-server-request');
     assert.strictEqual(req.path, '/sdapi/v1/txt2img');
     assert.deepStrictEqual([req.body.prompt, req.body.seed, req.body.cfg_scale, req.body.steps, req.body.sampler_name], [prompt, 7, 1, 8, 'euler']);
@@ -269,7 +269,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
 
   test('admin tuning restarts the resident engine with the new flags; the same flags reuse it', async () => {
     const before = runs().filter(r => r.engine === 'sd-server').length;
-    const tuned = { prompt: 'tuned', width: 256, height: 256, flash_attn: 'diffusion', vae_tiling: false, threads: 2, text_encoder: 'cpu', mmap: true };
+    const tuned = { prompt: 'tuned', width: 256, height: 256, flash_attn: 'diffusion', vae_tiling: false, threads: 2, text_encoder: 'cpu', mmap: false };
     const a = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify(tuned) })).job;
     const b = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ ...tuned, prompt: 'tuned again' }) })).job;
     assert.strictEqual((await finished(a.id)).status, 'done');
@@ -282,7 +282,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.strictEqual(args[args.indexOf('--flash-attn') + 1], 'auto,diffusion=on');
     assert.strictEqual(args[args.indexOf('--backend') + 1], 'te=cpu,gpu', 'text encoder on the CPU, the rest on the GPU');
     assert.ok(!args.includes('--vae-tiling'));
-    assert.ok(args.includes('--mmap'));
+    assert.ok(!args.includes('--mmap'));
     assert.strictEqual(args[args.indexOf('-t') + 1], '2');
   });
 
