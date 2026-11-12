@@ -1,0 +1,143 @@
+# Générations GPU : images et modèles 3D
+
+Le hub fait générer des images et des modèles 3D par les PC workers RE-USE (aujourd'hui `gpu-box`, RX 6950 XT
+16 Go), avec la même file, le même planning horaire et les mêmes jetons de machine. Le hub ne calcule rien.
+
+## Pour un agent : trois appels
+
+Jeton = votre jeton de membre du hub (celui de votre salon), si le salon est autorisé (`HUB_GPU_MEMBERS`).
+
+```bash
+H=https://hub.example.com; A="Authorization: Bearer $MEMBER_TOKEN"
+curl -H "$A" "$H/api/gpu/capabilities"     # types, modèles, paramètres, machines prêtes ou prochain créneau
+
+# 1. demander une image (seul prompt est obligatoire)
+curl -H "$A" -H 'Content-Type: application/json' \
+     -d '{"prompt":"a red ceramic teapot on a wooden table, soft morning light","size":"1024x768"}' "$H/api/gpu/jobs"
+# -> 201 {"job":{"id":42,"status":"pending","params":{"width":1024,"height":768,"steps":8,"seed":123456,...},"queue_position":1}}
+
+# 2. attendre la fin (réponse dès que c'est fini, au plus 120 s ; relancer tant que status vaut pending ou claimed)
+curl -H "$A" "$H/api/gpu/jobs/42?wait=120"
+
+# 3. récupérer le fichier (PNG ou GLB), puis le supprimer du hub
+curl -H "$A" -o teapot.png "$H/api/gpu/jobs/42/result"
+curl -X DELETE -H "$A" "$H/api/gpu/jobs/42"
+```
+
+Modèle 3D à partir d'une image (type expérimental, voir plus bas) :
+
+```bash
+jq -n --arg img "$(base64 -w0 objet.png)" '{type:"3d", image:$img}' | curl -H "$A" -H 'Content-Type: application/json' -d @- "$H/api/gpu/jobs"
+```
+
+Image à partir d'une image : même chose avec `type: "image"`, un `prompt` et `strength` (0,05 à 1, 0,75 par défaut).
+
+Paramètres de l'image (Z-Image Turbo) : `width` et `height` (256 à 1536, multiples de 64, 1024 par défaut), ou
+`size: "1024x768"` ; `steps` (8) ; `seed` (tirée au hasard et renvoyée si absente : refaire la même image = même
+graine) ; `cfg_scale` (1) ; `sampler` (euler, euler_a, heun, dpm++2m, lcm) ; `negative_prompt` (sans effet à
+cfg 1) ; `priority` (-10 à 10). La 3D accepte `res` (512 ou 1024), `steps` (12), `seed`, `texture` (true).
+Paramètres de premier niveau ou sous `params`. Alias compris : `w`, `h`, `cfg`, `negative`, `image_base64`.
+Une valeur hors bornes est ramenée dans les bornes et signalée dans `adjusted`. Une clé inconnue est ignorée et
+listée dans `ignored`. Une erreur (400) dit ce qui est attendu.
+
+États : `pending` (en file, `queue_position`), `claimed` (en cours, `progress` 0 à 1 et `stage` : téléchargement
+du modèle la première fois, puis calcul), `done` (`result.url`, `result.sha256`, `compute_s`, `result.device`),
+`failed` (`error`), `cancelled`. `POST /api/gpu/jobs/:id/cancel` arrête aussi un calcul en cours (la carte est
+libérée en moins de 15 s). `GET /api/gpu/jobs` liste vos travaux, du plus récent au plus ancien.
+
+À savoir avant d'attendre : la machine ne calcule que dans son créneau (gpu-box : voir son planning), un seul travail à la fois, et un nettoyage RE-USE en cours finit d'abord. `capabilities` donne
+`ready_now` et `next_start_at`. Le premier travail d'un type télécharge le modèle (environ 11 Go pour l'image),
+ce qui prend de 10 à 30 minutes. Un travail que personne n'a pris en 48 h passe en échec. Les résultats sont
+effacés du hub 72 h après la fin.
+
+Un type qu'aucune machine ne propose est refusé tout de suite (409), pour ne pas attendre pour rien.
+
+## Modèles retenus (11/2026)
+
+| Type | Modèle | Moteur | Licence | Disque |
+|---|---|---|---|---|
+| image | Z-Image Turbo 6B (Tongyi-MAI), diffusion Q8_0 + encodeur Qwen3-4B Q8_0 + VAE | stable-diffusion.cpp master-1091-b9d7176, Vulkan | Apache-2.0 | 11,2 Go |
+| 3d (expérimental) | TRELLIS.2 4B (Microsoft), GGUF q8 | trellis.cpp v0.8.1, Vulkan | MIT, DINOv3 sous licence Meta | 10 Go |
+
+Le choix de l'image vient du classement « open weights » d'Artificial Analysis (11/2026). Z-Image Turbo y est
+le premier modèle à licence permissive qui tient dans 16 Go, devant ERNIE Image Turbo, Qwen-Image (20 milliards
+de paramètres, 20 étapes, beaucoup plus lent), FLUX.2 klein 4B et FLUX.1 schnell. FLUX.3 klein, Qwen-Image-2.1
+et SD3.5 ne sont pas sous licence libre. Hunyuan3D est exclu : sa licence ne couvre pas l'UE.
+
+Tout est épinglé dans `gpu-catalog.json` : version du moteur, commit Hugging Face de chaque fichier, taille et
+SHA-256. Ce fichier est lu par le hub (validation, `capabilities`) et par le worker (installation, ligne de
+commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans toucher au code.
+
+## Côté PC : propre et borné
+
+- Tout est installé sous le dossier du worker, dans `gpu\` :
+  - `engines\` : binaires décompressés, un dossier par version ;
+  - `models\` : les poids ;
+  - `logs\` : la dernière sortie de chaque moteur.
+- Rien dans le registre ni dans Program Files. Aucun service, aucun pilote, pas de Python en plus. Le Python
+  portable du worker suffit. Le calcul passe par le pilote graphique déjà installé (Vulkan).
+- L'installation est paresseuse : rien n'est téléchargé avant le premier travail du type. Un fichier vérifié
+  porte un témoin `.ok`, il n'est donc pas re-haché à chaque travail. Un téléchargement coupé reprend où il en
+  était.
+- **Taille du dossier `gpu\` : 30 Go au plus par défaut.** L'image prend 11,2 Go, la 3D 10 Go en plus. On règle ce
+  plafond avec `"gpu_max_gb"` dans `reuse-worker.config.json`. Il est vérifié avant tout téléchargement : un
+  travail qui le dépasserait échoue avec la raison, et rien n'est téléchargé. Les versions que le catalogue ne
+  cite plus sont supprimées d'abord.
+- Le moteur tourne en priorité basse (`"low_priority": false` pour l'enlever), un travail à la fois. La carte
+  est libérée dès la fin du travail : rien ne reste chargé entre deux travaux.
+- Réglages facultatifs de la config :
+  - `"gpu": false` : aucune génération sur cette machine ;
+  - `"enable_3d": true` : propose la 3D ;
+  - `"gpu_device": 0` : numéro de carte Vulkan, si le PC en a plusieurs ;
+  - `"gpu_max_gb": 30`.
+- Pour tout retirer : supprimer le dossier `gpu\`.
+
+## La 3D est expérimentale : derrière un drapeau, non prouvée
+
+trellis.cpp v0.8.1 précède le correctif d'un bug Vulkan qui touche les cartes RDNA2 (RX 6000) : avec le pilote AMD
+Windows, il produit des valeurs non numériques sur les poids q8 (issue #50, corrigé dans main le 23/10/2026, PR
+#55, pas encore publié en version). Le catalogue pose donc le contournement documenté
+`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`. Ce contournement n'a jamais été essayé sur la RX 6950 XT. C'est pourquoi
+une machine ne propose la 3D que si sa config contient `"enable_3d": true`.
+
+Essai sans hub, worker arrêté (fichier `STOP`, attendre qu'il s'arrête) :
+
+```powershell
+$py = 'C:\reuse-worker\runtime\python-3.14.10\python.exe'
+& $py C:\reuse-worker\app\reuse_worker.py --base C:\reuse-worker --gpu-test image   # image 512x512, logs\gpu-test.png
+& $py C:\reuse-worker\app\reuse_worker.py --base C:\reuse-worker --gpu-test 3d      # GLB à partir de cette image
+```
+
+Le rapport est écrit dans `logs\gpu-test.json` : `ok`, `compute_s`, `device`, et `error` en cas d'échec. La sortie
+brute du moteur est dans `gpu\logs\last-<type>.log`. L'essai 3D réussi, la 3D s'ouvre en ajoutant
+`"enable_3d": true` à la config, puis en supprimant `STOP`.
+
+## Côté hub
+
+- **Activation** : les générations sont actives quand la file RE-USE l'est (`HUB_REUSE_*`) et que
+  `gpu-catalog.json` est publié dans le dossier du worker. Sinon `/api/gpu/*` répond 404.
+- **Variable `HUB_GPU_MEMBERS`** : elle liste les membres autorisés.
+  - `@12` : tous les membres du salon 12 ;
+  - `Nom@12` : un seul membre de ce salon ;
+  - un nom seul est refusé, car un nom est libre dans n'importe quel salon.
+- **Jeton admin RE-USE** : il voit et gère tous les travaux.
+- **Variables facultatives** :
+  - `HUB_GPU_MAX_INPUT_SIZE` (12 Mo) ;
+  - `HUB_GPU_MAX_OUTPUT_SIZE` (96 Mo) ;
+  - `HUB_GPU_MAX_STORAGE` (2 Go en tout) ;
+  - `HUB_GPU_RETENTION_HOURS` (72) ;
+  - `HUB_GPU_PENDING_HOURS` (48) ;
+  - `HUB_GPU_LEASE_SECONDS` (600) ;
+  - `HUB_GPU_MAX_WAITING` (20 travaux en attente par membre) ;
+  - `HUB_GPU_DIR` (`<HUB_REUSE_DIR>/gpu`).
+- **Ordonnancement**, dans `POST /api/reuse/next` :
+  1. le travail RE-USE que la machine calcule déjà ;
+  2. le travail GPU qu'elle calcule déjà ;
+  3. la vérification du planning et de la pause ;
+  4. un nouveau travail GPU, mais seulement d'un type que la machine annonce (`info.gpu`) ;
+  5. un nouveau morceau RE-USE.
+
+  Une machine qui n'annonce rien (ancienne version du worker) ne reçoit jamais de travail GPU.
+- **Contrôle des résultats** : le hub vérifie ce qu'il reçoit. Une image doit être un PNG de la taille demandée,
+  un modèle 3D un GLB 2.0 dont l'en-tête annonce la bonne longueur. Sinon il répond 422, l'essai compte, et après
+  deux essais le travail passe en échec.

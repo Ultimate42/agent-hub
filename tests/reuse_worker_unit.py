@@ -269,6 +269,105 @@ class RefusedResultTest(unittest.TestCase):
         self.assertFalse(jobdir.exists())
 
 
+
+class GpuTest(unittest.TestCase):
+    """Générations GPU : ligne de commande, catalogue, plafond du dossier, ménage."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.app = self.dir / 'app'
+        self.app.mkdir()
+        self.catalog = json.loads((Path(__file__).resolve().parent.parent / 'reuse-worker' / 'gpu-catalog.json').read_text(encoding='utf-8'))
+        system = 'windows' if w.IS_WINDOWS else 'linux'
+        for e in self.catalog['engines'].values():
+            e.setdefault(system, dict(e['windows']))
+        (self.app / w.GPU_CATALOG).write_text(json.dumps(self.catalog), encoding='utf-8')
+
+    def gpu(self, **config):
+        return w.Gpu(self.dir, config, self.app)
+
+    def test_command_keeps_each_value_whole(self):
+        prompt = 'a "cat" ; rm -rf / & echo %PATH% $(x) `y`\nsecond line'
+        args = w.build_command(['-p', '{prompt}', '-W', '{width}', '--cfg-scale', '{cfg_scale}', '{if:hd=--hd}', '{unless:texture=--no-texture}'],
+                               {'prompt': prompt, 'width': 512, 'cfg_scale': 1.0, 'hd': False, 'texture': False})
+        self.assertEqual(args, ['-p', prompt, '-W', '512', '--cfg-scale', '1', '--no-texture'])
+        with self.assertRaises(RuntimeError):
+            w.build_command(['{missing}'], {})
+        # Accolades dans une valeur : jamais réinterprétées
+        self.assertEqual(w.build_command(['{prompt}'], {'prompt': '{file:vae}'}), ['{file:vae}'])
+
+    def test_catalog_commands_use_only_known_values(self):
+        for kind, spec in self.catalog['types'].items():
+            for mid, m in spec['models'].items():
+                values = {k: (v['default'] if v.get('default') != 'random' else 1) for k, v in m['params'].items()}
+                values.update(prompt='x', output='o', models_dir='d', input='i', **{'file:' + f['role']: 'f' for f in m['files']})
+                w.build_command(m['command'] + m.get('command_input', []), values)   # aucune valeur manquante
+                for f in m['files']:
+                    self.assertTrue(w.safe_file_name(f['name']))
+                    self.assertRegex(f['sha256'], r'^[0-9a-f]{64}$')
+                    self.assertTrue(f['url'].startswith('https://huggingface.co/') and '/resolve/' in f['url'] and '/main/' not in f['url'],
+                                    'modèle épinglé par commit : %s' % f['url'])
+
+    def test_types_follow_flags(self):
+        self.assertEqual(self.gpu().types(), ['image'])
+        self.assertEqual(self.gpu(enable_3d=True).types(), ['3d', 'image'])
+        self.assertEqual(self.gpu(gpu=False, enable_3d=True).types(), [])
+
+    def test_folder_cap_is_checked_before_any_download(self):
+        g = self.gpu(gpu_max_gb=5)
+        with self.assertRaises(RuntimeError) as e:
+            g.ensure('image', 'z-image-turbo')
+        self.assertIn('plafonné à 5 Go', str(e.exception))
+        self.assertFalse((self.dir / 'gpu' / 'models').exists(), 'rien téléchargé')
+
+    def test_prune_removes_what_the_catalog_no_longer_names(self):
+        g = self.gpu()
+        root = self.dir / 'gpu'
+        system = 'windows' if w.IS_WINDOWS else 'linux'
+        current = g.engine_dir('sdcpp', self.catalog['engines']['sdcpp'][system])
+        old = root / 'engines' / 'sdcpp-000000000000'
+        for d in (current, old, root / 'models' / 'z-image-turbo', root / 'models' / 'old-model', root / 'downloads'):
+            d.mkdir(parents=True)
+        (root / 'models' / 'z-image-turbo' / 'ae.safetensors').write_text('keep')
+        (root / 'models' / 'z-image-turbo' / 'ae.safetensors.ok').write_text('keep')
+        (root / 'models' / 'z-image-turbo' / 'z_image_turbo-Q6_K.gguf').write_text('old quant')
+        g.prune()
+        self.assertTrue(current.exists())
+        self.assertFalse(old.exists())
+        self.assertFalse((root / 'models' / 'old-model').exists())
+        self.assertFalse((root / 'downloads').exists())
+        self.assertEqual(sorted(p.name for p in (root / 'models' / 'z-image-turbo').iterdir()), ['ae.safetensors', 'ae.safetensors.ok'])
+
+    def test_download_checks_and_remembers_the_checksum(self):
+        src = self.dir / 'src.bin'
+        src.write_bytes(b'weights' * 1000)
+        digest = w.sha256_file(src)
+        dest = self.dir / 'm' / 'model.gguf'
+        w.download_resume(src.as_uri(), dest, digest, src.stat().st_size, 'test')
+        self.assertEqual(dest.read_bytes(), src.read_bytes())
+        self.assertTrue(Path(str(dest) + '.ok').exists())
+        # Un fichier modifié depuis (taille ou date) est re-vérifié, et refusé s'il ne correspond plus
+        dest.write_bytes(b'corrupted' * 10)
+        sleep = w.time.sleep
+        w.time.sleep = lambda s: None
+        try:
+            with self.assertRaises(RuntimeError):
+                w.download_resume(src.as_uri(), dest, '0' * 64, src.stat().st_size, 'test')
+        finally:
+            w.time.sleep = sleep
+        self.assertFalse(dest.exists())
+
+    def test_output_checks(self):
+        p = self.dir / 'o.png'
+        p.write_bytes(w.PNG_MAGIC + struct.pack('>I', 13) + b'IHDR' + struct.pack('>II', 640, 384) + b'\x08\x06\0\0\0')
+        self.assertEqual(w.png_size(p), (640, 384))
+        g = self.dir / 'o.glb'
+        body = b'{"asset":{}}    '
+        g.write_bytes(b'glTF' + struct.pack('<II', 2, 12 + len(body)) + body)
+        self.assertTrue(w.is_glb(g))
+        g.write_bytes(b'glTF' + struct.pack('<II', 2, 999) + body)
+        self.assertFalse(w.is_glb(g))
+
 if __name__ == '__main__':
     w.log.addHandler(__import__('logging').NullHandler())
     w.log.propagate = False

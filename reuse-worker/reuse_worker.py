@@ -31,6 +31,7 @@ import tarfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -647,6 +648,359 @@ class Engine:
 
 
 # --------------------------------------------------------------------------------------------
+# Générations GPU (image, 3D) : catalogue publié par le hub, installation paresseuse sous <dossier>/gpu
+# --------------------------------------------------------------------------------------------
+GPU_CATALOG = 'gpu-catalog.json'
+GPU_DEFAULT_MAX_GB = 30.0        # plafond du dossier gpu (réglable : "gpu_max_gb" dans la config)
+PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
+
+
+def png_size(path):
+    """(largeur, hauteur) d'un PNG, ou None."""
+    with open(path, 'rb') as f:
+        head = f.read(24)
+    if len(head) < 24 or head[:8] != PNG_MAGIC or head[12:16] != b'IHDR':
+        return None
+    return struct.unpack('>II', head[16:24])
+
+
+def is_glb(path):
+    """glTF binaire 2.0 dont l'en-tête annonce exactement la taille du fichier."""
+    with open(path, 'rb') as f:
+        head = f.read(12)
+    return len(head) == 12 and head[:4] == b'glTF' and struct.unpack('<II', head[4:12]) == (2, os.path.getsize(path))
+
+
+def folder_bytes(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def build_command(template, values):
+    """Ligne de commande depuis le modèle du catalogue. Un élément « {nom} » est remplacé en entier par la valeur
+    (jamais de découpage ni de shell : un prompt reste un seul argument, quoi qu'il contienne) ;
+    « {if:nom=--x} » ne donne --x que si la valeur est vraie, « {unless:nom=--x} » que si elle est fausse."""
+    args = []
+    for item in template:
+        m = re.fullmatch(r'\{(if|unless):([\w.-]+)=([^{}]+)\}', item)
+        if m:
+            on = bool(values.get(m.group(2)))
+            if on == (m.group(1) == 'if'):
+                args.append(m.group(3))
+            continue
+        m = re.fullmatch(r'\{([\w:.-]+)\}', item)
+        if m:
+            if m.group(1) not in values:
+                raise RuntimeError('catalogue : valeur %s manquante pour la ligne de commande' % m.group(1))
+            v = values[m.group(1)]
+            args.append(('%g' % v) if isinstance(v, float) else str(v))
+        else:
+            args.append(item)
+    return args
+
+
+def download_resume(url, dest, expected_sha256, size, what, stop=None, progress=None):
+    """Gros fichier : reprend là où un essai précédent s'est arrêté (en-tête Range), vérifie l'empreinte à la fin.
+    Un fichier déjà vérifié porte un témoin <fichier>.ok (taille, date) : pas de re-hachage de 7 Go à chaque job."""
+    dest = Path(dest)
+    mark = Path(str(dest) + '.ok')
+    if dest.exists():
+        st = dest.stat()
+        if mark.exists() and mark.read_text().strip() == '%s %d %d' % (expected_sha256, st.st_size, st.st_mtime_ns):
+            return dest
+        if st.st_size == size and sha256_file(dest) == expected_sha256:
+            mark.write_text('%s %d %d' % (expected_sha256, st.st_size, st.st_mtime_ns))
+            return dest
+        dest.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(dest) + '.part')
+    delay = 5
+    for attempt in range(1, 9):
+        try:
+            have = tmp.stat().st_size if tmp.exists() else 0
+            if have > size:
+                tmp.unlink()
+                have = 0
+            if have < size:
+                log.info('Téléchargement : %s (%.1f Go%s)', what, size / 1e9, ', reprise à %.0f %%' % (100.0 * have / size) if have else '')
+                headers = {'User-Agent': 'reuse-worker'}
+                if have:
+                    headers['Range'] = 'bytes=%d-' % have
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
+                    mode = 'ab' if have and getattr(r, 'status', 200) == 206 else 'wb'
+                    if mode == 'wb':
+                        have = 0
+                    with open(tmp, mode) as f:
+                        last = 0
+                        for block in iter(lambda: r.read(1 << 20), b''):
+                            f.write(block)
+                            have += len(block)
+                            if stop is not None and stop.is_set():
+                                raise JobLost('téléchargement interrompu')
+                            if progress and have - last > (64 << 20):
+                                last = have
+                                progress(have / size)
+            got = sha256_file(tmp)
+            if got != expected_sha256:
+                tmp.unlink()
+                raise ValueError('empreinte inattendue pour %s (%s…)' % (what, got[:12]))
+            os.replace(tmp, dest)
+            st = dest.stat()
+            mark.write_text('%s %d %d' % (expected_sha256, st.st_size, st.st_mtime_ns))
+            return dest
+        except (OSError, ValueError) as e:
+            log.warning('Téléchargement de %s : essai %d raté (%s)', what, attempt, e)
+            if attempt == 8:
+                raise RuntimeError('impossible de télécharger %s : %s' % (what, e))
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+
+
+def kill_orphan(pidfile, markers):
+    """Moteur resté en marche après la mort du worker : arrêté, après avoir vérifié son nom (jamais un autre programme)."""
+    try:
+        pid = int(Path(pidfile).read_text())
+    except (OSError, ValueError):
+        return
+    try:
+        if IS_WINDOWS:
+            listing = subprocess.run(['tasklist', '/FI', 'PID eq %d' % pid, '/FO', 'CSV', '/NH'], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30).stdout.lower()
+            if any(m in listing for m in markers):
+                subprocess.run(['taskkill', '/PID', str(pid), '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
+                log.info('Moteur GPU resté en marche après une coupure : arrêté.')
+        elif any(m in Path('/proc/%d/cmdline' % pid).read_bytes().lower() for m in markers):
+            os.kill(pid, 9)
+            log.info('Moteur GPU resté en marche après une coupure : arrêté.')
+    except (OSError, subprocess.SubprocessError):
+        pass
+    Path(pidfile).unlink(missing_ok=True)
+
+
+class Gpu:
+    """Image et 3D : moteurs et modèles du catalogue, installés au premier job qui en a besoin, tout sous <dossier>/gpu.
+
+    gpu/engines/<moteur>-<empreinte>/   binaires décompressés        gpu/models/<modèle>/   poids (GGUF, safetensors)
+    gpu/downloads/                       archives en cours            gpu/logs/              dernière sortie de chaque moteur
+    Rien ailleurs : ni registre, ni service, ni Python en plus. Le plafond du dossier (gpu_max_gb) est vérifié avant
+    tout téléchargement ; les versions que le catalogue ne cite plus sont supprimées d'abord."""
+
+    def __init__(self, base, config, app):
+        self.root = base / 'gpu'
+        self.config = config
+        self.system = 'windows' if IS_WINDOWS else 'linux'
+        self.catalog = read_json(app / GPU_CATALOG, {}) or {}
+        self.pidfile = self.root / 'engine.pid'
+        self.status = {}   # type -> état lisible (« prêt », « pas installé », « échec : … »)
+
+    def types(self):
+        """Types que cette machine propose au hub (annoncés à chaque échange, info.gpu)."""
+        if self.config.get('gpu') is False or platform.machine().lower() not in ('amd64', 'x86_64'):
+            return []
+        out = []
+        for t, spec in sorted((self.catalog.get('types') or {}).items()):
+            engine = (self.catalog.get('engines') or {}).get(spec.get('engine')) or {}
+            if not engine.get(self.system):
+                continue
+            if spec.get('experimental') and not self.config.get(spec.get('flag') or ('enable_' + t)):
+                continue
+            out.append(t)
+        return out
+
+    def installed(self, kind):
+        spec = (self.catalog.get('types') or {}).get(kind) or {}
+        asset = ((self.catalog.get('engines') or {}).get(spec.get('engine')) or {}).get(self.system)
+        model = (spec.get('models') or {}).get(spec.get('default_model')) or {}
+        return bool(asset) and (self.engine_dir(spec['engine'], asset) / '.ok').exists() and all(
+            (self.root / 'models' / spec['default_model'] / (f['name'] + '.ok')).exists() for f in model.get('files') or [])
+
+    def describe(self):
+        return ', '.join('%s : %s' % (t, self.status.get(t) or ('installé' if self.installed(t) else 'pas encore installé'))
+                         for t in self.types())
+
+    def max_bytes(self):
+        try:
+            return float(self.config.get('gpu_max_gb') or GPU_DEFAULT_MAX_GB) * 1e9
+        except (TypeError, ValueError):
+            return GPU_DEFAULT_MAX_GB * 1e9
+
+    def engine_dir(self, name, asset):
+        return self.root / 'engines' / ('%s-%s' % (name, asset['sha256'][:12]))
+
+    def prune(self):
+        """Supprime ce que le catalogue ne cite plus (ancienne version d'un moteur, modèle retiré)."""
+        keep_engines = {self.engine_dir(n, e[self.system]).name for n, e in (self.catalog.get('engines') or {}).items() if e.get(self.system)}
+        keep_models = {}
+        for spec in (self.catalog.get('types') or {}).values():
+            for mid, m in (spec.get('models') or {}).items():
+                keep_models[mid] = {f['name'] for f in m.get('files') or []}
+        for d in (self.root / 'engines').glob('*') if (self.root / 'engines').exists() else []:
+            if d.name not in keep_engines:
+                log.info('GPU : ancienne version de moteur supprimée (%s).', d.name)
+                rmtree(d)
+        for d in (self.root / 'models').glob('*') if (self.root / 'models').exists() else []:
+            if d.name not in keep_models:
+                log.info('GPU : modèle retiré du catalogue supprimé (%s).', d.name)
+                rmtree(d)
+                continue
+            for f in d.iterdir():
+                stem = f.name[:-3] if f.name.endswith('.ok') else (f.name[:-5] if f.name.endswith('.part') else f.name)
+                if stem not in keep_models[d.name]:
+                    f.unlink(missing_ok=True)
+        rmtree(self.root / 'downloads')
+
+    def ensure(self, kind, model_id, stop=None, progress=None):
+        """-> (exécutable, {rôle: chemin}, dossier du modèle, variables d'environnement). Installe ce qui manque."""
+        spec = (self.catalog.get('types') or {}).get(kind)
+        if not spec or kind not in self.types():
+            raise RuntimeError('type %s non proposé par cette machine' % kind)
+        model = (spec.get('models') or {}).get(model_id)
+        if not model:
+            raise RuntimeError('modèle %s absent du catalogue publié' % model_id)
+        ename = spec['engine']
+        engine = self.catalog['engines'][ename]
+        asset = engine[self.system]
+        home = self.engine_dir(ename, asset)
+        mdir = self.root / 'models' / model_id
+        files = model.get('files') or []
+        for f in files:
+            if not safe_file_name(f['name']):
+                raise RuntimeError('catalogue : nom de fichier refusé %r' % f['name'])
+        # Place nécessaire avant de télécharger quoi que ce soit (archive + moteur décompressé comptés trois fois)
+        missing = [f for f in files if not (mdir / (f['name'] + '.ok')).exists()]
+        need = sum(int(f['size']) for f in missing) + (0 if (home / '.ok').exists() else 3 * int(asset.get('size') or 0))
+        if need:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.prune()
+            used = folder_bytes(self.root)
+            partial = sum((mdir / (f['name'] + '.part')).stat().st_size for f in missing if (mdir / (f['name'] + '.part')).exists())
+            if used - partial + need > self.max_bytes():
+                raise RuntimeError('dossier gpu plafonné à %.0f Go : il en faudrait %.1f (%.1f déjà pris). Monter "gpu_max_gb" dans la config '
+                                   'ou libérer de la place.' % (self.max_bytes() / 1e9, (used - partial + need) / 1e9, used / 1e9))
+        total = float(sum(int(f['size']) for f in missing)) or 1.0
+        done = [0.0]
+        if not (home / '.ok').exists():
+            self.status[kind] = 'installation du moteur'
+            archive = download(asset['url'], self.root / 'downloads' / Path(asset['url']).name, asset['sha256'], engine.get('label', ename))
+            rmtree(home)
+            safe_extract(archive, home)
+            archive.unlink()
+            found = [p for p in home.rglob(asset['exe'])]
+            if not found:
+                rmtree(home)
+                raise RuntimeError('%s introuvable dans l\'archive de %s' % (asset['exe'], ename))
+            if not IS_WINDOWS:
+                for p in home.rglob('*'):
+                    if p.is_file():
+                        os.chmod(p, 0o755)
+            (home / '.ok').write_text(str(found[0].relative_to(home)))
+        exe = home / (home / '.ok').read_text().strip()
+        paths = {}
+        for f in files:
+            def step(frac, f=f):
+                if progress:
+                    progress((done[0] + frac * int(f['size'])) / total, 'téléchargement %s' % f['name'])
+            if f in missing:
+                self.status[kind] = 'téléchargement de %s' % f['name']
+            paths[f['role']] = download_resume(f['url'], mdir / f['name'], f['sha256'], int(f['size']), '%s (%s)' % (f['name'], model_id), stop, step)
+            if f in missing:
+                done[0] += int(f['size'])
+        self.status[kind] = 'prêt (%s)' % model_id
+        return exe, paths, mdir, dict(engine.get('env') or {})
+
+    def run(self, job, input_path, workdir, stop, progress):
+        """Calcule un job ; -> (fichier produit, secondes de calcul, méta)."""
+        kind, model_id = job['kind'], job['model']
+        spec = self.catalog['types'][kind]
+        model = spec['models'][model_id]
+        exe, paths, mdir, env_extra = self.ensure(kind, model_id, stop, lambda frac, stage: progress(0.3 * frac, stage))
+        ext = spec.get('output', 'png')
+        out = workdir / ('out.' + ext)
+        out.unlink(missing_ok=True)
+        values = dict(job.get('params') or {})
+        values.update(prompt=job.get('prompt') or '', output=str(out), models_dir=str(mdir))
+        values.update({'file:' + role: str(p) for role, p in paths.items()})
+        template = list(model['command'])
+        if input_path is not None:
+            values['input'] = str(input_path)
+            template += model.get('command_input') or []
+        args = [str(exe)] + build_command(template, values)
+        env = dict(os.environ, **{k: str(v) for k, v in env_extra.items()})
+        if self.config.get('gpu_device') is not None:   # carte imposée (numéro Vulkan de ggml)
+            env['GGML_VK_VISIBLE_DEVICES'] = str(int(self.config['gpu_device']))
+        flags, kwargs = 0, {}
+        if IS_WINDOWS:
+            flags = subprocess.CREATE_NO_WINDOW | (subprocess.BELOW_NORMAL_PRIORITY_CLASS if self.config.get('low_priority', True) else 0)
+        elif self.config.get('low_priority', True):
+            kwargs['preexec_fn'] = lambda: os.nice(10)
+        logs = self.root / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        log_path = logs / ('last-%s.log' % kind)
+        timeout = float(model.get('timeout_s') or 1800)
+        progress(0.3, 'calcul')
+        t0 = time.time()
+        with open(log_path, 'wb') as out_log:
+            proc = subprocess.Popen(args, cwd=str(exe.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    env=env, creationflags=flags, **kwargs)
+            self.pidfile.write_text(str(proc.pid))
+            tail = bytearray()
+
+            def reader():
+                for block in iter(lambda: proc.stdout.read1(4096) if hasattr(proc.stdout, 'read1') else proc.stdout.read(4096), b''):
+                    out_log.write(block)
+                    tail.extend(block)
+                    if len(tail) > 65536:
+                        del tail[:len(tail) - 65536]
+            th = threading.Thread(target=reader, daemon=True)
+            th.start()
+            try:
+                while proc.poll() is None:
+                    if stop is not None and stop.is_set():
+                        raise JobLost('calcul interrompu')
+                    if time.time() - t0 > timeout:
+                        raise RuntimeError('calcul trop long (plus de %s), arrêté' % fmt_duration(timeout))
+                    steps = re.findall(rb'(\d+)/(\d+)\s*-', bytes(tail[-2048:]))
+                    if steps:
+                        a, b = (int(x) for x in steps[-1])
+                        if b:
+                            progress(0.3 + 0.65 * min(a, b) / b, 'calcul')
+                    time.sleep(1)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                th.join(5)
+                self.pidfile.unlink(missing_ok=True)
+        compute_s = time.time() - t0
+        text = bytes(tail).decode('utf-8', 'replace')
+        if proc.returncode != 0:
+            raise RuntimeError('%s a échoué (code %s) : %s' % (exe.name, proc.returncode, ' | '.join(text.strip().splitlines()[-3:])[-300:]))
+        if not out.exists():
+            raise RuntimeError('%s n\'a rien écrit' % exe.name)
+        meta = {}
+        dev = re.findall(r'ggml_vulkan: \d+ = ([^\r\n|(]+)', text)
+        if dev:
+            meta['device'] = dev[0].strip()[:120]
+        if ext == 'png':
+            size = png_size(out)
+            if not size:
+                raise RuntimeError('la sortie n\'est pas un PNG')
+            want = (values.get('width'), values.get('height'))
+            if None not in want and tuple(size) != tuple(want):
+                raise RuntimeError('image de %dx%d au lieu de %dx%d' % (size + want))
+        elif ext == 'glb' and not is_glb(out):
+            raise RuntimeError('la sortie n\'est pas un fichier GLB valide')
+        return out, compute_s, meta
+
+
+# --------------------------------------------------------------------------------------------
 # Worker
 # --------------------------------------------------------------------------------------------
 class Worker:
@@ -662,6 +1016,7 @@ class Worker:
         self.hub = Hub(self.config['hub_url'], self.config['token'])
         self.version = (self.app / 'version.txt').read_text().strip() if (self.app / 'version.txt').exists() else 'dev'
         self.engine = Engine(base, self.config)
+        self.gpu = Gpu(base, self.config, self.app)
         self.work = base / 'work'
         self.state = {'state': 'démarrage', 'job': None, 'last_error': None}
         self.paused_logged = False
@@ -682,6 +1037,8 @@ class Worker:
             'state': self.state['state'], 'job': self.state['job'], 'last_error': self.state['last_error'],
             'rolled_back_from': self.refused_version,   # version publiée que cette machine refuse (elle a planté ici)
             'update_ack': (read_json(self.base / 'update-ack.json', {}) or {}).get('order'),
+            'gpu': ','.join(self.gpu.types()),        # types de génération proposés (le hub n'en donne pas d'autres)
+            'gpu_state': self.gpu.describe() or None,
         }
 
     def set_state(self, state, job=None):
@@ -894,10 +1251,118 @@ class Worker:
             finished.set()
             self.set_state('en attente')
 
-    def give_back(self, jid, reason):
-        """Rend le job au hub en comptant l'essai (au bout de trois, le hub le déclare en échec)."""
+    # ---- un job GPU (image, 3D) --------------------------------------------------------
+    def process_gpu(self, job):
+        """Même déroulé qu'un nettoyage : bail entretenu, reprise après coupure, résultat vérifié, rendu en cas d'échec."""
+        jid, kind = job['id'], job['kind']
+        route = '/api/gpu/jobs/'
+        jobdir = self.work / ('gpu-%d' % jid)
+        for other in self.work.glob('gpu-*'):
+            if other != jobdir:
+                rmtree(other)
+        jobdir.mkdir(parents=True, exist_ok=True)
+        meta_file = jobdir / 'done.json'
+        label = '%s %s (%s, essai %d)' % (kind, jid, job.get('model'), job.get('attempt', 1))
+        self.set_state('génération %s' % kind, '%s %d' % (kind, jid))
+        stop, finished = threading.Event(), threading.Event()
+        now = {'progress': 0.0, 'stage': 'préparation'}
+
+        def progress(frac, stage):
+            now.update(progress=round(max(0.0, min(1.0, frac)), 3), stage=stage)
+
+        def beat():
+            # Plus fréquent qu'un nettoyage : l'avancement se voit côté client et une annulation arrête la carte vite
+            period = max(5, min(15, job.get('lease_s', 600) // 5))
+            while True:
+                try:
+                    status, _ = self.hub.request('POST', '%s%d/heartbeat' % (route, jid), body=dict(now, info=self.info()), timeout=30)
+                    if status in (404, 409):
+                        stop.set()
+                        return
+                except OSError:
+                    pass
+                if finished.wait(period):
+                    return
+
+        threading.Thread(target=beat, daemon=True).start()
         try:
-            self.hub.request('POST', '/api/reuse/jobs/%d/fail' % jid, body={'error': str(reason)[:300]}, timeout=30)
+            if kind not in self.gpu.types():
+                raise RuntimeError('type %s non proposé par cette machine' % kind)
+            starts = (read_json(jobdir / 'starts.json', {}) or {}).get('n', 0) + 1
+            write_json(jobdir / 'starts.json', {'n': starts})
+            if starts > 3:
+                raise RuntimeError('le worker s\'est arrêté %d fois sur ce job' % (starts - 1))
+            done = read_json(meta_file)
+            out = jobdir / (done or {}).get('file', '-')
+            if done and out.exists() and sha256_file(out) == done.get('sha256'):
+                log.info('Reprise : %s était déjà calculé avant la coupure, envoi du résultat.', label)
+            else:
+                src = None
+                if job.get('input'):
+                    fmt = job['input'].get('format')
+                    if fmt not in ('png', 'jpg', 'webp'):
+                        raise RuntimeError('format d\'entrée inattendu : %r' % fmt)
+                    src = jobdir / ('in.' + fmt)
+                    if not (src.exists() and sha256_file(src) == job['input']['sha256']):
+                        def fetch():
+                            status, body = self.hub.request('GET', '%s%d/input' % (route, jid), dest=src, timeout=300)
+                            if status in (404, 409):
+                                raise JobLost((body or {}).get('error', 'job repris'))
+                            if status != 200:
+                                raise Refused(status, (body or {}).get('error', 'téléchargement refusé'))
+                            if sha256_file(src) != job['input']['sha256']:
+                                raise OSError('image reçue abîmée')
+                        self.hub.retrying('Téléchargement de l\'image d\'entrée', fetch)
+                log.info('Job %s : %s', label, (job.get('prompt') or '')[:120])
+                try:
+                    out, compute_s, meta = self.gpu.run(job, src, jobdir, stop, progress)
+                except (OSError, subprocess.SubprocessError) as e:
+                    raise RuntimeError('panne locale pendant la génération : %s' % e)
+                done = {'file': out.name, 'sha256': sha256_file(out), 'compute_s': round(compute_s, 1), 'meta': meta}
+                write_json(meta_file, done)
+                log.info('Job %s : calculé en %s.', label, fmt_duration(compute_s))
+            payload = out.read_bytes()
+            query = urllib.parse.urlencode({'compute_s': done['compute_s'], 'backend': 'vulkan', 'meta': json.dumps(done.get('meta') or {})})
+
+            def send():
+                status, body = self.hub.request('POST', '%s%d/result?%s' % (route, jid, query), raw=payload, timeout=600,
+                                                headers={'X-Sha256': done['sha256'], 'Content-Type': 'application/octet-stream'})
+                if status == 200:
+                    return
+                if status in (404, 409):
+                    raise JobLost((body or {}).get('error', 'job repris'))
+                if status == 400:
+                    raise OSError('envoi abîmé en route')
+                raise Refused(status, (body or {}).get('error', 'résultat refusé'))
+            self.hub.retrying('Envoi du résultat', send, tries=12)
+            log.info('Job %s : résultat accepté par le hub.', label)
+            self.state['last_error'] = None
+            rmtree(jobdir)
+        except JobLost as e:
+            log.warning('Job %s abandonné : le hub l\'a repris ou annulé (%s).', label, e)
+            rmtree(jobdir)
+        except Refused as e:
+            log.error('Job %s : %s.', label, e)
+            self.state['last_error'] = 'job %s : %s' % (label, e)
+            rmtree(jobdir)
+            self.give_back(jid, e, route)
+        except OSError as e:
+            log.error('Job %s en attente : %s. Le travail fait est gardé dans %s.', label, e, jobdir)
+            self.state['last_error'] = 'job %s : %s' % (label, e)
+        except (RuntimeError, ValueError, KeyError) as e:
+            log.error('Job %s raté : %s', label, e)
+            self.state['last_error'] = 'job %s : %s' % (label, e)
+            self.gpu.status[kind] = 'échec : %s' % str(e)[:120]
+            rmtree(jobdir)
+            self.give_back(jid, e, route)
+        finally:
+            finished.set()
+            self.set_state('en attente')
+
+    def give_back(self, jid, reason, route='/api/reuse/jobs/'):
+        """Rend le job au hub en comptant l'essai (au bout du dernier, le hub le déclare en échec)."""
+        try:
+            self.hub.request('POST', '%s%d/fail' % (route, jid), body={'error': str(reason)[:300]}, timeout=30)
         except OSError:
             pass
 
@@ -943,6 +1408,9 @@ class Worker:
             self.state['last_error'] = 'installation : %s' % e
             self.report()
             return EXIT_NOT_READY
+        kill_orphan(self.gpu.pidfile, (b'sd-cli', b'trellis-cli'))
+        if self.gpu.types():
+            log.info('Générations GPU proposées : %s', self.gpu.describe())
         (self.app / '.ok').write_text(time.strftime('%Y-%m-%d %H:%M:%S'))   # cette version démarre : le lanceur ne reviendra pas en arrière
         self.set_state('en attente')
         job = None
@@ -953,7 +1421,10 @@ class Worker:
                 log.info('Fichier STOP présent : arrêt. Le supprimer pour relancer.')
                 return EXIT_STOP
             if job:
-                self.process(job)
+                if job.get('kind', 'reuse') == 'reuse':
+                    self.process(job)
+                else:
+                    self.process_gpu(job)
                 job = None
                 # Ordres reçus avec ce job (mise à jour publiée ou forcée) : appliqués entre deux jobs, sinon une
                 # file jamais vide retarderait indéfiniment un correctif du worker
@@ -1051,11 +1522,66 @@ def crash_test(base):
     return 0 if report['ok'] else 1
 
 
+def gpu_test(base, kind, input_path=None):
+    """Essai d'une génération sans hub : installe (si besoin) et calcule une petite image, ou un modèle 3D à partir
+    d'une image (--gpu-input, sinon l'image de l'essai précédent). Le worker doit être arrêté (fichier STOP) :
+    jamais deux calculs sur la carte. Écrit logs/gpu-test.json et le résultat dans logs/gpu-test.<ext>."""
+    lock = open(base / '.worker.lock', 'a+')
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.error('Le worker tourne : créer le fichier STOP dans %s, attendre son arrêt, puis relancer l\'essai.', base)
+        return EXIT_NOT_READY
+    config = read_json(base / 'reuse-worker.config.json', {}) or {}
+    config = {k: v for k, v in config.items() if k not in ('token', 'hub_url')}
+    if kind == '3d':
+        config.setdefault('enable_3d', True)   # l'essai est justement là pour décider d'ouvrir la 3D
+    gpu = Gpu(base, config, Path(__file__).resolve().parent)
+    report = {'ok': False, 'kind': kind, 'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+              'system': '%s %s %s' % (platform.system(), platform.release(), platform.machine())}
+    work = base / 'work' / 'gpu-test'
+    try:
+        spec = (gpu.catalog.get('types') or {}).get(kind)
+        if not spec:
+            raise RuntimeError('type %s absent du catalogue' % kind)
+        model = spec['default_model']
+        params = {'width': 512, 'height': 512, 'steps': 8, 'cfg_scale': 1.0, 'seed': 42, 'sampler': 'euler', 'negative_prompt': ''} \
+            if kind == 'image' else {'res': '512', 'steps': 12, 'seed': 42, 'texture': True}
+        job = {'kind': kind, 'model': model, 'params': params,
+               'prompt': 'a red ceramic teapot on a white table, studio photo' if spec.get('prompt') != 'none' else ''}
+        src = None
+        if spec.get('input') == 'required':
+            src = Path(input_path) if input_path else base / 'logs' / 'gpu-test.png'
+            if not src.exists():
+                raise RuntimeError('image d\'entrée introuvable : %s (lancer d\'abord l\'essai image, ou --gpu-input)' % src)
+        rmtree(work)
+        work.mkdir(parents=True)
+        out, compute_s, meta = gpu.run(job, src, work, None, lambda f, st: None)
+        dest = base / 'logs' / ('gpu-test.' + out.suffix.lstrip('.'))
+        shutil.copyfile(out, dest)
+        report.update(ok=True, model=model, compute_s=round(compute_s, 1), output=str(dest), size=os.path.getsize(dest), **meta)
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+        report['error'] = str(e)[:400]
+        report['log'] = str(gpu.root / 'logs' / ('last-%s.log' % kind))
+    rmtree(work)
+    write_json(base / 'logs' / 'gpu-test.json', report)
+    log.info('ESSAI GPU %s : %s', 'REUSSI' if report['ok'] else 'RATE', json.dumps(report, ensure_ascii=False))
+    return 0 if report['ok'] else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description='Worker de nettoyage RE-USE')
     parser.add_argument('--base', required=True, help='dossier d\'installation (config, runtime, logs)')
     parser.add_argument('--launcher', help='script qui a lancé ce worker (mis à jour avec lui)')
     parser.add_argument('--crash-test', action='store_true', help='essai complet sans hub : installe, teste la carte, nettoie 10 s, écrit logs/crash-test.json')
+    parser.add_argument('--gpu-test', choices=('image', '3d'), help='essai de génération sans hub (worker arrêté) : logs/gpu-test.json')
+    parser.add_argument('--gpu-input', help='image d\'entrée de l\'essai 3D (défaut : logs/gpu-test.png)')
     args = parser.parse_args()
     base = Path(args.base).resolve()
     (base / 'logs').mkdir(parents=True, exist_ok=True)
@@ -1072,7 +1598,10 @@ def main():
         log.addHandler(h)
     log.setLevel(logging.INFO)
     try:
-        code = crash_test(base) if args.crash_test else Worker(base, args.launcher).run()
+        if args.gpu_test:
+            code = gpu_test(base, args.gpu_test, args.gpu_input)
+        else:
+            code = crash_test(base) if args.crash_test else Worker(base, args.launcher).run()
     except SystemExit as e:
         if isinstance(e.code, str):
             log.error('%s', e.code)

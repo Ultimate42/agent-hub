@@ -1,0 +1,125 @@
+{
+  "schema": 1,
+  "about": "Generations GPU (image, 3D) des workers : moteurs et modeles epingles par version et SHA-256. Lu par le hub (validation des demandes, GET /api/gpu/capabilities) et par le worker (installation paresseuse sous <dossier>\\gpu, ligne de commande). Voir GPU.md.",
+  "engines": {
+    "sdcpp": {
+      "label": "stable-diffusion.cpp master-1091-b9d7176 (Vulkan)",
+      "license": "MIT",
+      "source": "https://github.com/leejet/stable-diffusion.cpp/releases/tag/master-1091-b9d7176",
+      "windows": {
+        "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1091-b9d7176/sd-master-b9d7176-bin-win-vulkan-x64.zip",
+        "sha256": "900b3059b31a8258553abad763f31cc8bbb4fa2dbbb97dc0cd76b473218567e1",
+        "size": 30030079,
+        "exe": "sd-cli.exe"
+      }
+    },
+    "trellis": {
+      "label": "trellis.cpp v0.8.1 (TRELLIS.2 en GGML, Vulkan)",
+      "license": "MIT",
+      "source": "https://github.com/pwilkin/trellis.cpp/releases/tag/v0.8.1",
+      "windows": {
+        "url": "https://github.com/pwilkin/trellis.cpp/releases/download/v0.8.1/trellis-vulkan-windows-x64.zip",
+        "sha256": "d6c70678635f5367f9aa93261e9310e7c0c327ca8395399cf2ef869ccc2e72ba",
+        "size": 14131887,
+        "exe": "trellis-cli.exe"
+      },
+      "env": {
+        "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT": "1"
+      },
+      "env_note": "v0.8.1 precede le correctif RDNA2 (trellis.cpp issue #50, PR #55 du 23/10/2026) : sans cette variable, NaN sur RX 6000 avec les poids q8."
+    }
+  },
+  "types": {
+    "image": {
+      "label": "Image a partir d'un texte (ou d'un texte et d'une image de depart)",
+      "engine": "sdcpp",
+      "prompt": "required",
+      "input": "optional",
+      "output": "png",
+      "default_model": "z-image-turbo",
+      "models": {
+        "z-image-turbo": {
+          "label": "Z-Image Turbo 6B (Tongyi-MAI), diffusion Q8_0, encodeur Qwen3-4B Q8_0, 8 etapes",
+          "license": "Apache-2.0",
+          "source": "https://huggingface.co/Tongyi-MAI/Z-Image-Turbo",
+          "notes": "Meilleur modele a licence permissive du classement open weights d'Artificial Analysis (11/2026) qui tient dans 16 Go. cfg_scale 1 : negative_prompt sans effet. Ecrire le prompt en anglais ou en chinois de preference.",
+          "files": [
+            { "role": "diffusion", "name": "z_image_turbo-Q8_0.gguf", "size": 6577440704,
+              "sha256": "df1c5baa86d1398c979495a6072dbcee79444fdb884a2445582ba0769c44e9a1",
+              "url": "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/c61c0e422dc8b541b7548cf33a4ef8302b0f8085/z_image_turbo-Q8_0.gguf" },
+            { "role": "llm", "name": "Qwen3-4B-Instruct-2507-Q8_0.gguf", "size": 4280405600,
+              "sha256": "391c1e410fd9f4cf2de2b510273b56a84c19ce18f4fa3bfb3774031dac4ef068",
+              "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q8_0.gguf" },
+            { "role": "vae", "name": "ae.safetensors", "size": 335304388,
+              "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+              "url": "https://huggingface.co/Comfy-Org/Z-Image-Turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/vae/ae.safetensors" }
+          ],
+          "params": {
+            "width": { "type": "int", "min": 256, "max": 1536, "multiple": 64, "default": 1024 },
+            "height": { "type": "int", "min": 256, "max": 1536, "multiple": 64, "default": 1024 },
+            "steps": { "type": "int", "min": 1, "max": 30, "default": 8 },
+            "cfg_scale": { "type": "number", "min": 0, "max": 10, "default": 1.0 },
+            "seed": { "type": "int", "min": 0, "max": 2147483647, "default": "random" },
+            "sampler": { "type": "enum", "values": ["euler", "euler_a", "heun", "dpm++2m", "lcm"], "default": "euler" },
+            "negative_prompt": { "type": "string", "max": 2000, "default": "" },
+            "strength": { "type": "number", "min": 0.05, "max": 1, "default": 0.75, "needs_input": true }
+          },
+          "command": ["--diffusion-model", "{file:diffusion}", "--llm", "{file:llm}", "--vae", "{file:vae}",
+                      "-p", "{prompt}", "-n", "{negative_prompt}", "-W", "{width}", "-H", "{height}", "--steps", "{steps}",
+                      "--cfg-scale", "{cfg_scale}", "--sampling-method", "{sampler}", "-s", "{seed}", "-o", "{output}", "-v"],
+          "command_input": ["-i", "{input}", "--strength", "{strength}"],
+          "timeout_s": 1800
+        }
+      }
+    },
+    "3d": {
+      "label": "Modele 3D texture (GLB) a partir d'une image",
+      "engine": "trellis",
+      "experimental": true,
+      "flag": "enable_3d",
+      "prompt": "none",
+      "input": "required",
+      "output": "glb",
+      "default_model": "trellis2",
+      "models": {
+        "trellis2": {
+          "label": "TRELLIS.2 4B (Microsoft), poids GGUF q8",
+          "license": "MIT (TRELLIS.2, BiRefNet) ; encodeur DINOv3 sous licence DINOv3 de Meta (libre de redevance, usages militaires interdits)",
+          "source": "https://huggingface.co/microsoft/TRELLIS.2-4B",
+          "notes": "Experimental : pas encore prouve sur la RX 6950 XT. Image d'entree PNG ou JPEG, objet seul de preference (le fond est retire).",
+          "files": [
+            { "role": "birefnet", "name": "birefnet.gguf", "size": 882749024, "sha256": "10c5dd4dcac904cf81c9a16180eb66f167dd52ab55867f54a44567b0b2babbc1",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/birefnet.gguf" },
+            { "role": "dinov3", "name": "dinov3.gguf", "size": 323657920, "sha256": "0dd4ffd4b46a248f5b7d49c35275d68461fbf73f57ddb4c1fa8afb4f7bb45a0d",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/dinov3.gguf" },
+            { "role": "ss_flow", "name": "ss_flow.gguf", "size": 1376059040, "sha256": "ea6d8a42b20661a5c6a52e5ffbdc1df7aca9b212792193873b418c69f871422c",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/ss_flow.gguf" },
+            { "role": "ss_dec", "name": "ss_dec.gguf", "size": 147379392, "sha256": "2790b5eecb261cc877d9bf175ce2bd6dd48cd65be8c042c5f5bc023dfca01cf7",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/ss_dec.gguf" },
+            { "role": "shape_flow_512", "name": "shape_flow_512.gguf", "size": 1376125952, "sha256": "29b639f4ff22ded8f91b619376a835f64b9874b0ebcadb9ac6c305195bf5d1f9",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/shape_flow_512.gguf" },
+            { "role": "shape_flow_1024", "name": "shape_flow_1024.gguf", "size": 1376125952, "sha256": "997e9fc10ab95fda11c4cd1cbaf425101980ac36a2ef80e9c83e0b9c4bfc9680",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/shape_flow_1024.gguf" },
+            { "role": "shape_dec", "name": "shape_dec.gguf", "size": 881361568, "sha256": "0de7c7a675022dd8696d526a9279e5a50b2a35c8a79452f434a72dc53d40f169",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/shape_dec.gguf" },
+            { "role": "tex_flow_512", "name": "tex_flow_512.gguf", "size": 1376178176, "sha256": "389a2cbdda59d53b21e5989650d9d36b7ac603266eaef06712cd07a9fc377210",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/tex_flow_512.gguf" },
+            { "role": "tex_flow_1024", "name": "tex_flow_1024.gguf", "size": 1376178176, "sha256": "cb2cb3aee74ba09c018f918ed8c146bc7e4f96335b61fa0d1fc1ff1a7811e6da",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/tex_flow_1024.gguf" },
+            { "role": "tex_dec", "name": "tex_dec.gguf", "size": 881344576, "sha256": "88b4fced46455e02f316664d5c43584a311921dd9a1cdc1b7b7d981cca9214d4",
+              "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/tex_dec.gguf" }
+          ],
+          "params": {
+            "res": { "type": "enum", "values": ["512", "1024"], "default": "512" },
+            "steps": { "type": "int", "min": 4, "max": 30, "default": 12 },
+            "seed": { "type": "int", "min": 0, "max": 2147483647, "default": "random" },
+            "texture": { "type": "bool", "default": true }
+          },
+          "command": ["{input}", "{output}", "--models", "{models_dir}", "--backend", "Vulkan", "--require-gpu",
+                      "--res", "{res}", "--steps", "{steps}", "--seed", "{seed}", "{unless:texture=--no-texture}"],
+          "timeout_s": 3600
+        }
+      }
+    }
+  }
+}

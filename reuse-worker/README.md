@@ -10,6 +10,8 @@ manager (VPS) ──POST /api/reuse/jobs──► hub (file durable, baux) ◄�
 
 Plusieurs PC peuvent tirer sur la même file : le premier libre prend le job suivant. C'est le répartiteur.
 
+Les mêmes machines génèrent aussi des images et des modèles 3D à la demande des agents : voir [GPU.md](GPU.md).
+
 ## Pourquoi ça tourne sur AMD
 
 Le dépôt officiel de RE-USE dépend de `mamba-ssm`, dont le noyau de calcul est écrit pour CUDA, et son script
