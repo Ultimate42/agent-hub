@@ -104,8 +104,9 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   - `"gpu_keep_free_gb": 10` ;
   - `"gpu_keep_loaded_s": 600`.
 - **Réglages du moteur, réservés au jeton admin** :
-  - `flash_attn` : diffusion (défaut : imposée au DiT, encodeur texte et VAE laissés à la sonde de sd.cpp), on, off
-    ou auto ;
+  - `flash_attn` : auto (défaut : la sonde de sd.cpp décide, elle la coupe sur RDNA2), diffusion (imposée au DiT), on
+    ou off. Mesure sur la RX 6950 XT en 1024 : 21,8 s par étape sans, 26,8 s avec ;
+  - `text_encoder` : gpu (défaut) ou cpu, pour libérer 4 Go de mémoire vidéo ;
   - `vae_tiling` : true par défaut ;
   - `threads` : 0 par défaut, soit un fil par cœur.
 

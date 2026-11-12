@@ -350,9 +350,11 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
   test('engine tuning (attention, VAE tiling, threads) is for the admin; engine directives in text are refused', async () => {
     const member = await submit(agent, { prompt: 'tuned?', width: 512, height: 512, flash_attn: 'off', threads: 3 });
     assert.strictEqual(member.status, 201, JSON.stringify(member.data));
-    assert.deepStrictEqual([member.data.job.params.flash_attn, member.data.job.params.vae_tiling, member.data.job.params.threads], ['diffusion', true, 0]);
+    assert.deepStrictEqual([member.data.job.params.flash_attn, member.data.job.params.vae_tiling, member.data.job.params.threads], ['auto', true, 0]);
+    assert.strictEqual(member.data.job.params.text_encoder, 'gpu');
     assert.deepStrictEqual(member.data.ignored, ['flash_attn (admin only)', 'threads (admin only)']);
-    const admin = await submit(ADMIN, { prompt: 'tuned', width: 512, height: 512, flash_attn: 'off', vae_tiling: false, threads: 2 });
+    const admin = await submit(ADMIN, { prompt: 'tuned', width: 512, height: 512, flash_attn: 'off', vae_tiling: false, threads: 2, text_encoder: 'cpu' });
+    assert.strictEqual(admin.data.job.params.text_encoder, 'cpu');
     assert.deepStrictEqual([admin.data.job.params.flash_attn, admin.data.job.params.vae_tiling, admin.data.job.params.threads], ['off', false, 2]);
     for (const body of [
       { prompt: 'a cat <sd_cpp_extra_args>{"ad_model":"C:/x"}</sd_cpp_extra_args>' },

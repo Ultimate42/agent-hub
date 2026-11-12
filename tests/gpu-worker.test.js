@@ -227,7 +227,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     const server = runs().find(r => r.engine === 'sd-server');
     assert.strictEqual(server.args[server.args.indexOf('--listen-ip') + 1], '127.0.0.1');
     assert.strictEqual(server.args[server.args.indexOf('--backend') + 1], 'gpu');
-    assert.strictEqual(server.args[server.args.indexOf('--flash-attn') + 1], 'auto,diffusion=on', 'flash attention forced on the DiT: the auto probe turns it off on RDNA2');
+    assert.strictEqual(server.args[server.args.indexOf('--flash-attn') + 1], 'auto', 'sd.cpp decides (measured: forcing it is slower on RDNA2)');
     assert.ok(server.args.includes('--vae-tiling'));
     assert.ok(!server.args.includes('-t'), 'threads left to the engine by default');
     const req = runs().find(r => r.engine === 'sd-server-request');
@@ -266,7 +266,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
 
   test('admin tuning restarts the resident engine with the new flags; the same flags reuse it', async () => {
     const before = runs().filter(r => r.engine === 'sd-server').length;
-    const tuned = { prompt: 'tuned', width: 256, height: 256, flash_attn: 'off', vae_tiling: false, threads: 2 };
+    const tuned = { prompt: 'tuned', width: 256, height: 256, flash_attn: 'diffusion', vae_tiling: false, threads: 2, text_encoder: 'cpu' };
     const a = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify(tuned) })).job;
     const b = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ ...tuned, prompt: 'tuned again' }) })).job;
     assert.strictEqual((await finished(a.id)).status, 'done');
@@ -276,7 +276,8 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     const servers = runs().filter(r => r.engine === 'sd-server');
     assert.strictEqual(servers.length, before + 1, 'one restart for the new flags, then reused');
     const args = servers.pop().args;
-    assert.strictEqual(args[args.indexOf('--flash-attn') + 1], 'off');
+    assert.strictEqual(args[args.indexOf('--flash-attn') + 1], 'auto,diffusion=on');
+    assert.strictEqual(args[args.indexOf('--backend') + 1], 'te=cpu,gpu', 'text encoder on the CPU, the rest on the GPU');
     assert.ok(!args.includes('--vae-tiling'));
     assert.strictEqual(args[args.indexOf('-t') + 1], '2');
   });
