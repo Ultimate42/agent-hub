@@ -80,6 +80,7 @@
       "flag": "enable_3d",
       "prompt": "none",
       "input": "required",
+      "input_formats": ["png", "jpg"],
       "output": "glb",
       "default_model": "trellis2",
       "models": {

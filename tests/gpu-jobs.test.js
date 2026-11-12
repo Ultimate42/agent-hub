@@ -282,11 +282,15 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     await call(`/api/gpu/jobs/${img.id}/cancel`, { method: 'POST', token: agent });
   });
 
-  test('a model or type named after an Object.prototype key is unknown', async () => {
+  test('a model or type named after an Object.prototype key is unknown; 3D takes PNG or JPEG only', async () => {
     for (const body of [{ prompt: 'x', model: 'constructor' }, { prompt: 'x', type: 'constructor' }]) {
       const r = await submit(agent, body);
       assert.strictEqual(r.status, 400, JSON.stringify(r.data));
     }
+    const webp = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBPVP8 '), Buffer.alloc(16)]);
+    const r = await submit(agent, { type: '3d', image: webp.toString('base64') });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.data.error, /PNG or JPG/);
   });
 
   test('owners only see their own jobs; admin sees all; wait returns as soon as the job ends', async () => {

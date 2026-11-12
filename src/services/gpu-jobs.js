@@ -261,6 +261,9 @@ export function normalizeRequest(body, catalog = gpuCatalog()) {
     if (!spec.input || spec.input === 'none') return err(400, `${type} (${modelId}) takes no input image`);
     const img = decodeImage(given.image);
     if (img.error) return err(img.status || 400, img.error);
+    if (Array.isArray(spec.input_formats) && !spec.input_formats.includes(img.ext)) {
+      return err(400, `${type} takes ${spec.input_formats.map(f => f.toUpperCase()).join(' or ')} input images, not ${img.ext.toUpperCase()}`);
+    }
     input = img;
   } else if (spec.input === 'required') return err(400, `image (base64 PNG, JPEG or WebP) is required for ${type}`);
 
