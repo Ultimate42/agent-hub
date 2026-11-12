@@ -214,19 +214,20 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     const done = await finished(job.id);
     assert.strictEqual(done.status, 'done', JSON.stringify(done));
     assert.strictEqual(done.result.device, 'Fake Radeon RX');
-    assert.strictEqual(done.result.backend, 'gpu', 'the discrete GPU is asked for explicitly, and what the engine chose is reported');
-    assert.strictEqual(done.backend, 'gpu');
+    assert.strictEqual(done.result.backend, 'te=cpu,gpu', 'text encoder on the CPU, the rest on the discrete GPU, as the engine reports');
+    assert.strictEqual(done.backend, 'te=cpu,gpu');
     assert.strictEqual(done.result.s_per_step, 0.1);
     assert.strictEqual(done.result.load_s, 1.5);
     assert.strictEqual(done.result.vram_free_mib, 15312);
     assert.ok(done.result.server_start_s >= 0, 'first job of a series: the engine was started (weights loaded)');
-    assert.ok(done.engine.log.some(l => /auto-fit: --backend "gpu"/.test(l)), JSON.stringify(done.engine));
+    assert.strictEqual(typeof done.result.prefetch_mb_s, 'number', 'weights read once, sequentially, before the engine (speed reported)');
+    assert.ok(done.engine.log.some(l => /auto-fit: --backend "te=cpu,gpu"/.test(l)), JSON.stringify(done.engine));
     const out = await admin(`/api/gpu/jobs/${job.id}/result`, { raw: true });
     assert.strictEqual(out.readUInt32BE(16), 640);
     assert.strictEqual(out.readUInt32BE(20), 384);
     const server = runs().find(r => r.engine === 'sd-server');
     assert.strictEqual(server.args[server.args.indexOf('--listen-ip') + 1], '127.0.0.1');
-    assert.strictEqual(server.args[server.args.indexOf('--backend') + 1], 'gpu');
+    assert.strictEqual(server.args[server.args.indexOf('--backend') + 1], 'te=cpu,gpu');
     assert.strictEqual(server.args[server.args.indexOf('--flash-attn') + 1], 'auto', 'sd.cpp decides (measured: forcing it is slower on RDNA2)');
     assert.ok(server.args.includes('--vae-tiling'));
     assert.ok(!server.args.includes('-t'), 'threads left to the engine by default');
@@ -252,6 +253,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.strictEqual(db.status, 'done', JSON.stringify(db));
     assert.strictEqual(da.result.server_reused, true);
     assert.strictEqual(db.result.server_reused, true);
+    assert.strictEqual(db.result.prefetch_mb_s, undefined, 'engine already loaded: nothing read again');
     assert.strictEqual(runs().filter(r => r.engine === 'sd-server').length, 1, 'weights loaded once for the series');
     const img2img = runs().filter(r => r.engine === 'sd-server-request').find(r => r.body.prompt === 'same, at night');
     assert.strictEqual(img2img.path, '/sdapi/v1/img2img');
@@ -307,7 +309,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     const run = runs().find(r => r.engine === 'sd');
     assert.strictEqual(run.args[run.args.indexOf('-p') + 1], prompt);
     assert.strictEqual(run.args[run.args.indexOf('-s') + 1], '9');
-    assert.strictEqual(run.args[run.args.indexOf('--backend') + 1], 'gpu');
+    assert.strictEqual(run.args[run.args.indexOf('--backend') + 1], 'te=cpu,gpu');
     assert.match(fs.readFileSync(path.join(pc, 'logs', 'worker.log'), 'utf8'), /Moteur résident indisponible/);
     // Not retried for every job: the next one goes straight to sd-cli
     const launches = runs().filter(r => r.engine === 'sd-server').length;

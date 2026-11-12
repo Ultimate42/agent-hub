@@ -535,7 +535,7 @@ export function gpuInputFor(caller, id) {
 }
 
 /** Small flat object from a worker: lower-case keys, strings, numbers, booleans only. */
-function cleanMeta(meta, max = 16) {
+function cleanMeta(meta, max = 24) {
   const kept = {};
   if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
     for (const [k, v] of Object.entries(meta).slice(0, max)) {

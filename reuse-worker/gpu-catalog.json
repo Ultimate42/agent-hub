@@ -69,9 +69,9 @@
                             "notes": "Attention de sd.cpp. auto : sa sonde décide (coupée sur RDNA2) ; diffusion : imposée au DiT ; on : partout. Mesuré le 12/11 sur RX 6950 XT en 1024, 8 étapes : 21,8 s par étape sans flash attention, 26,8 s avec (chemin scalaire, sans coopmat)." },
             "vae_tiling": { "type": "bool", "default": true, "admin": true,
                             "notes": "Décodage par tuiles : sans elles, le VAE dépasse la taille de tampon permise par le pilote en 1024 et retombe en partie sur le processeur (34 à 41 s)." },
-            "text_encoder": { "type": "enum", "values": ["gpu", "cpu"], "default": "gpu", "admin": true,
+            "text_encoder": { "type": "enum", "values": ["cpu", "gpu"], "default": "cpu", "admin": true,
                               "cli": { "gpu": "gpu", "cpu": "te=cpu,gpu" },
-                              "notes": "Où calculer l'encodeur texte Qwen3-4B (4 Go) : cpu libère la mémoire vidéo pour le DiT, une fois par image." },
+                              "notes": "Où calculer l'encodeur texte Qwen3-4B (4 Go), une fois par image. Mesuré le 12/11 en 1024 : 13,3 s par étape avec cpu, 21,7 s avec gpu (encodeur, DiT et tampon de 4,4 Go dans 16 Go : la mémoire vidéo déborde)." },
             "threads": { "type": "int", "min": 0, "max": 64, "default": 0, "admin": true,
                          "notes": "Fils du moteur, lecture des poids comprise (0 = un par cœur). Le premier chargement lit le disque à 25 Mo/s environ avec la valeur par défaut." }
           },

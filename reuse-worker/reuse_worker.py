@@ -773,6 +773,59 @@ def download_resume(url, dest, expected_sha256, size, what, stop=None, progress=
             delay = min(delay * 2, 120)
 
 
+def available_ram():
+    """Mémoire disponible (octets, cache de fichiers récupérable compris), ou None si inconnue."""
+    try:
+        if IS_WINDOWS:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong), ('ullTotalPhys', ctypes.c_ulonglong),
+                            ('ullAvailPhys', ctypes.c_ulonglong), ('ullTotalPageFile', ctypes.c_ulonglong),
+                            ('ullAvailPageFile', ctypes.c_ulonglong), ('ullTotalVirtual', ctypes.c_ulonglong),
+                            ('ullAvailVirtual', ctypes.c_ulonglong), ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+            status = MemoryStatus()
+            status.dwLength = ctypes.sizeof(MemoryStatus)
+            return int(status.ullAvailPhys) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            if line.startswith('MemAvailable:'):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
+
+
+def prefetch(files, stop=None, progress=None, block=16 << 20, ram=available_ram):
+    """Lit les poids une fois, du début à la fin, par grands blocs et d'un seul lecteur, avant le moteur.
+
+    sd.cpp lit chaque tenseur depuis plusieurs fils à la fois, à des endroits différents des fichiers : sur un disque
+    mécanique ce va-et-vient plafonne à 15-25 Mo/s (mesuré sur gpu-box : 11 Go en 7 à 11 min). Une lecture séquentielle
+    remplit le cache de Windows ; le moteur lit ensuite en mémoire. Sauté si la mémoire libre ne peut pas tout garder
+    (on relirait pour rien). -> {prefetch_s, prefetch_mb_s} ou {prefetch: raison}."""
+    files = [Path(f) for f in files]
+    total = sum(f.stat().st_size for f in files)
+    free = ram()
+    if free is not None and total > 0.8 * free:
+        return {'prefetch': 'sauté : %.1f Go de poids pour %.1f Go de mémoire libre' % (total / 1e9, free / 1e9)}
+    t0, done = time.time(), 0
+    buf = bytearray(block)
+    view = memoryview(buf)
+    for f in files:
+        with open(f, 'rb', buffering=0) as handle:
+            while True:
+                n = handle.readinto(view)
+                if not n:
+                    break
+                done += n
+                if stop is not None and stop.is_set():
+                    raise JobLost('calcul interrompu')
+                if progress and done % (256 << 20) < block:
+                    elapsed = max(time.time() - t0, 1e-6)
+                    progress(done / max(total, 1), 'lecture des poids (%.0f Mo/s)' % (done / elapsed / 1e6))
+    elapsed = max(time.time() - t0, 1e-6)
+    return {'prefetch_s': round(elapsed, 1), 'prefetch_mb_s': round(done / elapsed / 1e6, 1)}
+
+
 def kill_orphan(pidfile, markers):
     """Moteur resté en marche après la mort du worker : arrêté, après avoir vérifié son nom (jamais un autre programme)."""
     try:
@@ -1121,10 +1174,11 @@ class Gpu:
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / ('last-%s.log' % kind)
         timeout = float(model.get('timeout_s') or 1800)
-        progress(0.3, 'lancement du moteur')
         t0 = time.time()
         trace = EngineTrace(steps)
         self.last_trace = trace
+        self.warm(values, trace, stop, progress)
+        progress(0.3, 'lancement du moteur')
         with open(log_path, 'wb') as out_log:
             proc = subprocess.Popen(args, cwd=str(exe.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     env=env, creationflags=flags, **kwargs)
@@ -1177,6 +1231,20 @@ class Gpu:
                 raise RuntimeError('image de %dx%d au lieu de %dx%d' % (size + want))
         elif ext == 'glb' and not is_glb(out):
             raise RuntimeError('la sortie n\'est pas un fichier GLB valide')
+
+    def warm(self, values, trace, stop, progress):
+        """Lecture séquentielle des poids avant un chargement (voir prefetch) ; durée et débit remontés au hub."""
+        if self.config.get('gpu_prefetch') is False:
+            return
+        files = sorted({v for k, v in values.items() if k.startswith('file:')})
+        if not files:
+            return
+        try:
+            info = prefetch(files, stop, lambda frac, stage: progress(0.3 * frac, stage))
+        except OSError as e:   # un fichier illisible : le moteur le dira mieux
+            info = {'prefetch': 'raté : %s' % e}
+        trace.meta.update(info)
+        log.info('Poids lus avant le moteur : %s', json.dumps(info, ensure_ascii=False))
 
     def spawn_options(self):
         flags, kwargs = 0, {}
@@ -1278,6 +1346,7 @@ class Gpu:
         t0 = time.time()
         fresh = self.server is None
         if fresh:
+            self.warm(values, trace, stop, progress)
             th = self.start_server(spec, exe, values, env, key, timeout, stop, progress)
             self.server['box']['trace'] = trace
             th.start()

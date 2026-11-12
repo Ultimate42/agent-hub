@@ -351,7 +351,7 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     const member = await submit(agent, { prompt: 'tuned?', width: 512, height: 512, flash_attn: 'off', threads: 3 });
     assert.strictEqual(member.status, 201, JSON.stringify(member.data));
     assert.deepStrictEqual([member.data.job.params.flash_attn, member.data.job.params.vae_tiling, member.data.job.params.threads], ['auto', true, 0]);
-    assert.strictEqual(member.data.job.params.text_encoder, 'gpu');
+    assert.strictEqual(member.data.job.params.text_encoder, 'cpu');
     assert.deepStrictEqual(member.data.ignored, ['flash_attn (admin only)', 'threads (admin only)']);
     const admin = await submit(ADMIN, { prompt: 'tuned', width: 512, height: 512, flash_attn: 'off', vae_tiling: false, threads: 2, text_encoder: 'cpu' });
     assert.strictEqual(admin.data.job.params.text_encoder, 'cpu');

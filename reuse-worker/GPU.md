@@ -106,7 +106,8 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
 - **Réglages du moteur, réservés au jeton admin** :
   - `flash_attn` : auto (défaut : la sonde de sd.cpp décide, elle la coupe sur RDNA2), diffusion (imposée au DiT), on
     ou off. Mesure sur la RX 6950 XT en 1024 : 21,8 s par étape sans, 26,8 s avec ;
-  - `text_encoder` : gpu (défaut) ou cpu, pour libérer 4 Go de mémoire vidéo ;
+  - `text_encoder` : cpu (défaut) ou gpu. En 1024, cpu libère 4 Go de mémoire vidéo et donne 13,3 s par étape au lieu
+    de 21,7 s (mesure du 12/11) ;
   - `vae_tiling` : true par défaut ;
   - `threads` : 0 par défaut, soit un fil par cœur.
 
@@ -122,6 +123,14 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
     sur le processeur, soit 34 à 41 s.
 - Un texte (prompt, negative_prompt) qui contient `sd_cpp_extra_args` est refusé. Le worker le retire aussi : sd-server
   lit dans le texte des réglages cachés, dont des chemins de fichiers.
+- **Lecture des poids.** sd.cpp lit les tenseurs avec un fil par cœur, à des endroits différents des fichiers.
+  Sur gpu-box, cela donne 15 à 25 Mo/s, soit 7 à 11 minutes pour 11 Go à chaque démarrage du moteur, sans profiter
+  du cache. Avant chaque démarrage, le worker lit donc les fichiers une fois du début à la fin, d'un seul lecteur,
+  par blocs de 16 Mo. Cela remplit le cache de Windows, et le moteur lit ensuite en mémoire.
+  - Si la mémoire libre ne peut pas tout garder, cette lecture est sautée.
+  - Le débit mesuré est remonté dans `engine` (`prefetch_mb_s`). S'il reste lui aussi sous 30 Mo/s, la limite vient
+    du disque ou de l'antivirus, pas de la manière de lire.
+  - `"gpu_prefetch": false` dans la config la désactive.
 - **Ce que dit le moteur** est remonté au hub pendant le calcul. On le lit dans `engine` de
   `GET /api/gpu/jobs/:id` :
   - la carte réellement utilisée (`device`) et le choix de calcul de sd.cpp (`backend`, `cpu` s'il est retombé

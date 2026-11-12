@@ -478,6 +478,42 @@ class EngineTraceTest(unittest.TestCase):
         self.assertIn('warning 0', t.lines[0])
         self.assertIn('warning 499', t.lines[-1])
 
+
+class PrefetchTest(unittest.TestCase):
+    """Lecture séquentielle des poids avant le moteur : débit mesuré, sautée si la mémoire ne peut pas tout garder."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.files = []
+        for i, size in enumerate((3 << 20, 1 << 20)):
+            f = self.dir / ('w%d.gguf' % i)
+            f.write_bytes(os.urandom(size))
+            self.files.append(f)
+
+    def test_reads_everything_and_reports_speed(self):
+        seen = []
+        info = w.prefetch(self.files, progress=lambda frac, stage: seen.append((frac, stage)), block=1 << 20, ram=lambda: 1 << 40)
+        self.assertGreater(info['prefetch_mb_s'], 0)
+        self.assertGreaterEqual(info['prefetch_s'], 0)
+
+    def test_skipped_when_memory_cannot_hold_the_weights(self):
+        info = w.prefetch(self.files, ram=lambda: 2 << 20)
+        self.assertIn('sauté', info['prefetch'])
+
+    def test_unknown_memory_still_reads(self):
+        self.assertIn('prefetch_mb_s', w.prefetch(self.files, ram=lambda: None))
+
+    def test_cancel_stops_reading(self):
+        import threading
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(w.JobLost):
+            w.prefetch(self.files, stop=stop, block=1 << 20, ram=lambda: None)
+
+    def test_available_ram_is_a_number_or_none(self):
+        v = w.available_ram()
+        self.assertTrue(v is None or v > 0)
+
 if __name__ == '__main__':
     w.log.addHandler(__import__('logging').NullHandler())
     w.log.propagate = False
