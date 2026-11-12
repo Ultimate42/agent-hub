@@ -72,19 +72,21 @@
             "text_encoder": { "type": "enum", "values": ["cpu", "gpu"], "default": "cpu", "admin": true,
                               "cli": { "gpu": "gpu", "cpu": "te=cpu,gpu" },
                               "notes": "Où calculer l'encodeur texte Qwen3-4B (4 Go), une fois par image. Mesuré le 12/11 en 1024 : 13,3 s par étape avec cpu, 21,7 s avec gpu (encodeur, DiT et tampon de 4,4 Go dans 16 Go : la mémoire vidéo déborde)." },
+            "mmap": { "type": "bool", "default": false, "admin": true,
+                       "notes": "Charger les poids par projection mémoire (--mmap) au lieu de std::ifstream. Mesuré le 12/11 : les fichiers se lisent à 953 Mo/s d'un seul lecteur, mais sd.cpp les relit à 25 Mo/s par ifstream, même en cache." },
             "threads": { "type": "int", "min": 0, "max": 64, "default": 0, "admin": true,
                          "notes": "Fils du moteur, lecture des poids comprise (0 = un par cœur). Le premier chargement lit le disque à 25 Mo/s environ avec la valeur par défaut." }
           },
           "command": ["--diffusion-model", "{file:diffusion}", "--llm", "{file:llm}", "--vae", "{file:vae}",
                       "-p", "{prompt}", "-n", "{negative_prompt}", "-W", "{width}", "-H", "{height}", "--steps", "{steps}",
                       "--cfg-scale", "{cfg_scale}", "--sampling-method", "{sampler}", "-s", "{seed}", "-o", "{output}", "-v", "--backend", "{text_encoder}",
-                      "--flash-attn", "{flash_attn}", "{if:vae_tiling=--vae-tiling}", "{opt:threads=-t}"],
+                      "--flash-attn", "{flash_attn}", "{if:vae_tiling=--vae-tiling}", "{if:mmap=--mmap}", "{opt:threads=-t}"],
           "command_input": ["-i", "{input}", "--strength", "{strength}"],
           "server": {
             "exe": "sd-server.exe",
             "protocol": "sdapi",
             "command": ["--diffusion-model", "{file:diffusion}", "--llm", "{file:llm}", "--vae", "{file:vae}", "--backend", "{text_encoder}", "-v",
-                        "--flash-attn", "{flash_attn}", "{if:vae_tiling=--vae-tiling}", "{opt:threads=-t}",
+                        "--flash-attn", "{flash_attn}", "{if:vae_tiling=--vae-tiling}", "{if:mmap=--mmap}", "{opt:threads=-t}",
                         "--listen-ip", "127.0.0.1", "--listen-port", "{port}"]
           },
           "timeout_s": 1800

@@ -106,6 +106,8 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
 - **Réglages du moteur, réservés au jeton admin** :
   - `flash_attn` : auto (défaut : la sonde de sd.cpp décide, elle la coupe sur RDNA2), diffusion (imposée au DiT), on
     ou off. Mesure sur la RX 6950 XT en 1024 : 21,8 s par étape sans, 26,8 s avec ;
+  - `mmap` : false par défaut. true charge les poids par projection mémoire au lieu de la lecture par flux de sd.cpp,
+    qui plafonne à 25 Mo/s même quand les fichiers sont en cache ;
   - `text_encoder` : cpu (défaut) ou gpu. En 1024, cpu libère 4 Go de mémoire vidéo et donne 13,3 s par étape au lieu
     de 21,7 s (mesure du 12/11) ;
   - `vae_tiling` : true par défaut ;
