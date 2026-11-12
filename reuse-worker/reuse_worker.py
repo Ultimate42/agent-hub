@@ -12,6 +12,7 @@ Codes de sortie (lus par le lanceur) :
   autre  plantage (le lanceur relance ; trois plantages au démarrage = retour à la version précédente)
 """
 import argparse
+import base64
 import array
 import hashlib
 import json
@@ -653,6 +654,7 @@ class Engine:
 # Générations GPU (image, 3D) : catalogue publié par le hub, installation paresseuse sous <dossier>/gpu
 # --------------------------------------------------------------------------------------------
 GPU_CATALOG = 'gpu-catalog.json'
+GPU_KEEP_LOADED_S = 600          # moteur image gardé chargé entre deux travaux (réglable : "gpu_keep_loaded_s", 0 = jamais)
 GPU_DEFAULT_MAX_GB = 30.0        # plafond du dossier gpu (réglable : "gpu_max_gb" dans la config)
 GPU_KEEP_FREE_GB = 10.0          # place laissée libre sur le disque après un téléchargement (réglable : "gpu_keep_free_gb")
 PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
@@ -787,6 +789,127 @@ def kill_orphan(pidfile, markers):
     Path(pidfile).unlink(missing_ok=True)
 
 
+class ServerUnavailable(Exception):
+    """Le moteur résident n'a pas pu servir ce travail : le lancement classique (un processus par travail) prend le relais."""
+
+
+class EngineTrace:
+    """Lit la sortie d'un moteur (stable-diffusion.cpp, trellis.cpp) au fil de l'eau : phases chronométrées, carte et
+    plan mémoire réellement choisis, lignes utiles gardées pour le hub. Sans cela, un calcul retombé sur le processeur
+    ou des poids relus du disque à chaque travail ne se voient qu'à la lenteur."""
+    KEEP = re.compile(r'ggml_vulkan|vulkan\d|auto-fit|devices?:|free\s+-?\d+ MiB|RAM\s+free|params\s+-?\d+ MiB|--backend|using CPU|'
+                      r'no GPU|buffer size|completed, taking|completed in|memory-mapped|out of memory|tiling|model manager|'
+                      r'offload|staged|\bWARN|\bERROR|failed|error', re.I)
+    BAR = re.compile(r'\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)\s*(s/it|it/s|[KMG]B/s)')
+    TAKING = (('load_s', r'loading tensors completed, taking ([\d.]+)s'), ('encode_s', r'get_learned_condition completed, taking ([\d.]+)s'),
+              ('sampling_s', r'sampling completed, taking ([\d.]+)s'), ('decode_s', r'decode_first_stage completed, taking ([\d.]+)s'),
+              ('total_s', r'generate_image completed in ([\d.]+)s'))
+    MAX_LINES = 80
+
+    def __init__(self, steps=None, clock=time.time):
+        self.steps = steps
+        self.clock = clock
+        self.t0 = clock()
+        self.partial = ''
+        self.lines = []
+        self.meta = {}
+        self.phase = 'démarrage'
+        self.progress = 0.0
+        self.step = None
+        self.step_rate = None
+        self.first_step_at = None
+        self.last_step_at = None
+
+    def feed(self, data):
+        text = self.partial + data.decode('utf-8', 'replace')
+        parts = re.split(r'[\r\n]', text)
+        self.partial = parts.pop()
+        for line in parts:
+            self.line(line)
+        if len(self.partial) > 4096:
+            self.line(self.partial)
+            self.partial = ''
+        bar = list(self.BAR.finditer(self.partial))   # barre en cours de dessin (pas encore de fin de ligne)
+        if bar:
+            self.bar(bar[-1])
+
+    def close(self):
+        if self.partial:
+            self.line(self.partial)
+            self.partial = ''
+
+    def keep(self, line):
+        line = line.strip()[:240]
+        if line and (not self.lines or self.lines[-1] != line):
+            self.lines.append('%5.0fs %s' % (self.clock() - self.t0, line))
+            if len(self.lines) > self.MAX_LINES:   # le début (cartes, plan) et la fin (temps) comptent le plus
+                del self.lines[self.MAX_LINES // 2]
+
+    def line(self, line):
+        bars = list(self.BAR.finditer(line))
+        if bars:
+            self.bar(bars[-1])
+            return
+        if not self.KEEP.search(line):
+            return
+        self.keep(line)
+        low = line.lower()
+        m = re.search(r'ggml_vulkan: \d+ = ([^|(\r\n]+)', line)
+        if m and 'device' not in self.meta:
+            self.meta['device'] = m.group(1).strip()[:120]
+        if 'using cpu' in low or 'no gpu devices' in low:
+            self.meta['backend'] = 'cpu'
+        m = re.search(r'--backend "([^"]*)"', line)
+        if m and self.meta.get('backend') != 'cpu':
+            self.meta['backend'] = m.group(1)[:120]
+        m = re.search(r'(vulkan\d+)\s+(.*?)\s+free\s+(-?\d+) MiB, budget\s+(-?\d+) MiB', line, re.I)
+        if m:
+            self.meta.setdefault('vram_free_mib', int(m.group(3)))
+            self.meta.setdefault('vram_budget_mib', int(m.group(4)))
+        m = re.search(r'RAM\s+free\s+(-?\d+) MiB', line)
+        if m:
+            self.meta.setdefault('ram_free_mib', int(m.group(1)))
+        for key, pattern in self.TAKING:
+            m = re.search(pattern, line)
+            if m:
+                self.meta[key] = round(float(m.group(1)), 1)
+                self.phase = {'load_s': 'encodage du texte', 'encode_s': 'étapes', 'sampling_s': 'décodage'}.get(key, self.phase)
+
+    def bar(self, m):
+        a, b, rate, unit = int(m.group(1)), int(m.group(2)), float(m.group(3)), m.group(4)
+        if not b:
+            return
+        now = self.clock()
+        if unit.endswith('B/s'):
+            self.phase = 'chargement des poids'
+            self.progress = max(self.progress, 0.05 + 0.25 * a / b) if self.step is None else self.progress
+        elif self.steps and b == self.steps:
+            self.step = a
+            self.step_rate = (rate if unit == 's/it' else (1.0 / rate if rate else None))
+            if self.first_step_at is None:
+                self.first_step_at = now
+            self.last_step_at = now
+            self.phase = 'étape %d/%d' % (a, b)
+            self.progress = 0.35 + 0.55 * a / b
+        else:   # tuiles du décodeur, autre barre
+            self.phase = 'décodage' if self.step else self.phase
+            if self.step:
+                self.progress = max(self.progress, 0.9 + 0.08 * a / b)
+
+    def stage(self):
+        if self.step_rate and self.step is not None and self.phase.startswith('étape'):
+            return '%s (%.1f s par étape)' % (self.phase, self.step_rate)
+        return self.phase
+
+    def summary(self):
+        meta = dict(self.meta)
+        if self.step_rate:
+            meta['s_per_step'] = round(self.step_rate, 2)
+        if self.first_step_at is not None:
+            meta.setdefault('before_steps_s', round(self.first_step_at - self.t0, 1))
+        return meta
+
+
 class Gpu:
     """Image et 3D : moteurs et modèles du catalogue, installés au premier job qui en a besoin, tout sous <dossier>/gpu.
 
@@ -803,6 +926,10 @@ class Gpu:
         self.catalog = read_json(app / GPU_CATALOG, {}) or {}
         self.pidfile = self.root / 'engine.pid'
         self.status = {}   # type -> état lisible (« prêt », « pas installé », « échec : … »)
+        self.last_trace = None   # EngineTrace du dernier lancement de moteur
+        self.server = None       # moteur résident (sd-server) : {proc, port, key, trace, last_used, thread, log}
+        self.server_pidfile = self.root / 'server.pid'
+        self.server_refused = set()   # configurations dont le moteur résident n'a pas démarré : sd-cli directement
 
     def vram(self):
         """Mémoire de la carte qui calculera (octets), 0 sans carte Vulkan, None si inconnue (pas encore regardé)."""
@@ -968,17 +1095,24 @@ class Gpu:
         env = dict(os.environ, **{k: str(v) for k, v in env_extra.items()})
         if self.config.get('gpu_device') is not None:   # carte imposée (numéro Vulkan de ggml)
             env['GGML_VK_VISIBLE_DEVICES'] = str(int(self.config['gpu_device']))
-        flags, kwargs = 0, {}
-        if IS_WINDOWS:
-            flags = subprocess.CREATE_NO_WINDOW | (subprocess.BELOW_NORMAL_PRIORITY_CLASS if self.config.get('low_priority', True) else 0)
-        elif self.config.get('low_priority', True):
-            kwargs['preexec_fn'] = lambda: os.nice(10)
+        flags, kwargs = self.spawn_options()
+        steps = values.get('steps') if isinstance(values.get('steps'), int) else None
+        server = model.get('server')
+        if server and self.keep_loaded_s() > 0:
+            try:
+                compute_s, meta = self.run_server(server, exe, values, env, input_path, out, steps, stop, progress, float(model.get('timeout_s') or 1800))
+                self.check_output(ext, out, values)
+                return out, compute_s, meta
+            except ServerUnavailable as e:
+                log.warning('Moteur résident indisponible (%s) : lancement classique de %s pour ce travail.', e, exe.name)
         logs = self.root / 'logs'
         logs.mkdir(parents=True, exist_ok=True)
         log_path = logs / ('last-%s.log' % kind)
         timeout = float(model.get('timeout_s') or 1800)
-        progress(0.3, 'calcul')
+        progress(0.3, 'lancement du moteur')
         t0 = time.time()
+        trace = EngineTrace(steps)
+        self.last_trace = trace
         with open(log_path, 'wb') as out_log:
             proc = subprocess.Popen(args, cwd=str(exe.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     env=env, creationflags=flags, **kwargs)
@@ -989,6 +1123,7 @@ class Gpu:
                 for block in iter(lambda: proc.stdout.read1(4096) if hasattr(proc.stdout, 'read1') else proc.stdout.read(4096), b''):
                     out_log.write(block)
                     tail.extend(block)
+                    trace.feed(block)
                     if len(tail) > 65536:
                         del tail[:len(tail) - 65536]
             th = threading.Thread(target=reader, daemon=True)
@@ -999,28 +1134,28 @@ class Gpu:
                         raise JobLost('calcul interrompu')
                     if time.time() - t0 > timeout:
                         raise RuntimeError('calcul trop long (plus de %s), arrêté' % fmt_duration(timeout))
-                    steps = re.findall(rb'(\d+)/(\d+)\s*-', bytes(tail[-2048:]))
-                    if steps:
-                        a, b = (int(x) for x in steps[-1])
-                        if b:
-                            progress(0.3 + 0.65 * min(a, b) / b, 'calcul')
+                    progress(max(0.3, trace.progress), trace.stage())
                     time.sleep(1)
             finally:
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
                 th.join(5)
+                trace.close()
                 self.pidfile.unlink(missing_ok=True)
         compute_s = time.time() - t0
+        log.info('Moteur %s : %s', exe.name, json.dumps(trace.summary(), ensure_ascii=False))
         text = bytes(tail).decode('utf-8', 'replace')
         if proc.returncode != 0:
             raise RuntimeError('%s a échoué (code %s) : %s' % (exe.name, proc.returncode, ' | '.join(text.strip().splitlines()[-3:])[-300:]))
         if not out.exists():
             raise RuntimeError('%s n\'a rien écrit' % exe.name)
-        meta = {}
-        dev = re.findall(r'ggml_vulkan: \d+ = ([^\r\n|(]+)', text)
-        if dev:
-            meta['device'] = dev[0].strip()[:120]
+        meta = trace.summary()
+        self.check_output(ext, out, values)
+        return out, compute_s, meta
+
+    @staticmethod
+    def check_output(ext, out, values):
         if ext == 'png':
             size = png_size(out)
             if not size:
@@ -1030,7 +1165,178 @@ class Gpu:
                 raise RuntimeError('image de %dx%d au lieu de %dx%d' % (size + want))
         elif ext == 'glb' and not is_glb(out):
             raise RuntimeError('la sortie n\'est pas un fichier GLB valide')
-        return out, compute_s, meta
+
+    def spawn_options(self):
+        flags, kwargs = 0, {}
+        if IS_WINDOWS:
+            flags = subprocess.CREATE_NO_WINDOW | (subprocess.BELOW_NORMAL_PRIORITY_CLASS if self.config.get('low_priority', True) else 0)
+        elif self.config.get('low_priority', True):
+            kwargs['preexec_fn'] = lambda: os.nice(10)
+        return flags, kwargs
+
+    # ---- moteur résident : les poids (11 Go) chargés une fois pour une série de travaux ------------------
+    def keep_loaded_s(self):
+        try:
+            return max(0.0, float(self.config.get('gpu_keep_loaded_s', GPU_KEEP_LOADED_S)))
+        except (TypeError, ValueError):
+            return float(GPU_KEEP_LOADED_S)
+
+    def local(self, method, path, body=None, timeout=30):
+        """Requête au moteur résident, sur 127.0.0.1 seulement, sans proxy. -> (statut, json ou None)."""
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request('http://127.0.0.1:%d%s' % (self.server['port'], path), data=data, method=method,
+                                     headers={'Content-Type': 'application/json'} if data else {})
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                text = r.read()
+                return r.status, (json.loads(text) if text[:1] in (b'{', b'[') else None)
+        except urllib.error.HTTPError as e:
+            text = e.read()
+            try:
+                return e.code, json.loads(text)
+            except ValueError:
+                return e.code, {'error': text[:300].decode('utf-8', 'replace')}
+
+    def start_server(self, spec, exe, values, env, key, timeout, stop, progress):
+        exe_dir = Path(exe).parent
+        name = spec['exe'][:-4] if not IS_WINDOWS and spec['exe'].endswith('.exe') else spec['exe']
+        server_exe = exe_dir / name
+        if not server_exe.exists():
+            raise ServerUnavailable('%s absent du paquet' % spec['exe'])
+        probe = socket.socket()
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        args = [str(server_exe)] + build_command(spec['command'], dict(values, port=port))
+        flags, kwargs = self.spawn_options()
+        logs = self.root / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        out_log = open(logs / 'server-image.log', 'wb')
+        proc = subprocess.Popen(args, cwd=str(exe_dir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                env=env, creationflags=flags, **kwargs)
+        self.server_pidfile.write_text(str(proc.pid))
+        box = {'trace': None, 'written': 0}
+
+        def reader():
+            for block in iter(lambda: proc.stdout.read1(4096) if hasattr(proc.stdout, 'read1') else proc.stdout.read(4096), b''):
+                if box['written'] < (50 << 20):   # journal borné : un moteur résident peut parler des heures
+                    out_log.write(block)
+                    out_log.flush()
+                    box['written'] += len(block)
+                t = box['trace']
+                if t is not None:
+                    t.feed(block)
+            out_log.close()
+        th = threading.Thread(target=reader, daemon=True)
+        self.server = {'proc': proc, 'port': port, 'key': key, 'box': box, 'thread': th, 'last_used': time.time()}
+        return th
+
+    def stop_server(self, why=''):
+        srv, self.server = self.server, None
+        if not srv:
+            return
+        if srv['proc'].poll() is None:
+            srv['proc'].kill()
+            try:
+                srv['proc'].wait(30)
+            except subprocess.TimeoutExpired:
+                pass
+        srv['thread'].join(5)
+        self.server_pidfile.unlink(missing_ok=True)
+        if why:
+            log.info('Moteur image résident arrêté (%s) : carte libérée.', why)
+
+    def idle(self):
+        """Appelé par la boucle du worker : décharge le moteur résident après gpu_keep_loaded_s sans travail."""
+        if self.server and (self.server['proc'].poll() is not None or time.time() - self.server['last_used'] > self.keep_loaded_s()):
+            self.stop_server('%s sans travail' % fmt_duration(self.keep_loaded_s()) if self.server['proc'].poll() is None else 'il s\'était arrêté')
+
+    def run_server(self, spec, exe, values, env, input_path, out, steps, stop, progress, timeout):
+        """Un travail sur le moteur résident (sd-server, API sdapi). Démarré au besoin : le premier travail d'une série paie
+        le chargement des poids, les suivants non. -> (secondes, méta)."""
+        key = json.dumps([str(exe), spec, sorted((k, v) for k, v in values.items() if k.startswith('file:')), sorted((k, v) for k, v in env.items() if k.startswith('GGML'))])
+        if key in self.server_refused:
+            raise ServerUnavailable('a déjà refusé de démarrer avec cette configuration')
+        if self.server and (self.server['key'] != key or self.server['proc'].poll() is not None):
+            self.stop_server('configuration changée' if self.server['key'] != key else 'il s\'était arrêté')
+        trace = EngineTrace(steps)
+        self.last_trace = trace
+        t0 = time.time()
+        fresh = self.server is None
+        if fresh:
+            th = self.start_server(spec, exe, values, env, key, timeout, stop, progress)
+            self.server['box']['trace'] = trace
+            th.start()
+            progress(0.3, 'chargement du moteur')
+            while True:   # prêt quand l'API répond : les poids sont alors chargés
+                if stop is not None and stop.is_set():
+                    self.stop_server()
+                    raise JobLost('calcul interrompu')
+                if self.server['proc'].poll() is not None:
+                    self.server_refused.add(key)
+                    self.stop_server()
+                    raise ServerUnavailable('arrêté au démarrage : %s' % ' | '.join(trace.lines[-3:])[-300:])
+                if time.time() - t0 > timeout:
+                    self.stop_server()
+                    raise RuntimeError('moteur résident pas prêt après %s' % fmt_duration(timeout))
+                try:
+                    if self.local('GET', '/sdapi/v1/options', timeout=5)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                progress(max(0.3, trace.progress), trace.stage())
+                time.sleep(1)
+            trace.meta['server_start_s'] = round(time.time() - t0, 1)
+        else:
+            self.server['box']['trace'] = trace
+            trace.meta['server_reused'] = True
+        body = {'prompt': values.get('prompt', ''), 'negative_prompt': values.get('negative_prompt', ''),
+                'width': values.get('width'), 'height': values.get('height'), 'steps': values.get('steps'),
+                'cfg_scale': values.get('cfg_scale'), 'seed': values.get('seed'), 'sampler_name': values.get('sampler', ''),
+                'batch_size': 1}
+        route = '/sdapi/v1/txt2img'
+        if input_path is not None:
+            body['init_images'] = [base64.b64encode(Path(input_path).read_bytes()).decode()]
+            body['denoising_strength'] = values.get('strength')
+            route = '/sdapi/v1/img2img'
+        answer = {}
+
+        def call():
+            try:
+                answer['r'] = self.local('POST', route, body, timeout=timeout)
+            except OSError as e:
+                answer['e'] = e
+        caller = threading.Thread(target=call, daemon=True)
+        t1 = time.time()
+        caller.start()
+        while caller.is_alive():
+            if stop is not None and stop.is_set():
+                self.stop_server('travail annulé')   # sd-server ne sait pas interrompre une génération
+                raise JobLost('calcul interrompu')
+            if self.server['proc'].poll() is not None:
+                break
+            progress(max(0.35, trace.progress), trace.stage() if trace.step is not None else 'calcul')
+            caller.join(1)
+        caller.join(5)
+        self.server['last_used'] = time.time()
+        if self.server['proc'].poll() is not None:
+            lines = ' | '.join(trace.lines[-3:])[-300:]
+            self.stop_server()
+            raise RuntimeError('le moteur résident s\'est arrêté pendant le calcul : %s' % lines)
+        if 'e' in answer:
+            self.stop_server()
+            raise RuntimeError('moteur résident injoignable : %s' % answer['e'])
+        status, data = answer.get('r', (0, None))
+        images = (data or {}).get('images') or []
+        if status != 200 or not images:
+            raise RuntimeError('le moteur résident a refusé (HTTP %s) : %s' % (status, str((data or {}).get('error') or (data or {}).get('message') or data)[:300]))
+        out.write_bytes(base64.b64decode(images[0]))
+        meta = trace.summary()
+        meta['generate_s'] = round(time.time() - t1, 1)
+        meta.setdefault('backend', 'vulkan')
+        log.info('Moteur résident : %s', json.dumps(meta, ensure_ascii=False))
+        return time.time() - t0, meta
 
 
 # --------------------------------------------------------------------------------------------
@@ -1299,6 +1605,7 @@ class Worker:
         self.set_state('génération %s' % kind, '%s %d' % (kind, jid))
         stop, finished = threading.Event(), threading.Event()
         now = {'progress': 0.0, 'stage': 'préparation'}
+        self.gpu.last_trace = None   # journal du moteur de CE travail (rempli par Gpu.run)
 
         def progress(frac, stage):
             now.update(progress=round(max(0.0, min(1.0, frac)), 3), stage=stage)
@@ -1308,7 +1615,7 @@ class Worker:
             period = max(5, min(15, job.get('lease_s', 600) // 5))
             while True:
                 try:
-                    status, _ = self.hub.request('POST', '%s%d/heartbeat' % (route, jid), body=dict(now, info=self.info()), timeout=30)
+                    status, _ = self.hub.request('POST', '%s%d/heartbeat' % (route, jid), body=self.gpu_beat(now), timeout=30)
                     if status in (404, 409):
                         stop.set()
                         return
@@ -1355,7 +1662,9 @@ class Worker:
                 write_json(meta_file, done)
                 log.info('Job %s : calculé en %s.', label, fmt_duration(compute_s))
             payload = out.read_bytes()
-            query = urllib.parse.urlencode({'compute_s': done['compute_s'], 'backend': 'vulkan', 'meta': json.dumps(done.get('meta') or {})})
+            self.final_beat(route, jid, now)   # journal complet du moteur, avant le résultat
+            backend = str((done.get('meta') or {}).get('backend') or 'vulkan')
+            query = urllib.parse.urlencode({'compute_s': done['compute_s'], 'backend': backend, 'meta': json.dumps(done.get('meta') or {})})
 
             def send():
                 status, body = self.hub.request('POST', '%s%d/result?%s' % (route, jid, query), raw=payload, timeout=600,
@@ -1378,6 +1687,7 @@ class Worker:
             log.error('Job %s : %s.', label, e)
             self.state['last_error'] = 'job %s : %s' % (label, e)
             rmtree(jobdir)
+            self.final_beat(route, jid, now)
             self.give_back(jid, e, route)
         except OSError as e:
             log.error('Job %s en attente : %s. Le travail fait est gardé dans %s.', label, e, jobdir)
@@ -1387,10 +1697,28 @@ class Worker:
             self.state['last_error'] = 'job %s : %s' % (label, e)
             self.gpu.status[kind] = 'échec : %s' % str(e)[:120]
             rmtree(jobdir)
+            self.final_beat(route, jid, now)
             self.give_back(jid, e, route)
         finally:
             finished.set()
             self.set_state('en attente')
+
+    def gpu_beat(self, now):
+        """Corps d'un signe de vie GPU : avancement, étape lisible, et lignes utiles du moteur (carte, plan mémoire, temps)."""
+        body = dict(now, info=self.info())
+        trace = getattr(self.gpu, 'last_trace', None)
+        if trace is not None:
+            body['log'] = list(trace.lines)
+            body['meta'] = trace.summary()
+        return body
+
+    def final_beat(self, route, jid, now):
+        if getattr(self.gpu, 'last_trace', None) is None:
+            return
+        try:
+            self.hub.request('POST', '%s%d/heartbeat' % (route, jid), body=self.gpu_beat(now), timeout=30)
+        except OSError:
+            pass
 
     def give_back(self, jid, reason, route='/api/reuse/jobs/'):
         """Rend le job au hub en comptant l'essai (au bout du dernier, le hub le déclare en échec)."""
@@ -1442,6 +1770,7 @@ class Worker:
             self.report()
             return EXIT_NOT_READY
         kill_orphan(self.gpu.pidfile, (b'sd-cli', b'trellis-cli'))
+        kill_orphan(self.gpu.server_pidfile, (b'sd-server',))
         skipped = {}
         if self.gpu.types(skipped):
             log.info('Générations GPU proposées : %s', self.gpu.describe())
@@ -1453,7 +1782,9 @@ class Worker:
         orders = {}
         errors = 0
         while True:
+            self.gpu.idle()
             if (self.base / 'STOP').exists():
+                self.gpu.stop_server('arrêt du worker')
                 log.info('Fichier STOP présent : arrêt. Le supprimer pour relancer.')
                 return EXIT_STOP
             if job:
@@ -1605,6 +1936,7 @@ def gpu_test(base, kind, input_path=None):
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
         report['error'] = str(e)[:400]
         report['log'] = str(gpu.root / 'logs' / ('last-%s.log' % kind))
+    gpu.stop_server()   # l'essai ne laisse rien tourner derrière lui
     rmtree(work)
     write_json(base / 'logs' / 'gpu-test.json', report)
     log.info('ESSAI GPU %s : %s', 'REUSSI' if report['ok'] else 'RATE', json.dumps(report, ensure_ascii=False))

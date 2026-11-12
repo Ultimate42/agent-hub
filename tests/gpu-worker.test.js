@@ -17,6 +17,8 @@ const BASE_URL = `http://localhost:${PORT}`;
 const ADMIN = 'reuse-admin-secret-0123456789';
 const TOKEN = 'gpu-box-worker-secret-0123456789';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const KEEP_S = 8; // resident engine unloaded after this long without a job (600 s by default)
+const alive = (pid) => fs.existsSync(`/proc/${pid}`) && fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(' ')[2] !== 'Z';
 const sha = buf => crypto.createHash('sha256').update(buf).digest('hex');
 
 const FAKE_SD = `#!/usr/bin/env python3
@@ -28,12 +30,62 @@ with open(os.environ['FAKE_GPU_LOG'], 'a') as f:
 for role in ('--diffusion-model', '--llm', '--vae'):
     assert open(opt(role)).read().startswith('fake'), role
 print('ggml_vulkan: 0 = Fake Radeon RX (RADV) | uma: 0', flush=True)
-for i in range(1, 5):
-    print('  |=====>   | %d/4 - 0.10s/it' % i, end='\\r', flush=True)
-    time.sleep(30 if 'slow' in opt('-p') else 0.1)
+print('[INFO ] backend_fit.cpp:337 -     Vulkan0      Fake Radeon RX                   free  15312 MiB, budget  14800 MiB', flush=True)
+print('[INFO ] backend_fit.cpp:485 - auto-fit: --backend "%s"' % (opt('--backend') or 'Vulkan0'), flush=True)
+for i in (50, 100):
+    print('\\r  |####| %d/100 -   900.00MB/s\\x1b[K' % i, end='\\n' if i == 100 else '', flush=True)
+print('[INFO ] model_loader.cpp:1437 - loading tensors completed, taking 1.50s (read: 1.00s, memcpy: 0.10s, convert: 0.00s, copy_to_backend: 0.40s)', flush=True)
+steps = int(opt('--steps'))
+for i in range(1, steps + 1):
+    print('\\r  |=====>   | %d/%d - 0.10s/it\\x1b[K' % (i, steps), end='\\n' if i == steps else '', flush=True)
+    time.sleep(30 if 'slow' in opt('-p') else 0.05)
+print('[INFO ] image.cpp:1037 - sampling completed, taking 0.40s', flush=True)
 w, h = int(opt('-W')), int(opt('-H'))
 with open(opt('-o'), 'wb') as f:
     f.write(b'\\x89PNG\\r\\n\\x1a\\n' + struct.pack('>I', 13) + b'IHDR' + struct.pack('>II', w, h) + bytes([8, 6, 0, 0, 0]) + b'fake pixels')
+`;
+// Resident engine (sd-server, sdapi): loads once, answers txt2img / img2img on 127.0.0.1 until stopped
+const FAKE_SERVER = `#!/usr/bin/env python3
+import base64, http.server, json, os, struct, sys, time
+a = sys.argv[1:]
+opt = lambda k: a[a.index(k) + 1] if k in a else None
+def note(d):
+    with open(os.environ['FAKE_GPU_LOG'], 'a') as f:
+        f.write(json.dumps(d) + '\\n')
+note({'engine': 'sd-server', 'args': a, 'pid': os.getpid()})
+if os.path.exists(os.environ['FAKE_GPU_LOG'] + '.server-broken'):
+    print('[ERROR] fake: cannot start', flush=True)
+    sys.exit(1)
+for role in ('--diffusion-model', '--llm', '--vae'):
+    assert open(opt(role)).read().startswith('fake'), role
+print('ggml_vulkan: 0 = Fake Radeon RX (RADV) | uma: 0', flush=True)
+print('[INFO ] backend_fit.cpp:337 -     Vulkan0      Fake Radeon RX                   free  15312 MiB, budget  14800 MiB', flush=True)
+print('[INFO ] backend_fit.cpp:485 - auto-fit: --backend "%s"' % opt('--backend'), flush=True)
+print('\\r  |####| 100/100 -   900.00MB/s\\x1b[K', flush=True)
+print('[INFO ] model_loader.cpp:1437 - loading tensors completed, taking 1.50s (read: 1.00s, memcpy: 0.10s, convert: 0.00s, copy_to_backend: 0.40s)', flush=True)
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        self.send_response(200 if self.path == '/sdapi/v1/options' else 404)
+        self.end_headers()
+        self.wfile.write(b'{}')
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        note({'engine': 'sd-server-request', 'path': self.path, 'pid': os.getpid(), 'init': len(body.pop('init_images', [])), 'body': body})
+        steps = body['steps']
+        for i in range(1, steps + 1):
+            print('\\r  |=====>   | %d/%d - 0.10s/it\\x1b[K' % (i, steps), end='\\n' if i == steps else '', flush=True)
+            time.sleep(30 if 'slow' in body['prompt'] else 0.05)
+        print('[INFO ] image.cpp:1037 - sampling completed, taking 0.40s', flush=True)
+        png = b'\\x89PNG\\r\\n\\x1a\\n' + struct.pack('>I', 13) + b'IHDR' + struct.pack('>II', body['width'], body['height']) + bytes([8, 6, 0, 0, 0]) + b'fake'
+        out = json.dumps({'images': [base64.b64encode(png).decode()], 'info': '{}'}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+http.server.ThreadingHTTPServer(('127.0.0.1', int(opt('--listen-port'))), Handler).serve_forever()
 `;
 const FAKE_TRELLIS = `#!/usr/bin/env python3
 import json, os, struct, sys
@@ -87,10 +139,11 @@ describe('worker: image and 3D generation end to end', { skip: !canRun }, () => 
 
     // Catalog = the real one (parameters, command lines), with Linux fake engines and small model files
     const catalog = JSON.parse(fs.readFileSync(path.join(SRC, 'gpu-catalog.json'), 'utf8'));
-    const asset = (name, exe, script) => {
+    const asset = (name, exe, script, extra = {}) => {
       const dir = path.join(tmp, `${name}-build`, 'bin');
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, exe), script);
+      for (const [file, text] of Object.entries(extra)) fs.writeFileSync(path.join(dir, file), text);
       fs.writeFileSync(path.join(dir, 'libggml-vulkan.so'), 'fake library');
       const zip = path.join(store, `${name}.zip`);
       const zipped = spawnSync('python3', ['-I', '-c', 'import shutil, sys; shutil.make_archive(sys.argv[1][:-4], "zip", sys.argv[2])', zip, path.dirname(dir)]);
@@ -98,7 +151,7 @@ describe('worker: image and 3D generation end to end', { skip: !canRun }, () => 
       const data = fs.readFileSync(zip);
       return { url: `file://${zip}`, sha256: sha(data), size: data.length, exe };
     };
-    catalog.engines.sdcpp.linux = asset('sd', 'sd-cli', FAKE_SD);
+    catalog.engines.sdcpp.linux = asset('sd', 'sd-cli', FAKE_SD, { 'sd-server': FAKE_SERVER });
     catalog.engines.trellis.linux = asset('trellis', 'trellis-cli', FAKE_TRELLIS);
     for (const type of Object.values(catalog.types)) {
       for (const model of Object.values(type.models)) {
@@ -119,7 +172,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     fs.writeFileSync(path.join(tmp, 'model.gguf'), 'fake');
     fs.writeFileSync(path.join(pc, 'reuse-worker.config.json'), JSON.stringify({
       hub_url: BASE_URL, allow_http: true, token: TOKEN, backend: 'cpu', audiocpp_cli: engine, model: path.join(tmp, 'model.gguf'),
-      enable_3d: true, gpu_max_gb: 1, gpu_keep_free_gb: 0
+      enable_3d: true, gpu_max_gb: 1, gpu_keep_free_gb: 0, gpu_keep_loaded_s: KEEP_S
     }));
 
     hub = spawn('node', ['src/index.js'], {
@@ -155,20 +208,29 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.ok(!fs.existsSync(path.join(pc, 'gpu', 'models')), 'lazy: no model before the first job');
   });
 
-  test('image: installs on first need, prompt passed as one argument, PNG checked by the hub', async () => {
-    const prompt = 'a "quoted" teapot; & | $(echo nope) `x` %PATH%';
+  test('image: installs on first need, resident engine started on the GPU, prompt intact, PNG checked by the hub', async () => {
+    const prompt = 'a "quoted" teapot; & | $(echo nope) `x` %PATH% é';
     const { job } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt, width: 640, height: 384, seed: 7 }) });
     const done = await finished(job.id);
     assert.strictEqual(done.status, 'done', JSON.stringify(done));
     assert.strictEqual(done.result.device, 'Fake Radeon RX');
+    assert.strictEqual(done.result.backend, 'gpu', 'the discrete GPU is asked for explicitly, and what the engine chose is reported');
+    assert.strictEqual(done.backend, 'gpu');
+    assert.strictEqual(done.result.s_per_step, 0.1);
+    assert.strictEqual(done.result.load_s, 1.5);
+    assert.strictEqual(done.result.vram_free_mib, 15312);
+    assert.ok(done.result.server_start_s >= 0, 'first job of a series: the engine was started (weights loaded)');
+    assert.ok(done.engine.log.some(l => /auto-fit: --backend "gpu"/.test(l)), JSON.stringify(done.engine));
     const out = await admin(`/api/gpu/jobs/${job.id}/result`, { raw: true });
     assert.strictEqual(out.readUInt32BE(16), 640);
     assert.strictEqual(out.readUInt32BE(20), 384);
-    const run = runs().find(r => r.engine === 'sd');
-    assert.strictEqual(run.args[run.args.indexOf('-p') + 1], prompt);
-    assert.strictEqual(run.args[run.args.indexOf('-s') + 1], '7');
-    assert.strictEqual(run.args[run.args.indexOf('--cfg-scale') + 1], '1');
-    assert.ok(!run.args.includes('-i'), 'no input image: no image-to-image arguments');
+    const server = runs().find(r => r.engine === 'sd-server');
+    assert.strictEqual(server.args[server.args.indexOf('--listen-ip') + 1], '127.0.0.1');
+    assert.strictEqual(server.args[server.args.indexOf('--backend') + 1], 'gpu');
+    const req = runs().find(r => r.engine === 'sd-server-request');
+    assert.strictEqual(req.path, '/sdapi/v1/txt2img');
+    assert.deepStrictEqual([req.body.prompt, req.body.seed, req.body.cfg_scale, req.body.steps, req.body.sampler_name], [prompt, 7, 1, 8, 'euler']);
+    assert.ok(!runs().some(r => r.engine === 'sd'), 'no one-shot sd-cli run');
     // Everything lives under <folder>/gpu; the job folder is gone
     const engines = fs.readdirSync(path.join(pc, 'gpu', 'engines'));
     assert.strictEqual(engines.length, 1, 'only the engine that was needed');
@@ -178,14 +240,59 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.deepStrictEqual(fs.readdirSync(path.join(pc, 'work')), []);
   });
 
-  test('image to image: the input image reaches the engine with the strength', async () => {
+  test('a series of jobs reuses the loaded engine (image to image included), then it is unloaded when idle', async () => {
     const start = png(512, 512, 'start');
-    const { job } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'same, at night', image: start.toString('base64'), width: 512, height: 512, strength: 0.4 }) });
+    const a = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'same, at night', image: start.toString('base64'), width: 512, height: 512, strength: 0.4 }) })).job;
+    const b = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'another one', width: 256, height: 256 }) })).job;
+    const [da, db] = [await finished(a.id), await finished(b.id)];
+    assert.strictEqual(da.status, 'done', JSON.stringify(da));
+    assert.strictEqual(db.status, 'done', JSON.stringify(db));
+    assert.strictEqual(da.result.server_reused, true);
+    assert.strictEqual(db.result.server_reused, true);
+    assert.strictEqual(runs().filter(r => r.engine === 'sd-server').length, 1, 'weights loaded once for the series');
+    const img2img = runs().filter(r => r.engine === 'sd-server-request').find(r => r.body.prompt === 'same, at night');
+    assert.strictEqual(img2img.path, '/sdapi/v1/img2img');
+    assert.strictEqual(img2img.init, 1);
+    assert.strictEqual(img2img.body.denoising_strength, 0.4);
+
+    const pid = runs().find(r => r.engine === 'sd-server').pid;
+    assert.ok(alive(pid));
+    await until('engine unloaded after the idle delay', () => !alive(pid), KEEP_S + 60);
+    assert.match(fs.readFileSync(path.join(pc, 'logs', 'worker.log'), 'utf8'), /Moteur image résident arrêté \(8 s sans travail\)/);
+  });
+
+  test('cancelled while computing: the resident engine is stopped (card freed), the next job starts a new one', async () => {
+    const { job } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'slow one', width: 256, height: 256 }) });
+    await until('computing', async () => (await admin(`/api/gpu/jobs/${job.id}`)).progress > 0.35);
+    const pid = runs().filter(r => r.engine === 'sd-server').pop().pid;
+    assert.match((await admin(`/api/gpu/jobs/${job.id}`)).stage, /^étape \d\/8/);
+    await admin(`/api/gpu/jobs/${job.id}/cancel`, { method: 'POST' });
+    await until('engine stopped', () => !alive(pid), 90);
+    const { job: next } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'after the cancel', width: 256, height: 256 }) });
+    const done = await finished(next.id);
+    assert.strictEqual(done.status, 'done');
+    assert.ok(done.result.server_start_s >= 0, 'a new engine was started');
+    assert.match(fs.readFileSync(path.join(pc, 'logs', 'worker.log'), 'utf8'), /abandonné : le hub l'a repris ou annulé/);
+  });
+
+  test('an engine that will not start: one-shot sd-cli instead, prompt passed as one argument', async () => {
+    const pid = runs().filter(r => r.engine === 'sd-server').pop().pid;
+    await until('engine unloaded', () => !alive(pid), KEEP_S + 60);
+    fs.writeFileSync(`${fakeLog}.server-broken`, '');
+    const prompt = 'a "quoted" teapot; & | $(echo nope)';
+    const { job } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt, width: 320, height: 256, seed: 9 }) });
     const done = await finished(job.id);
     assert.strictEqual(done.status, 'done', JSON.stringify(done));
-    const run = runs().filter(r => r.engine === 'sd').pop();
-    assert.strictEqual(run.args[run.args.indexOf('--strength') + 1], '0.4');
-    assert.match(run.args[run.args.indexOf('-i') + 1], /in\.png$/);
+    const run = runs().find(r => r.engine === 'sd');
+    assert.strictEqual(run.args[run.args.indexOf('-p') + 1], prompt);
+    assert.strictEqual(run.args[run.args.indexOf('-s') + 1], '9');
+    assert.strictEqual(run.args[run.args.indexOf('--backend') + 1], 'gpu');
+    assert.match(fs.readFileSync(path.join(pc, 'logs', 'worker.log'), 'utf8'), /Moteur résident indisponible/);
+    // Not retried for every job: the next one goes straight to sd-cli
+    const launches = runs().filter(r => r.engine === 'sd-server').length;
+    const { job: again } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'again', width: 256, height: 256 }) });
+    assert.strictEqual((await finished(again.id)).status, 'done');
+    assert.strictEqual(runs().filter(r => r.engine === 'sd-server').length, launches);
   });
 
   test('3d: trellis installed on first need, with the RDNA2 workaround, GLB checked by the hub', async () => {
@@ -202,17 +309,6 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.strictEqual(run.args[run.args.indexOf('--res') + 1], '512');
     assert.ok(run.models.includes('ss_flow.gguf') && run.models.includes('dinov3.gguf'));
     assert.ok(!run.models.some(n => n.endsWith('.part')));
-  });
-
-  test('cancelled while computing: the engine is stopped, the worker takes the next job', async () => {
-    const { job } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'slow one', width: 256, height: 256 }) });
-    await until('computing', async () => (await admin(`/api/gpu/jobs/${job.id}`)).progress > 0.3);
-    const pid = runs().filter(r => r.engine === 'sd').pop().pid;
-    await admin(`/api/gpu/jobs/${job.id}/cancel`, { method: 'POST' });
-    await until('engine stopped', () => !fs.existsSync(`/proc/${pid}`) || fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(' ')[2] === 'Z', 90);
-    const { job: next } = await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ prompt: 'after the cancel', width: 256, height: 256 }) });
-    assert.strictEqual((await finished(next.id)).status, 'done');
-    assert.match(fs.readFileSync(path.join(pc, 'logs', 'worker.log'), 'utf8'), /abandonné : le hub l'a repris ou annulé/);
   });
 
   test('RE-USE still works on the same worker', async () => {

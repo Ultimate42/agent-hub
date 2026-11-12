@@ -316,6 +316,37 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     assert.strictEqual((await call(`/api/gpu/jobs/${mine.id}`, { token: agent })).status, 404);
   });
 
+  test('what the engine says (device, memory plan, timings, useful lines) is kept with the job, per attempt', async () => {
+    const img = (await submit(agent, { prompt: 'diagnostics', width: 512, height: 512 })).data.job;
+    assert.strictEqual((await poll(AMD, 'image')).data.job.id, img.id);
+    const lines = ['   12s auto-fit: --backend "gpu"', ...Array.from({ length: 150 }, (_, i) => `line ${i} ${'x'.repeat(400)}`)];
+    const hb = await call(`/api/gpu/jobs/${img.id}/heartbeat`, {
+      method: 'POST', token: AMD,
+      body: { progress: 0.5, stage: 'étape 3/8 (4.2 s par étape)', log: lines, meta: { device: 'AMD Radeon RX 6950 XT', s_per_step: 4.2, 'Bad-Key': 1, nested: { a: 1 } } }
+    });
+    assert.strictEqual(hb.status, 200);
+    const v = await view(img.id, agent);
+    assert.strictEqual(v.stage, 'étape 3/8 (4.2 s par étape)');
+    assert.strictEqual(v.engine.device, 'AMD Radeon RX 6950 XT');
+    assert.strictEqual(v.engine.s_per_step, 4.2);
+    assert.strictEqual(v.engine['Bad-Key'], undefined);
+    assert.strictEqual(v.engine.nested, undefined);
+    assert.strictEqual(v.engine.log.length, 100, 'bounded');
+    assert.ok(v.engine.log.every(l => l.length <= 300));
+    // A heartbeat without log keeps what was said; a new attempt starts clean
+    await call(`/api/gpu/jobs/${img.id}/heartbeat`, { method: 'POST', token: AMD, body: { progress: 0.6 } });
+    assert.strictEqual((await view(img.id)).engine.device, 'AMD Radeon RX 6950 XT');
+    await call(`/api/gpu/jobs/${img.id}/fail`, { method: 'POST', token: AMD, body: { error: 'test' } });
+    assert.strictEqual((await poll(AMD, 'image')).data.job.id, img.id);
+    assert.strictEqual((await view(img.id)).engine, undefined);
+    const image = png(512, 512);
+    const done = await call(`/api/gpu/jobs/${img.id}/result?compute_s=790&backend=cpu&meta=${encodeURIComponent(JSON.stringify({ backend: 'cpu', load_s: 412.2 }))}`, {
+      method: 'POST', token: AMD, rawBody: image, headers: { 'X-Sha256': sha(image) }
+    });
+    assert.strictEqual(done.data.job.backend, 'cpu');
+    assert.strictEqual(done.data.job.result.load_s, 412.2);
+  });
+
   test('a caller cannot flood the queue', async () => {
     const ids = [];
     let last;

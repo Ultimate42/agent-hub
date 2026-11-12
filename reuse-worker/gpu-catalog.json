@@ -67,8 +67,14 @@
           },
           "command": ["--diffusion-model", "{file:diffusion}", "--llm", "{file:llm}", "--vae", "{file:vae}",
                       "-p", "{prompt}", "-n", "{negative_prompt}", "-W", "{width}", "-H", "{height}", "--steps", "{steps}",
-                      "--cfg-scale", "{cfg_scale}", "--sampling-method", "{sampler}", "-s", "{seed}", "-o", "{output}", "-v"],
+                      "--cfg-scale", "{cfg_scale}", "--sampling-method", "{sampler}", "-s", "{seed}", "-o", "{output}", "-v", "--backend", "gpu"],
           "command_input": ["-i", "{input}", "--strength", "{strength}"],
+          "server": {
+            "exe": "sd-server.exe",
+            "protocol": "sdapi",
+            "command": ["--diffusion-model", "{file:diffusion}", "--llm", "{file:llm}", "--vae", "{file:vae}", "--backend", "gpu", "-v",
+                        "--listen-ip", "127.0.0.1", "--listen-port", "{port}"]
+          },
           "timeout_s": 1800
         }
       }

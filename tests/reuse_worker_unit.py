@@ -302,6 +302,9 @@ class GpuTest(unittest.TestCase):
                 values = {k: (v['default'] if v.get('default') != 'random' else 1) for k, v in m['params'].items()}
                 values.update(prompt='x', output='o', models_dir='d', input='i', **{'file:' + f['role']: 'f' for f in m['files']})
                 w.build_command(m['command'] + m.get('command_input', []), values)   # aucune valeur manquante
+                if m.get('server'):
+                    args = w.build_command(m['server']['command'], dict(values, port=1234))
+                    self.assertIn('127.0.0.1', args, 'le moteur résident n\'écoute que la machine elle-même')
                 for f in m['files']:
                     self.assertTrue(w.safe_file_name(f['name']))
                     self.assertRegex(f['sha256'], r'^[0-9a-f]{64}$')
@@ -397,6 +400,79 @@ class GpuTest(unittest.TestCase):
         self.assertTrue(w.is_glb(g))
         g.write_bytes(b'glTF' + struct.pack('<II', 2, 999) + body)
         self.assertFalse(w.is_glb(g))
+
+
+class EngineTraceTest(unittest.TestCase):
+    """Sortie de stable-diffusion.cpp lue au fil de l'eau : carte, plan mémoire, phases et temps remontés au hub."""
+
+    def sample(self, cpu=False):
+        bar = lambda a, b, speed: '\r  |%s| %d/%d - %10s\x1b[K%s' % ('#' * (50 * a // b) + ' ' * (50 - 50 * a // b), a, b, speed, '\n' if a == b else '')
+        out = ['ggml_vulkan: Found 2 Vulkan devices:\n',
+               'ggml_vulkan: 0 = AMD Radeon RX 6950 XT (AMD proprietary driver) | uma: 0 | fp16: 1 | bf16: 0 | warp size: 64\n',
+               'ggml_vulkan: 1 = AMD Radeon(TM) Graphics (AMD proprietary driver) | uma: 1 | fp16: 1\n',
+               '[INFO ] backend_fit.cpp:334 - auto-fit plan:\n',
+               '[INFO ] backend_fit.cpp:337 -     Vulkan0      AMD Radeon RX 6950 XT            free  15312 MiB, budget  14800 MiB\n',
+               '[INFO ] backend_fit.cpp:344 -     RAM          free  20480 MiB, params budget  18432 MiB\n',
+               '[DEBUG] model.cpp:12 - a line nobody needs\n']
+        if cpu:
+            out.append('[WARN ] backend_fit.cpp:457 - auto-fit: no GPU memory budget available; using CPU\n')
+        else:
+            out.append('[INFO ] backend_fit.cpp:485 - auto-fit: --backend "diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0" --params-backend "te=cpu"\n')
+        out += [bar(a, 400, '27.31MB/s') for a in (100, 200, 400)]
+        out.append('[INFO ] model_loader.cpp:1437 - loading tensors completed, taking 412.20s (read: 400.10s, memcpy: 2.00s, convert: 0.00s, copy_to_backend: 9.00s)\n')
+        out.append('[INFO ] image.cpp:662 - get_learned_condition completed, taking 131.05s\n')
+        out += [bar(a, 8, '%.2fs/it' % 24.5) for a in range(1, 9)]
+        out.append('[INFO ] image.cpp:1037 - sampling completed, taking 196.10s\n')
+        out += [bar(a, 16, '1.10it/s') for a in (8, 16)]
+        out.append('[INFO ] image.cpp:757 - decode_first_stage completed, taking 35.20s\n')
+        out.append('[INFO ] main.cpp:900 - generate_image completed in 790.00s\n')
+        return ''.join(out).encode()
+
+    def feed(self, trace, data, size=37):
+        for i in range(0, len(data), size):   # blocs arbitraires : lignes et barres coupées n'importe où
+            trace.feed(data[i:i + size])
+        trace.close()
+
+    def test_phases_device_plan_and_times(self):
+        clock = [100.0]
+        t = w.EngineTrace(steps=8, clock=lambda: clock[0])
+        self.feed(t, self.sample())
+        m = t.summary()
+        self.assertEqual(m['device'], 'AMD Radeon RX 6950 XT')
+        self.assertEqual(m['backend'], 'diffusion=Vulkan0,te=Vulkan0,vae=Vulkan0')
+        self.assertEqual((m['vram_free_mib'], m['vram_budget_mib'], m['ram_free_mib']), (15312, 14800, 20480))
+        self.assertEqual((m['load_s'], m['encode_s'], m['sampling_s'], m['decode_s'], m['total_s']), (412.2, 131.1, 196.1, 35.2, 790.0))
+        self.assertEqual(m['s_per_step'], 24.5)
+        self.assertTrue(any('--params-backend "te=cpu"' in l for l in t.lines))
+        self.assertFalse(any('nobody needs' in l for l in t.lines))
+        self.assertFalse(any('MB/s' in l or 's/it' in l for l in t.lines), 'les barres ne remplissent pas le journal')
+
+    def test_cpu_fallback_is_named(self):
+        t = w.EngineTrace(steps=8)
+        self.feed(t, self.sample(cpu=True))
+        self.assertEqual(t.summary()['backend'], 'cpu')
+
+    def test_progress_and_stage_while_running(self):
+        t = w.EngineTrace(steps=8)
+        t.feed(b'\r  |#########                    | 100/400 -   27.31MB/s\x1b[K')
+        self.assertEqual(t.stage(), 'chargement des poids')
+        self.assertAlmostEqual(t.progress, 0.05 + 0.25 * 0.25)
+        t.feed(b'\n[INFO ] image.cpp:662 - get_learned_condition completed, taking 1.05s\n')
+        t.feed(b'\r  |======>        | 3/8 - 4.25s/it\x1b[K')
+        self.assertEqual(t.stage(), 'étape 3/8 (4.2 s par étape)')
+        self.assertAlmostEqual(t.progress, 0.35 + 0.55 * 3 / 8)
+        before = t.progress
+        t.feed(b'\r  |=====| 8/8 - 4.00s/it\x1b[K\n\r  |##| 4/16 - 2.00it/s\x1b[K')
+        self.assertEqual(t.stage(), 'décodage')
+        self.assertGreater(t.progress, before)
+
+    def test_log_is_bounded(self):
+        t = w.EngineTrace(steps=8)
+        for i in range(500):
+            t.feed(('[WARN ] x.cpp:1 - warning %d\n' % i).encode())
+        self.assertEqual(len(t.lines), w.EngineTrace.MAX_LINES)
+        self.assertIn('warning 0', t.lines[0])
+        self.assertIn('warning 499', t.lines[-1])
 
 if __name__ == '__main__':
     w.log.addHandler(__import__('logging').NullHandler())

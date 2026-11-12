@@ -99,6 +99,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_gpu_jobs_status ON gpu_jobs (status, priority DESC, id);
   CREATE INDEX IF NOT EXISTS idx_gpu_jobs_owner ON gpu_jobs (owner, id);
 `);
+// What the engine said during the current attempt (device, memory plan, timings, useful lines), sent with heartbeats
+if (!db.prepare('PRAGMA table_info(gpu_jobs)').all().some(c => c.name === 'engine')) db.exec('ALTER TABLE gpu_jobs ADD COLUMN engine TEXT');
 
 const q = {
   insert: db.prepare(`INSERT INTO gpu_jobs (type, model, owner, owner_label, priority, params, in_sha256, in_size, in_ext, created_at)
@@ -114,8 +116,9 @@ const q = {
   held: db.prepare(`SELECT * FROM gpu_jobs WHERE status = 'claimed' AND worker = ? AND lease_until >= ? ORDER BY id LIMIT 1`),
   heldAll: db.prepare(`SELECT worker, type FROM gpu_jobs WHERE status = 'claimed' AND lease_until >= ?`),
   claim: db.prepare(`UPDATE gpu_jobs SET status = 'claimed', worker = ?, claimed_at = ?, lease_until = ?, attempts = attempts + 1,
-                     progress = NULL, stage = NULL WHERE id = ?`),
+                     progress = NULL, stage = NULL, engine = NULL WHERE id = ?`),
   renew: db.prepare('UPDATE gpu_jobs SET lease_until = ?, progress = COALESCE(?, progress), stage = COALESCE(?, stage) WHERE id = ?'),
+  engine: db.prepare('UPDATE gpu_jobs SET engine = ? WHERE id = ?'),
   fail: db.prepare('UPDATE gpu_jobs SET status = ?, error = ?, lease_until = NULL, done_at = ? WHERE id = ?'),
   done: db.prepare(`UPDATE gpu_jobs SET status = 'done', out_sha256 = ?, out_size = ?, out_ext = ?, out_meta = ?, compute_s = ?, backend = ?,
                     error = NULL, progress = 1, stage = NULL, lease_until = NULL, done_at = ? WHERE id = ?`),
@@ -336,6 +339,7 @@ export function gpuJobView(j, now = Date.now()) {
     ...(status === 'claimed' ? { progress: j.progress ?? 0, ...(j.stage ? { stage: j.stage } : {}) } : {}),
     ...(status === 'pending' ? { queue_position: q.ahead.get({ now, type: j.type, priority: j.priority, id: j.id }).n + 1 } : {}),
     ...(j.compute_s != null ? { compute_s: j.compute_s, backend: j.backend } : {}),
+    ...(j.engine ? { engine: parse(j.engine) } : {}),
     created_at: new Date(j.created_at).toISOString(),
     ...(j.claimed_at ? { claimed_at: new Date(j.claimed_at).toISOString() } : {}),
     ...(j.done_at ? { finished_at: new Date(j.done_at).toISOString() } : {})
@@ -517,10 +521,25 @@ export function gpuInputFor(caller, id) {
   return { ok: true, job: r.job, file };
 }
 
-export function heartbeatGpu(id, name, { progress, stage, info } = {}, now = Date.now()) {
+/** Small flat object from a worker: lower-case keys, strings, numbers, booleans only. */
+function cleanMeta(meta, max = 16) {
+  const kept = {};
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    for (const [k, v] of Object.entries(meta).slice(0, max)) {
+      if (/^[a-z_]{1,32}$/.test(k) && ['string', 'number', 'boolean'].includes(typeof v)) kept[k] = typeof v === 'string' ? v.slice(0, 200) : v;
+    }
+  }
+  return kept;
+}
+
+export function heartbeatGpu(id, name, { progress, stage, info, log, meta } = {}, now = Date.now()) {
   const r = heldBy(id, name);
   if (!r.ok) return r;
   noteReusePoll(name, info);
+  if (Array.isArray(log) || (meta && typeof meta === 'object')) {
+    const lines = (Array.isArray(log) ? log : []).filter(l => typeof l === 'string').slice(-100).map(l => l.slice(0, 300));
+    q.engine.run(JSON.stringify({ ...cleanMeta(meta), log: lines }), r.job.id);
+  }
   const p = Number(progress);
   q.renew.run(now + config.gpuLeaseMs, progress !== undefined && Number.isFinite(p) ? Math.min(Math.max(p, 0), 1) : null,
     typeof stage === 'string' ? stage.slice(0, 80) : null, r.job.id);
@@ -568,12 +587,7 @@ export function completeGpu(id, name, { data, sha256: announced, computeS, backe
   if (q.stored.get().bytes + data.length > config.gpuMaxStorage) {
     return err(507, 'GPU storage is full on the hub: delete finished jobs (DELETE /api/gpu/jobs/:id)');
   }
-  const kept = {};
-  if (meta && typeof meta === 'object') {
-    for (const [k, v] of Object.entries(meta).slice(0, 12)) {
-      if (/^[a-z_]{1,32}$/.test(k) && ['string', 'number', 'boolean'].includes(typeof v)) kept[k] = typeof v === 'string' ? v.slice(0, 200) : v;
-    }
-  }
+  const kept = cleanMeta(meta);
   const seconds = Number(computeS);
   db.transaction(() => {
     writeAtomic(outPath(j.id, ext), data);

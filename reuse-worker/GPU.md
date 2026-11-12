@@ -88,14 +88,32 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   téléchargerait 11 Go pour rater chaque travail. Elle le dit dans son journal au démarrage.
 - **Disque : 10 Go restent toujours libres.** Un téléchargement qui laisserait moins de place libre sur le disque
   est refusé de la même façon, même sous le plafond (`"gpu_keep_free_gb"`).
-- Le moteur tourne en priorité basse (`"low_priority": false` pour l'enlever), un travail à la fois. La carte
-  est libérée dès la fin du travail : rien ne reste chargé entre deux travaux.
+- Le moteur tourne en priorité basse (`"low_priority": false` pour l'enlever), un travail à la fois, sur la carte
+  dédiée demandée explicitement (`--backend gpu` : jamais le processeur ni une carte intégrée).
+- **Moteur image résident.** Charger les 11 Go de poids coûtait environ 580 s par travail (mesure du 12/11, jobs 3
+  et 4 identiques en 1024 et en 512). Le moteur (`sd-server`, fourni dans le même paquet) reste donc chargé
+  entre deux travaux. Seul le premier travail d'une série paie le chargement. Il écoute sur 127.0.0.1 seulement,
+  rien n'est ouvert au réseau. Il est arrêté et la carte libérée après 10 minutes sans travail
+  (`"gpu_keep_loaded_s"`, 0 pour un processus par travail), à l'annulation d'un travail et à l'arrêt du worker.
+  S'il refuse de démarrer, le travail passe par `sd-cli` comme avant.
 - Réglages facultatifs de la config :
   - `"gpu": false` : aucune génération sur cette machine ;
   - `"enable_3d": true` : propose la 3D ;
   - `"gpu_device": 0` : numéro de carte Vulkan, si le PC en a plusieurs ;
   - `"gpu_max_gb": 30` ;
-  - `"gpu_keep_free_gb": 10`.
+  - `"gpu_keep_free_gb": 10` ;
+  - `"gpu_keep_loaded_s": 600`.
+- **Ce que dit le moteur** est remonté au hub pendant le calcul. On le lit dans `engine` de
+  `GET /api/gpu/jobs/:id` :
+  - la carte réellement utilisée (`device`) et le choix de calcul de sd.cpp (`backend`, `cpu` s'il est retombé
+    sur le processeur) ;
+  - la mémoire vidéo et la RAM libres (`vram_free_mib`, `ram_free_mib`) ;
+  - les temps : chargement (`load_s`), texte (`encode_s`), étapes (`sampling_s`, `s_per_step`), décodage
+    (`decode_s`) ;
+  - les lignes utiles du journal (`log`).
+
+  `stage` dit l'étape en cours (« étape 3/8 (4.2 s par étape) »). Le journal complet reste sur le PC, dans
+  `gpu\logs\`.
 - Pour tout retirer : supprimer le dossier `gpu\`.
 
 ## La 3D est expérimentale : derrière un drapeau, non prouvée
