@@ -7,6 +7,7 @@ import {
   noteReusePoll, claimJob, claimView, canReadInput, heartbeat, failJob, completeJob,
   listWorkers, orderWorker, getSchedule, setSchedule, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost
 } from '../services/reuse.js';
+import { gpuClaimHooks, gpuClaimView } from '../services/gpu-jobs.js';
 
 // ---------------------------------------------------------------------------
 // RE-USE cleaning queue API. 404 when disabled. Bearer token = admin (HUB_REUSE_ADMIN_TOKEN) or
@@ -143,7 +144,8 @@ router.delete('/api/reuse/workers/:name/schedule', guard('admin'), (req, res) =>
 // ----- Worker ----------------------------------------------------------------
 
 /**
- * POST /api/reuse/next {wait: 25, info: {version, backend, device, os, state}} - Long-poll for a job.
+ * POST /api/reuse/next {wait: 25, info: {version, backend, device, os, state, gpu: "image,3d"}} - Long-poll for a job:
+ * a RE-USE job (kind "reuse") or a GPU job (kind "image" | "3d", answered on /api/gpu/jobs/:id/*).
  * Always 200 {job: {...}|null, orders: {paused, update, worker_version}}. Returns early when an order changes.
  */
 router.post('/api/reuse/next', guard('worker'), json, (req, res) => {
@@ -157,8 +159,10 @@ router.post('/api/reuse/next', guard('worker'), json, (req, res) => {
   const attempt = () => {
     if (closed) return;
     const orders = workerOrders(caller.name);
-    const job = claimJob(caller.name);
-    if (job) return res.json({ job: claimView(job), orders });
+    // GPU jobs (image, 3D) only for a worker that announces the types it can run (info.gpu); a GPU job it holds is
+    // always given back to it, like a RE-USE one. Older workers announce nothing and never see a GPU job.
+    const job = claimJob(caller.name, Date.now(), gpuClaimHooks(caller.name, body.info?.gpu));
+    if (job) return res.json({ job: job.gpu ? gpuClaimView(job.gpu) : claimView(job), orders });
     const changed = orders.paused !== first.paused || orders.update !== first.update || orders.worker_version !== first.worker_version;
     // An order the worker must act on (update) is delivered at once; otherwise wait for a job
     if (changed || orders.update || Date.now() >= deadline) return res.json({ job: null, orders });

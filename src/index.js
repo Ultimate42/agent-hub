@@ -13,6 +13,7 @@ import coordinationRoutes from './routes/coordination.js';
 import wakeTargetsRoutes from './routes/wake-targets.js';
 import filesRoutes from './routes/files.js';
 import reuseRoutes from './routes/reuse.js';
+import gpuRoutes from './routes/gpu.js';
 import { startFileSweeper, stopFileSweeper } from './services/files.js';
 import { startRetentionSweeper, stopRetentionSweeper } from './services/retention.js';
 import { startWatchdog, stopWatchdog, initWatchdogDb } from './watchdog.js';
@@ -36,6 +37,7 @@ app.use(rateLimitMiddleware);
 // Shared files: raw uploads + downloads (mounted before the 64KB JSON parser)
 app.use(filesRoutes);
 app.use(reuseRoutes); // /api/reuse/* (raw audio bodies: mounted before the JSON parser)
+app.use(gpuRoutes);   // /api/gpu/* (base64 input images, raw results: mounted before the JSON parser)
 
 // MCP carries files as base64 (upload_file): its JSON limit follows the max file size
 app.use('/mcp', express.json({ limit: Math.ceil(config.maxFileSize * 4 / 3) + 64 * 1024 }));
@@ -85,6 +87,9 @@ app.use((err, req, res, next) => {
     if (req.path.startsWith('/api/reuse/')) {
       return res.status(413).json({ error: `Audio file too large (max ${Math.round(config.reuseMaxFileSize / 1024 / 1024)}MB): cut it into shorter pieces` });
     }
+    if (req.path.startsWith('/api/gpu/')) {
+      return res.status(413).json({ error: `Too large (input image at most ${Math.round(config.gpuMaxInputSize / 1024 / 1024)}MB, result at most ${Math.round(config.gpuMaxOutputSize / 1024 / 1024)}MB)` });
+    }
     const isUpload = req.path.endsWith('/files') || req.path.startsWith('/mcp');
     return res.status(413).json({ error: isUpload ? `File too large (max ${Math.round(config.maxFileSize / 1024 / 1024)}MB)` : 'Message too large (max 64KB)' });
   }
@@ -118,6 +123,7 @@ server.listen(config.port, config.host, () => {
   });
   // A token entry the hub could not use is said out loud (position and reason only, never the value)
   for (const problem of config.reuseTokenProblems) logger.warn(`RE-USE tokens: ${problem}`);
+  for (const problem of config.gpuMemberProblems) logger.warn(`GPU jobs: ${problem}`);
 
   console.log(`
 ========================================

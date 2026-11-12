@@ -286,6 +286,9 @@ export function listJobs({ batch = null, status = null } = {}) {
 
 export const getJob = (id) => q.byId.get(Number(id)) || null;
 
+/** The RE-USE job this worker is computing now (live lease), or null. */
+export const heldReuseJob = (name, now = Date.now()) => q.held.get(name, now) || null;
+
 export function retryJob(id) {
   return q.retry.run(Number(id)).changes === 1 ? { ok: true, job: jobView(getJob(id)) } : err(409, 'Only a failed or cancelled job can be retried');
 }
@@ -324,7 +327,7 @@ export function workerOrders(name) {
 /** Record a poll (last seen + what the worker says about itself) and return its standing orders. */
 export function noteReusePoll(name, info = {}) {
   const kept = {};
-  for (const k of ['version', 'backend', 'device', 'os', 'state', 'job', 'rolled_back_from', 'last_error', 'host', 'update_ack']) {
+  for (const k of ['version', 'backend', 'device', 'os', 'state', 'job', 'rolled_back_from', 'last_error', 'host', 'update_ack', 'gpu', 'gpu_state']) {
     if (info && info[k] != null) kept[k] = String(info[k]).slice(0, 200);
   }
   if (info && typeof info === 'object') q.touch.run(name, Date.now(), JSON.stringify(kept));
@@ -343,7 +346,7 @@ export function noteReusePoll(name, info = {}) {
  * it already holds is left to finish (heartbeats, result and resume after a restart are not gated): stopping
  * it would throw away minutes of computation to free the machine a few minutes earlier.
  */
-export function claimJob(name, now = Date.now()) {
+export function claimJob(name, now = Date.now(), other = null) {
   return db.transaction(() => {
     if (q.worker.get(name)?.paused) return null;
     const mine = q.held.get(name, now);
@@ -351,7 +354,14 @@ export function claimJob(name, now = Date.now()) {
       q.renew.run(now + config.reuseLeaseMs, null, mine.id);
       return q.byId.get(mine.id);
     }
+    // Other GPU work (gpu-jobs.js) shares the machine: one job at a time, whatever its kind. A held one is
+    // resumed even outside the schedule, exactly like a held RE-USE job; a new one is offered before RE-USE
+    // (short, interactive requests), never in place of a RE-USE job already being computed.
+    const otherHeld = other?.held(now);
+    if (otherHeld) return otherHeld;
     if (!workerInWindow(name, now)) return null;
+    const otherNext = other?.next(now);
+    if (otherNext) return otherNext;
     for (;;) {
       const job = q.next.get(now);
       if (!job) return null;
@@ -368,7 +378,7 @@ export function claimJob(name, now = Date.now()) {
 
 export function claimView(j) {
   return {
-    id: j.id, batch: j.batch, name: j.name, attempt: j.attempts,
+    kind: 'reuse', id: j.id, batch: j.batch, name: j.name, attempt: j.attempts,
     size: j.in_size, sha256: j.in_sha256, rate: j.in_rate, samples: j.in_samples,
     params: parseParams(j.params),
     lease_s: Math.round(config.reuseLeaseMs / 1000)
@@ -528,7 +538,7 @@ export function setSchedule(name, schedule) {
 // Worker program distribution (self-update): every file of reuseWorkerDir, with its checksum
 // ---------------------------------------------------------------------------
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const workerDir = () => path.resolve(config.reuseWorkerDir || path.join(repoRoot, 'reuse-worker'));
+export const workerDir = () => path.resolve(config.reuseWorkerDir || path.join(repoRoot, 'reuse-worker'));
 let manifestCache = { stamp: '', manifest: { version: 'none', files: [] } };
 
 /**

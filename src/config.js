@@ -73,6 +73,22 @@ export function parseWorkerMembers(raw) {
   }).filter(w => w.member && w.roomId && /^[\w.-]{1,32}$/.test(w.name));
 }
 
+/**
+ * HUB_GPU_MEMBERS: room members allowed to submit GPU jobs (image, 3D) with their own member token.
+ * "Name@12" = that member of room 12, "@12" = every member of room 12. A name alone is refused: names are free
+ * in any room. -> {entries: [{member|null, roomId}], problems: [text]} (a refused entry is reported by position).
+ */
+export function parseGpuMembers(raw) {
+  const entries = [], problems = [];
+  String(raw || '').split(',').map(e => e.trim()).forEach((e, n) => {
+    if (!e) return;
+    const m = /^(.*)@(\d+)$/.exec(e);
+    if (!m) return problems.push(`HUB_GPU_MEMBERS entry ${n + 1} ignored: expected Name@roomId or @roomId`);
+    entries.push({ member: m[1].trim() || null, roomId: Number(m[2]) });
+  });
+  return { entries, problems };
+}
+
 /** Positive integer from an env value, or the default (an unparseable value must not disable a cap). */
 function positiveInt(value, dflt) {
   const n = parseInt(value, 10);
@@ -81,6 +97,8 @@ function positiveInt(value, dflt) {
 
 const reuseWorkers = parseReuseWorkerTokens(process.env.HUB_REUSE_WORKER_TOKENS);
 const reuseAdmin = parseReuseAdminToken(process.env.HUB_REUSE_ADMIN_TOKEN);
+const gpuMembers = parseGpuMembers(process.env.HUB_GPU_MEMBERS);
+const reuseDir = process.env.HUB_REUSE_DIR || path.join(path.dirname(process.env.DB_PATH || path.join(dataDir, 'hub.db')), 'reuse');
 
 export const config = {
   port: parseInt(process.env.PORT || '4030', 10),
@@ -118,7 +136,7 @@ export const config = {
   reuseAdminDigest: reuseAdmin.digest,
   reuseWorkerTokens: reuseWorkers.workers, // [{name, digest}]
   reuseTokenProblems: [...reuseAdmin.problems, ...reuseWorkers.problems], // logged at startup, values never quoted
-  reuseDir: process.env.HUB_REUSE_DIR || path.join(path.dirname(process.env.DB_PATH || path.join(dataDir, 'hub.db')), 'reuse'),
+  reuseDir,
   reuseWorkerDir: process.env.HUB_REUSE_WORKER_DIR || null, // default: <repo>/reuse-worker
   reusePythonBaseUrl: process.env.HUB_REUSE_PYTHON_BASE_URL || 'https://www.python.org/ftp/python', // origin of the portable Python zip (tests)
   reuseMaxFileSize: positiveInt(process.env.HUB_REUSE_MAX_FILE_SIZE, 32 * 1024 * 1024), // held in memory: 5 min of FLAC is under 10 MB
@@ -127,6 +145,19 @@ export const config = {
   reuseLeaseMs: positiveInt(process.env.HUB_REUSE_LEASE_SECONDS, 600) * 1000,
   reuseMaxAttempts: 3,
   reuseMinRate: 24000, // cleaned audio is never accepted under 24 kHz
+  // GPU jobs (image, 3D) on the same workers (src/services/gpu-jobs.js, catalog reuse-worker/gpu-catalog.json).
+  // Enabled with the RE-USE queue; room members listed in HUB_GPU_MEMBERS may submit with their member token.
+  gpuMembers: gpuMembers.entries,
+  gpuMemberProblems: gpuMembers.problems,
+  gpuDir: process.env.HUB_GPU_DIR || path.join(reuseDir, 'gpu'),
+  gpuMaxInputSize: positiveInt(process.env.HUB_GPU_MAX_INPUT_SIZE, 12 * 1024 * 1024),   // input image (3D, image to image)
+  gpuMaxOutputSize: positiveInt(process.env.HUB_GPU_MAX_OUTPUT_SIZE, 96 * 1024 * 1024), // PNG or GLB sent by a worker
+  gpuMaxStorage: positiveInt(process.env.HUB_GPU_MAX_STORAGE, 2 * 1024 * 1024 * 1024),
+  gpuRetentionMs: positiveInt(process.env.HUB_GPU_RETENTION_HOURS, 72) * 3600 * 1000,   // finished jobs and their files
+  gpuPendingMs: positiveInt(process.env.HUB_GPU_PENDING_HOURS, 48) * 3600 * 1000,       // waiting longer = failed
+  gpuLeaseMs: positiveInt(process.env.HUB_GPU_LEASE_SECONDS, 600) * 1000,
+  gpuMaxAttempts: 2,
+  gpuMaxWaitingPerOwner: positiveInt(process.env.HUB_GPU_MAX_WAITING, 20),
   // Rooms are deleted after this many days without messages (0 = never); agents can change it
   // per room (set_retention). A warning is posted retentionWarnMs before deletion.
   retentionDefaultDays: parseFloat(process.env.HUB_RETENTION_DEFAULT_DAYS ?? '7'),

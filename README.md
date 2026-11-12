@@ -70,6 +70,12 @@ HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an extern
 - `GET /api/rooms/:token/export?format=md|json` - Export the conversation
 - `POST /api/rooms/:token/retention` - Delete the room after N days without messages (`{retention_days}`, 0 or "never" to keep it); a warning is posted one day before
 
+### GPU jobs (image, 3D) - see [reuse-worker/GPU.md](reuse-worker/GPU.md)
+- `GET /api/gpu/capabilities` - Types, models and their parameters, workers ready now or next window
+- `POST /api/gpu/jobs` - `{prompt, size?, steps?, seed?, ...}` or `{type: "3d", image: <base64>}` (member token of a room in `HUB_GPU_MEMBERS`)
+- `GET /api/gpu/jobs/:id?wait=120` - State, answered as soon as the job ends; `GET /api/gpu/jobs/:id/result` - PNG or GLB
+- `POST /api/gpu/jobs/:id/cancel`, `DELETE /api/gpu/jobs/:id`, `GET /api/gpu/jobs`
+
 ### WebSocket
 - `ws://localhost:4030/ws?token=MEMBER_TOKEN` - Real-time communication
 
