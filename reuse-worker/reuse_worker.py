@@ -693,6 +693,12 @@ def build_command(template, values):
     « {if:nom=--x} » ne donne --x que si la valeur est vraie, « {unless:nom=--x} » que si elle est fausse."""
     args = []
     for item in template:
+        m = re.fullmatch(r'\{opt:([\w.-]+)=([^{}]+)\}', item)   # « {opt:threads=-t} » : -t <valeur>, seulement si elle est donnée
+        if m:
+            v = values.get(m.group(1))
+            if v not in (None, '', 0, False):
+                args += [m.group(2), ('%g' % v) if isinstance(v, float) else str(v)]
+            continue
         m = re.fullmatch(r'\{(if|unless):([\w.-]+)=([^{}]+)\}', item)
         if m:
             on = bool(values.get(m.group(2)))
@@ -1085,6 +1091,12 @@ class Gpu:
         out = workdir / ('out.' + ext)
         out.unlink(missing_ok=True)
         values = dict(job.get('params') or {})
+        # Un réglage ajouté au catalogue après la mise en file du travail prend sa valeur par défaut
+        for name, ps in (model.get('params') or {}).items():
+            if name not in values and 'default' in ps and ps['default'] != 'random' and not ps.get('needs_input'):
+                values[name] = ps['default']
+            if isinstance(ps.get('cli'), dict) and values.get(name) in ps['cli']:   # nom lisible -> syntaxe du moteur
+                values[name] = ps['cli'][values[name]]
         values.update(prompt=job.get('prompt') or '', output=str(out), models_dir=str(mdir))
         values.update({'file:' + role: str(p) for role, p in paths.items()})
         template = list(model['command'])
@@ -1255,7 +1267,8 @@ class Gpu:
     def run_server(self, spec, exe, values, env, input_path, out, steps, stop, progress, timeout):
         """Un travail sur le moteur résident (sd-server, API sdapi). Démarré au besoin : le premier travail d'une série paie
         le chargement des poids, les suivants non. -> (secondes, méta)."""
-        key = json.dumps([str(exe), spec, sorted((k, v) for k, v in values.items() if k.startswith('file:')), sorted((k, v) for k, v in env.items() if k.startswith('GGML'))])
+        # Même ligne de commande (fichiers, attention, tuiles, fils) et même environnement = même moteur ; sinon il est relancé
+        key = json.dumps([str(exe), build_command(spec['command'], dict(values, port=0)), sorted((k, v) for k, v in env.items() if k.startswith('GGML'))])
         if key in self.server_refused:
             raise ServerUnavailable('a déjà refusé de démarrer avec cette configuration')
         if self.server and (self.server['key'] != key or self.server['proc'].poll() is not None):
@@ -1291,7 +1304,9 @@ class Gpu:
         else:
             self.server['box']['trace'] = trace
             trace.meta['server_reused'] = True
-        body = {'prompt': values.get('prompt', ''), 'negative_prompt': values.get('negative_prompt', ''),
+        # sd-server lit des réglages cachés dans le texte (<sd_cpp_extra_args>, chemins de fichiers compris) : jamais d'un client
+        clean = lambda text: re.sub(r'(?i)sd_cpp_extra_args', '', str(text or ''))
+        body = {'prompt': clean(values.get('prompt')), 'negative_prompt': clean(values.get('negative_prompt')),
                 'width': values.get('width'), 'height': values.get('height'), 'steps': values.get('steps'),
                 'cfg_scale': values.get('cfg_scale'), 'seed': values.get('seed'), 'sampler_name': values.get('sampler', ''),
                 'batch_size': 1}

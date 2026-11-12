@@ -293,6 +293,10 @@ class GpuTest(unittest.TestCase):
         self.assertEqual(args, ['-p', prompt, '-W', '512', '--cfg-scale', '1', '--no-texture'])
         with self.assertRaises(RuntimeError):
             w.build_command(['{missing}'], {})
+        # « {opt:x=-t} » : drapeau et valeur seulement si la valeur est donnée
+        self.assertEqual(w.build_command(['{opt:threads=-t}', 'x'], {'threads': 0}), ['x'])
+        self.assertEqual(w.build_command(['{opt:threads=-t}'], {'threads': 2}), ['-t', '2'])
+        self.assertEqual(w.build_command(['{opt:threads=-t}'], {}), [])
         # Accolades dans une valeur : jamais réinterprétées
         self.assertEqual(w.build_command(['{prompt}'], {'prompt': '{file:vae}'}), ['{file:vae}'])
 

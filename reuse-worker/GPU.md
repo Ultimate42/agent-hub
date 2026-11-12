@@ -103,6 +103,24 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   - `"gpu_max_gb": 30` ;
   - `"gpu_keep_free_gb": 10` ;
   - `"gpu_keep_loaded_s": 600`.
+- **Réglages du moteur, réservés au jeton admin** :
+  - `flash_attn` : diffusion (défaut : imposée au DiT, encodeur texte et VAE laissés à la sonde de sd.cpp), on, off
+    ou auto ;
+  - `vae_tiling` : true par défaut ;
+  - `threads` : 0 par défaut, soit un fil par cœur.
+
+  Un membre qui les passe voit ses valeurs ignorées, et listées dans `ignored`. Changer un réglage relance le
+  moteur résident, qui relit alors les poids.
+
+  Pourquoi ces défauts, d'après les mesures du 12/11 en 8 étapes avec le moteur déjà chargé :
+  - l'attention classique coûte 1,4 s par étape en 512, 9,9 s en 768 et 21,6 s en 1024, alors que la sonde de
+    sd.cpp avait coupé la flash attention sur RDNA2. En 1024, sa matrice dépasse les 2 Go par allocation du pilote
+    AMD Windows (ggml-vulkan, llama.cpp #30697). Référence publiée sur la même carte : Flux.1-dev 12B en 1024, 6,7 s
+    par étape (stable-diffusion.cpp #2291) ;
+  - sans tuiles, le VAE dépasse en 1024 la taille de tampon permise par le pilote : une partie du décodage passe
+    sur le processeur, soit 34 à 41 s.
+- Un texte (prompt, negative_prompt) qui contient `sd_cpp_extra_args` est refusé. Le worker le retire aussi : sd-server
+  lit dans le texte des réglages cachés, dont des chemins de fichiers.
 - **Ce que dit le moteur** est remonté au hub pendant le calcul. On le lit dans `engine` de
   `GET /api/gpu/jobs/:id` :
   - la carte réellement utilisée (`device`) et le choix de calcul de sd.cpp (`backend`, `cpu` s'il est retombé

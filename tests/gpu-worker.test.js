@@ -227,6 +227,9 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     const server = runs().find(r => r.engine === 'sd-server');
     assert.strictEqual(server.args[server.args.indexOf('--listen-ip') + 1], '127.0.0.1');
     assert.strictEqual(server.args[server.args.indexOf('--backend') + 1], 'gpu');
+    assert.strictEqual(server.args[server.args.indexOf('--flash-attn') + 1], 'auto,diffusion=on', 'flash attention forced on the DiT: the auto probe turns it off on RDNA2');
+    assert.ok(server.args.includes('--vae-tiling'));
+    assert.ok(!server.args.includes('-t'), 'threads left to the engine by default');
     const req = runs().find(r => r.engine === 'sd-server-request');
     assert.strictEqual(req.path, '/sdapi/v1/txt2img');
     assert.deepStrictEqual([req.body.prompt, req.body.seed, req.body.cfg_scale, req.body.steps, req.body.sampler_name], [prompt, 7, 1, 8, 'euler']);
@@ -259,6 +262,23 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.ok(alive(pid));
     await until('engine unloaded after the idle delay', () => !alive(pid), KEEP_S + 60);
     assert.match(fs.readFileSync(path.join(pc, 'logs', 'worker.log'), 'utf8'), /Moteur image résident arrêté \(8 s sans travail\)/);
+  });
+
+  test('admin tuning restarts the resident engine with the new flags; the same flags reuse it', async () => {
+    const before = runs().filter(r => r.engine === 'sd-server').length;
+    const tuned = { prompt: 'tuned', width: 256, height: 256, flash_attn: 'off', vae_tiling: false, threads: 2 };
+    const a = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify(tuned) })).job;
+    const b = (await admin('/api/gpu/jobs', { method: 'POST', body: JSON.stringify({ ...tuned, prompt: 'tuned again' }) })).job;
+    assert.strictEqual((await finished(a.id)).status, 'done');
+    const db = await finished(b.id);
+    assert.strictEqual(db.status, 'done');
+    assert.strictEqual(db.result.server_reused, true);
+    const servers = runs().filter(r => r.engine === 'sd-server');
+    assert.strictEqual(servers.length, before + 1, 'one restart for the new flags, then reused');
+    const args = servers.pop().args;
+    assert.strictEqual(args[args.indexOf('--flash-attn') + 1], 'off');
+    assert.ok(!args.includes('--vae-tiling'));
+    assert.strictEqual(args[args.indexOf('-t') + 1], '2');
   });
 
   test('cancelled while computing: the resident engine is stopped (card freed), the next job starts a new one', async () => {

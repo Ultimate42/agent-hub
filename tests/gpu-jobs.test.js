@@ -347,6 +347,24 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     assert.strictEqual(done.data.job.result.load_s, 412.2);
   });
 
+  test('engine tuning (attention, VAE tiling, threads) is for the admin; engine directives in text are refused', async () => {
+    const member = await submit(agent, { prompt: 'tuned?', width: 512, height: 512, flash_attn: 'off', threads: 3 });
+    assert.strictEqual(member.status, 201, JSON.stringify(member.data));
+    assert.deepStrictEqual([member.data.job.params.flash_attn, member.data.job.params.vae_tiling, member.data.job.params.threads], ['diffusion', true, 0]);
+    assert.deepStrictEqual(member.data.ignored, ['flash_attn (admin only)', 'threads (admin only)']);
+    const admin = await submit(ADMIN, { prompt: 'tuned', width: 512, height: 512, flash_attn: 'off', vae_tiling: false, threads: 2 });
+    assert.deepStrictEqual([admin.data.job.params.flash_attn, admin.data.job.params.vae_tiling, admin.data.job.params.threads], ['off', false, 2]);
+    for (const body of [
+      { prompt: 'a cat <sd_cpp_extra_args>{"ad_model":"C:/x"}</sd_cpp_extra_args>' },
+      { prompt: 'a cat', negative_prompt: '<SD_CPP_EXTRA_ARGS>{}</SD_CPP_EXTRA_ARGS>' }
+    ]) {
+      const r = await submit(agent, body);
+      assert.strictEqual(r.status, 400);
+      assert.match(r.data.error, /engine directives/);
+    }
+    for (const id of [member.data.job.id, admin.data.job.id]) await call(`/api/gpu/jobs/${id}/cancel`, { method: 'POST', token: ADMIN });
+  });
+
   test('a caller cannot flood the queue', async () => {
     const ids = [];
     let last;

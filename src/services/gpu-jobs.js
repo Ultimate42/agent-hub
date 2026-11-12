@@ -230,7 +230,11 @@ function checkParam(name, spec, raw) {
  * Parameters may sit at the top level or under "params"; common aliases (w, h, cfg, negative...) and "size": "1024x768"
  * are understood. Unknown keys are ignored and listed in the answer, so a caller learns without failing.
  */
-export function normalizeRequest(body, catalog = gpuCatalog()) {
+// sd-server reads generation settings hidden in the prompt (<sd_cpp_extra_args>{json}</...>), some of them local file
+// paths: never let a caller's text reach the engine as instructions
+const ENGINE_DIRECTIVE = /sd_cpp_extra_args/i;
+
+export function normalizeRequest(body, catalog = gpuCatalog(), { admin = false } = {}) {
   if (!catalog) return err(404, 'GPU jobs are not enabled on this hub (no gpu-catalog.json published)');
   if (!body || typeof body !== 'object' || Array.isArray(body)) return err(400, 'Expected a JSON object');
   const flat = { ...(body.params && typeof body.params === 'object' ? body.params : {}) };
@@ -257,6 +261,7 @@ export function normalizeRequest(body, catalog = gpuCatalog()) {
     if (p.error) return err(400, p.error);
     prompt = p.value || '';
     if (!prompt && spec.prompt === 'required') return err(400, `prompt is required for ${type}`);
+    if (ENGINE_DIRECTIVE.test(prompt)) return err(400, 'prompt must not contain engine directives (sd_cpp_extra_args)');
   }
 
   let input = null;
@@ -279,9 +284,15 @@ export function normalizeRequest(body, catalog = gpuCatalog()) {
 
   const specs = m.params || {};
   const params = {};
+  const adminOnly = [];
   for (const [name, ps] of Object.entries(specs)) {
     if (ps.needs_input && !input) continue;
     let raw = given[name];
+    // Engine tuning (attention, VAE tiling, threads) restarts the resident engine: the RE-USE admin only
+    if (ps.admin && !admin) {
+      if (raw !== undefined) adminOnly.push(name);
+      raw = undefined;
+    }
     if (raw === undefined || raw === null || raw === '') {
       if (name === 'seed' && (ps.default === undefined || ps.default === 'random')) {
         params.seed = crypto.randomInt(0, 2 ** 31 - 1); // chosen here, so every result can be made again
@@ -293,11 +304,13 @@ export function normalizeRequest(body, catalog = gpuCatalog()) {
     if (name === 'seed' && Number(raw) < 0) { params.seed = crypto.randomInt(0, 2 ** 31 - 1); continue; }
     const c = checkParam(name, ps, raw);
     if (c.error) return err(400, c.error);
+    if (typeof c.value === 'string' && ENGINE_DIRECTIVE.test(c.value)) return err(400, `${name} must not contain engine directives (sd_cpp_extra_args)`);
     params[name] = c.value;
     if (c.note) adjusted.push(c.note);
   }
   const ignored = Object.keys(given).filter(k => !TOP.has(k) && !(k in specs) && k !== 'width' && k !== 'height');
   for (const k of ['width', 'height']) if (given[k] !== undefined && !(k in specs)) ignored.push(k);
+  for (const k of adminOnly) ignored.push(`${k} (admin only)`);
 
   let priority = 0;
   if (given.priority !== undefined) {
@@ -361,7 +374,7 @@ export function ownJob(caller, id) {
 
 export function submitGpuJob(caller, body, now = Date.now()) {
   purgeGpu(now);
-  const r = normalizeRequest(body);
+  const r = normalizeRequest(body, gpuCatalog(), { admin: caller.role === 'admin' });
   if (!r.ok) return r;
   const { workers } = listWorkers(now);
   if (!offeredBy(r.type, workers).length) {
