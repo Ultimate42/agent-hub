@@ -270,6 +270,25 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     assert.match(v.error, /lease expired/);
   });
 
+  test('a held GPU job is never handed to a worker that no longer announces its type (rolled back): it goes back to the queue', async () => {
+    const img = (await submit(agent, { prompt: 'rollback' })).data.job;
+    assert.strictEqual((await poll(AMD, 'image')).data.job.id, img.id);
+    const old = (await poll(AMD)).data.job; // older worker: no info.gpu, would read any job as a RE-USE one
+    assert.ok(!old || old.kind === 'reuse', `got ${JSON.stringify(old)}`);
+    const v = await view(img.id);
+    assert.strictEqual(v.status, 'pending');
+    assert.match(v.error, /no longer offers "image"/);
+    assert.strictEqual((await poll(AMD, 'image')).data.job.id, img.id, 'taken again by a worker that offers it');
+    await call(`/api/gpu/jobs/${img.id}/cancel`, { method: 'POST', token: agent });
+  });
+
+  test('a model or type named after an Object.prototype key is unknown', async () => {
+    for (const body of [{ prompt: 'x', model: 'constructor' }, { prompt: 'x', type: 'constructor' }]) {
+      const r = await submit(agent, body);
+      assert.strictEqual(r.status, 400, JSON.stringify(r.data));
+    }
+  });
+
   test('owners only see their own jobs; admin sees all; wait returns as soon as the job ends', async () => {
     const mine = (await submit(agent, { prompt: 'mine' })).data.job;
     assert.strictEqual((await call(`/api/gpu/jobs/${mine.id}`, { token: other })).status, 404);

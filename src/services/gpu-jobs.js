@@ -22,6 +22,8 @@ import { reuseEnabled, identifyReuseCaller, workerDir, heldReuseJob, listWorkers
 const TYPE = /^[a-z0-9]{1,16}$/;
 const MODEL = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 const PROMPT_MAX = 4000;
+/** Own key of a catalog object ("constructor" or "toString" are not types or models). */
+const own = (obj, key) => Boolean(obj && typeof obj === 'object' && Object.hasOwn(obj, key) && obj[key]);
 const err = (status, error, extra = {}) => ({ ok: false, status, error, ...extra });
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 
@@ -235,12 +237,12 @@ export function normalizeRequest(body, catalog = gpuCatalog()) {
 
   let type = given.type !== undefined ? String(given.type).toLowerCase() : null;
   const model = given.model !== undefined ? String(given.model).toLowerCase() : null;
-  if (!type && model) type = Object.keys(catalog.types).find(t => catalog.types[t].models?.[model]) || null;
-  if (!type) type = given.image !== undefined && given.prompt === undefined && catalog.types['3d'] ? '3d' : 'image';
-  if (!TYPE.test(type) || !catalog.types[type]) return err(400, `Unknown type "${type}". Available: ${Object.keys(catalog.types).join(', ')}`);
+  if (!type && model) type = Object.keys(catalog.types).find(t => own(catalog.types[t].models, model)) || null;
+  if (!type) type = given.image !== undefined && given.prompt === undefined && own(catalog.types, '3d') ? '3d' : 'image';
+  if (!TYPE.test(type) || !own(catalog.types, type)) return err(400, `Unknown type "${type}". Available: ${Object.keys(catalog.types).join(', ')}`);
   const spec = catalog.types[type];
   const modelId = model || spec.default_model;
-  if (!MODEL.test(modelId || '') || !spec.models?.[modelId]) {
+  if (!MODEL.test(modelId || '') || !own(spec.models, modelId)) {
     return err(400, `Unknown model "${modelId}" for ${type}. Available: ${Object.keys(spec.models || {}).join(', ')}`);
   }
   const m = spec.models[modelId];
@@ -461,6 +463,12 @@ export function gpuClaimHooks(name, caps) {
     held(now) {
       const mine = q.held.get(name, now);
       if (!mine) return null;
+      // A machine that no longer announces this type (worker rolled back to a version without GPU jobs, "gpu":
+      // false, 3D switched off) would take the job for a RE-USE one: it is given back to the queue instead.
+      if (!types.has(mine.type)) {
+        recordFailure(mine, name, `no longer offers "${mine.type}"`, now);
+        return null;
+      }
       q.renew.run(now + config.gpuLeaseMs, null, null, mine.id);
       return { gpu: q.byId.get(mine.id) };
     },
