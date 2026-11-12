@@ -42,6 +42,7 @@
           "label": "Z-Image Turbo 6B (Tongyi-MAI), diffusion Q8_0, encodeur Qwen3-4B Q8_0, 8 etapes",
           "license": "Apache-2.0",
           "source": "https://huggingface.co/Tongyi-MAI/Z-Image-Turbo",
+          "min_vram_gb": 14,
           "notes": "Meilleur modele a licence permissive du classement open weights d'Artificial Analysis (11/2026) qui tient dans 16 Go. cfg_scale 1 : negative_prompt sans effet. Ecrire le prompt en anglais ou en chinois de preference.",
           "files": [
             { "role": "diffusion", "name": "z_image_turbo-Q8_0.gguf", "size": 6577440704,
@@ -86,6 +87,7 @@
           "label": "TRELLIS.2 4B (Microsoft), poids GGUF q8",
           "license": "MIT (TRELLIS.2, BiRefNet) ; encodeur DINOv3 sous licence DINOv3 de Meta (libre de redevance, usages militaires interdits)",
           "source": "https://huggingface.co/microsoft/TRELLIS.2-4B",
+          "min_vram_gb": 14,
           "notes": "Experimental : pas encore prouve sur la RX 6950 XT. Image d'entree PNG ou JPEG, objet seul de preference (le fond est retire).",
           "files": [
             { "role": "birefnet", "name": "birefnet.gguf", "size": 882749024, "sha256": "10c5dd4dcac904cf81c9a16180eb66f167dd52ab55867f54a44567b0b2babbc1",

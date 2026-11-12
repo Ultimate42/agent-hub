@@ -83,6 +83,9 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   plafond avec `"gpu_max_gb"` dans `reuse-worker.config.json`. Il est vérifié avant tout téléchargement : un
   travail qui le dépasserait échoue avec la raison, et rien n'est téléchargé. Les versions que le catalogue ne
   cite plus sont supprimées d'abord.
+- **Carte : 14 Go de mémoire vidéo au moins** (`min_vram_gb` du catalogue, lu dans la liste des cartes Vulkan du
+  moteur RE-USE). Une machine plus petite, comme `dev-box` et sa GTX 1060 de 6 Go, ne propose pas le type : elle
+  téléchargerait 11 Go pour rater chaque travail. Elle le dit dans son journal au démarrage.
 - **Disque : 10 Go restent toujours libres.** Un téléchargement qui laisserait moins de place libre sur le disque
   est refusé de la même façon, même sous le plafond (`"gpu_keep_free_gb"`).
 - Le moteur tourne en priorité basse (`"low_priority": false` pour l'enlever), un travail à la fois. La carte

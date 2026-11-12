@@ -351,6 +351,7 @@ class Engine:
         self.backend = 'cpu'     # 'vulkan' ou 'cpu'
         self.device = None       # index du GPU Vulkan
         self.device_name = 'processeur'
+        self.gpus = None         # cartes Vulkan vues au démarrage (None : pas regardé, backend cpu imposé)
         self.note = ''           # pourquoi on est en repli, s'il y a lieu
         self.model = self.runtime / 'models' / MODEL_NAME
         self.flac = None
@@ -490,6 +491,7 @@ class Engine:
             raise RuntimeError('"backend" doit valoir auto, vulkan ou cpu dans la config')
         if wanted != 'cpu':
             gpus = self.list_gpus()
+            self.gpus = list(gpus)
             for d in gpus:
                 log.info('Carte graphique vue : n° %s, %s (%.1f Go)', d.get('index'), d.get('description') or d.get('name'),
                          ((d.get('memory') or {}).get('total_bytes') or 0) / 1e9)
@@ -793,24 +795,42 @@ class Gpu:
     Rien ailleurs : ni registre, ni service, ni Python en plus. Le plafond du dossier (gpu_max_gb) est vérifié avant
     tout téléchargement ; les versions que le catalogue ne cite plus sont supprimées d'abord."""
 
-    def __init__(self, base, config, app):
+    def __init__(self, base, config, app, engine=None):
         self.root = base / 'gpu'
         self.config = config
+        self.engine = engine   # cartes vues par le moteur RE-USE (mémoire vidéo), None pour l'essai --gpu-test
         self.system = 'windows' if IS_WINDOWS else 'linux'
         self.catalog = read_json(app / GPU_CATALOG, {}) or {}
         self.pidfile = self.root / 'engine.pid'
         self.status = {}   # type -> état lisible (« prêt », « pas installé », « échec : … »)
 
-    def types(self):
-        """Types que cette machine propose au hub (annoncés à chaque échange, info.gpu)."""
+    def vram(self):
+        """Mémoire de la carte qui calculera (octets), 0 sans carte Vulkan, None si inconnue (pas encore regardé)."""
+        cards = getattr(self.engine, 'gpus', None)
+        if cards is None:
+            return None
+        if self.config.get('gpu_device') is not None:
+            cards = [d for d in cards if str(d.get('index')) == str(self.config['gpu_device'])]
+        return max([(d.get('memory') or {}).get('total_bytes') or 0 for d in cards] or [0])
+
+    def types(self, reasons=None):
+        """Types que cette machine propose au hub (annoncés à chaque échange, info.gpu). reasons : dict rempli des
+        types écartés et pourquoi (journal de démarrage)."""
         if self.config.get('gpu') is False or platform.machine().lower() not in ('amd64', 'x86_64'):
             return []
         out = []
+        vram = self.vram()
         for t, spec in sorted((self.catalog.get('types') or {}).items()):
             engine = (self.catalog.get('engines') or {}).get(spec.get('engine')) or {}
             if not engine.get(self.system):
                 continue
             if spec.get('experimental') and not self.config.get(spec.get('flag') or ('enable_' + t)):
+                continue
+            # Une carte trop petite raterait chaque travail après avoir téléchargé les poids : le type n'est pas proposé
+            need = float(((spec.get('models') or {}).get(spec.get('default_model')) or {}).get('min_vram_gb') or 0)
+            if need and vram is not None and vram < need * 1e9:
+                if reasons is not None:
+                    reasons[t] = 'carte de %.1f Go, %.0f Go demandés' % (vram / 1e9, need)
                 continue
             out.append(t)
         return out
@@ -1029,7 +1049,7 @@ class Worker:
         self.hub = Hub(self.config['hub_url'], self.config['token'])
         self.version = (self.app / 'version.txt').read_text().strip() if (self.app / 'version.txt').exists() else 'dev'
         self.engine = Engine(base, self.config)
-        self.gpu = Gpu(base, self.config, self.app)
+        self.gpu = Gpu(base, self.config, self.app, self.engine)
         self.work = base / 'work'
         self.state = {'state': 'démarrage', 'job': None, 'last_error': None}
         self.paused_logged = False
@@ -1422,8 +1442,11 @@ class Worker:
             self.report()
             return EXIT_NOT_READY
         kill_orphan(self.gpu.pidfile, (b'sd-cli', b'trellis-cli'))
-        if self.gpu.types():
+        skipped = {}
+        if self.gpu.types(skipped):
             log.info('Générations GPU proposées : %s', self.gpu.describe())
+        for t, why in sorted(skipped.items()):
+            log.info('Génération %s non proposée ici : %s.', t, why)
         (self.app / '.ok').write_text(time.strftime('%Y-%m-%d %H:%M:%S'))   # cette version démarre : le lanceur ne reviendra pas en arrière
         self.set_state('en attente')
         job = None

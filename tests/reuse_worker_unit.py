@@ -320,6 +320,24 @@ class GpuTest(unittest.TestCase):
         self.assertIn('plafonné à 5 Go', str(e.exception))
         self.assertFalse((self.dir / 'gpu' / 'models').exists(), 'rien téléchargé')
 
+    def test_types_need_a_big_enough_card(self):
+        class Seen:
+            gpus = None
+        engine = Seen()
+        g = w.Gpu(self.dir, {'enable_3d': True}, self.app, engine)
+        self.assertEqual(g.types(), ['3d', 'image'], 'cartes pas encore regardées : rien d\'écarté')
+        engine.gpus = [{'index': 0, 'memory': {'total_bytes': 6442450944}}]          # GTX 1060 6 Go
+        why = {}
+        self.assertEqual(g.types(why), [])
+        self.assertIn('6.4 Go', why['image'])
+        engine.gpus.append({'index': 1, 'memory': {'total_bytes': 17163091968}})     # RX 6950 XT 16 Go
+        self.assertEqual(g.types(), ['3d', 'image'])
+        g.config['gpu_device'] = 0
+        self.assertEqual(g.types(), [], 'carte imposée : sa mémoire à elle')
+        engine.gpus = []
+        g.config.pop('gpu_device')
+        self.assertEqual(g.types(), [], 'aucune carte Vulkan')
+
     def test_free_disk_space_is_checked_before_any_download(self):
         g = self.gpu(gpu_max_gb=1000)
         usage = w.shutil.disk_usage
