@@ -119,7 +119,7 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     fs.writeFileSync(path.join(tmp, 'model.gguf'), 'fake');
     fs.writeFileSync(path.join(pc, 'reuse-worker.config.json'), JSON.stringify({
       hub_url: BASE_URL, allow_http: true, token: TOKEN, backend: 'cpu', audiocpp_cli: engine, model: path.join(tmp, 'model.gguf'),
-      enable_3d: true, gpu_max_gb: 1
+      enable_3d: true, gpu_max_gb: 1, gpu_keep_free_gb: 0
     }));
 
     hub = spawn('node', ['src/index.js'], {

@@ -83,13 +83,16 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   plafond avec `"gpu_max_gb"` dans `reuse-worker.config.json`. Il est vérifié avant tout téléchargement : un
   travail qui le dépasserait échoue avec la raison, et rien n'est téléchargé. Les versions que le catalogue ne
   cite plus sont supprimées d'abord.
+- **Disque : 10 Go restent toujours libres.** Un téléchargement qui laisserait moins de place libre sur le disque
+  est refusé de la même façon, même sous le plafond (`"gpu_keep_free_gb"`).
 - Le moteur tourne en priorité basse (`"low_priority": false` pour l'enlever), un travail à la fois. La carte
   est libérée dès la fin du travail : rien ne reste chargé entre deux travaux.
 - Réglages facultatifs de la config :
   - `"gpu": false` : aucune génération sur cette machine ;
   - `"enable_3d": true` : propose la 3D ;
   - `"gpu_device": 0` : numéro de carte Vulkan, si le PC en a plusieurs ;
-  - `"gpu_max_gb": 30`.
+  - `"gpu_max_gb": 30` ;
+  - `"gpu_keep_free_gb": 10`.
 - Pour tout retirer : supprimer le dossier `gpu\`.
 
 ## La 3D est expérimentale : derrière un drapeau, non prouvée

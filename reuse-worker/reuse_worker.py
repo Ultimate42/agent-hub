@@ -652,6 +652,7 @@ class Engine:
 # --------------------------------------------------------------------------------------------
 GPU_CATALOG = 'gpu-catalog.json'
 GPU_DEFAULT_MAX_GB = 30.0        # plafond du dossier gpu (réglable : "gpu_max_gb" dans la config)
+GPU_KEEP_FREE_GB = 10.0          # place laissée libre sur le disque après un téléchargement (réglable : "gpu_keep_free_gb")
 PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
 
 
@@ -831,6 +832,12 @@ class Gpu:
         except (TypeError, ValueError):
             return GPU_DEFAULT_MAX_GB * 1e9
 
+    def keep_free_bytes(self):
+        try:
+            return max(0.0, float(self.config.get('gpu_keep_free_gb', GPU_KEEP_FREE_GB))) * 1e9
+        except (TypeError, ValueError):
+            return GPU_KEEP_FREE_GB * 1e9
+
     def engine_dir(self, name, asset):
         return self.root / 'engines' / ('%s-%s' % (name, asset['sha256'][:12]))
 
@@ -884,6 +891,12 @@ class Gpu:
             if used - partial + need > self.max_bytes():
                 raise RuntimeError('dossier gpu plafonné à %.0f Go : il en faudrait %.1f (%.1f déjà pris). Monter "gpu_max_gb" dans la config '
                                    'ou libérer de la place.' % (self.max_bytes() / 1e9, (used - partial + need) / 1e9, used / 1e9))
+            # Le plafond ne dit rien du disque lui-même : ne jamais le remplir (Windows, autres logiciels de la machine)
+            free = shutil.disk_usage(str(self.root)).free
+            keep = self.keep_free_bytes()
+            if need - partial + keep > free:
+                raise RuntimeError('disque presque plein : %.1f Go à télécharger, %.1f Go libres, %.0f Go à laisser libres '
+                                   '("gpu_keep_free_gb" dans la config).' % ((need - partial) / 1e9, free / 1e9, keep / 1e9))
         total = float(sum(int(f['size']) for f in missing)) or 1.0
         done = [0.0]
         if not (home / '.ok').exists():

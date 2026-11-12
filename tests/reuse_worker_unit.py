@@ -320,6 +320,18 @@ class GpuTest(unittest.TestCase):
         self.assertIn('plafonné à 5 Go', str(e.exception))
         self.assertFalse((self.dir / 'gpu' / 'models').exists(), 'rien téléchargé')
 
+    def test_free_disk_space_is_checked_before_any_download(self):
+        g = self.gpu(gpu_max_gb=1000)
+        usage = w.shutil.disk_usage
+        w.shutil.disk_usage = lambda path: usage(path)._replace(free=int(15e9))
+        try:
+            with self.assertRaises(RuntimeError) as e:
+                g.ensure('image', 'z-image-turbo')   # 11 Go à télécharger + 10 Go à laisser libres > 15 Go
+        finally:
+            w.shutil.disk_usage = usage
+        self.assertIn('disque presque plein', str(e.exception))
+        self.assertFalse((self.dir / 'gpu' / 'models').exists(), 'rien téléchargé')
+
     def test_prune_removes_what_the_catalog_no_longer_names(self):
         g = self.gpu()
         root = self.dir / 'gpu'
