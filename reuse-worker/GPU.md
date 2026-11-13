@@ -58,6 +58,7 @@ Un type qu'aucune machine ne propose est refusé tout de suite (409), pour ne pa
 |---|---|---|---|---|
 | image | Z-Image Turbo 6B (Tongyi-MAI), diffusion Q8_0 + encodeur Qwen3-4B Q8_0 + VAE | stable-diffusion.cpp master-1091-b9d7176, Vulkan | Apache-2.0 | 11,2 Go |
 | 3d (expérimental) | TRELLIS.2 4B (Microsoft), GGUF q8 | trellis.cpp v0.8.1, Vulkan | MIT, DINOv3 sous licence Meta | 10 Go |
+| banc d'essai | Z-Image Turbo bf16 (Comfy-Org) | ComfyUI v0.45.0 + PyTorch 2.13.0 ROCm 10.0 gfx1030 | GPL-3.0, MIT, Apache-2.0, BSD | 27 Go |
 
 Le choix de l'image vient du classement « open weights » d'Artificial Analysis (11/2026). Z-Image Turbo y est
 le premier modèle à licence permissive qui tient dans 16 Go, devant ERNIE Image Turbo, Qwen-Image (20 milliards
@@ -74,8 +75,9 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   - `engines\` : binaires décompressés, un dossier par version ;
   - `models\` : les poids ;
   - `logs\` : la dernière sortie de chaque moteur.
-- Rien dans le registre ni dans Program Files. Aucun service, aucun pilote, pas de Python en plus. Le Python
-  portable du worker suffit. Le calcul passe par le pilote graphique déjà installé (Vulkan).
+- Rien dans le registre ni dans Program Files. Aucun service, aucun pilote, pas de Python en plus (sauf le banc
+  ComfyUI, sous `gpu\comfyui`). Le Python portable du worker suffit. Le calcul passe par le pilote graphique déjà
+  installé (Vulkan).
 - L'installation est paresseuse : rien n'est téléchargé avant le premier travail du type. Un fichier vérifié
   porte un témoin `.ok`, il n'est donc pas re-haché à chaque travail. Un téléchargement coupé reprend où il en
   était.
@@ -145,17 +147,35 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
 
   `stage` dit l'étape en cours (« étape 3/8 (4.2 s par étape) »). Le journal complet reste sur le PC, dans
   `gpu\logs\`.
-- Pour tout retirer : supprimer le dossier `gpu\`.
+- Pour tout retirer : supprimer le dossier `gpu\` (ComfyUI seul : essai `comfyui_remove`).
 
 ## La 3D est expérimentale : derrière un drapeau, non prouvée
 
-trellis.cpp v0.8.1 précède le correctif d'un bug Vulkan qui touche les cartes RDNA2 (RX 6000) : avec le pilote AMD
-Windows, il produit des valeurs non numériques sur les poids q8 (issue #50, corrigé dans main le 23/10/2026, PR
-#55, pas encore publié en version). Le catalogue pose donc le contournement documenté
-`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`. Ce contournement n'a jamais été essayé sur la RX 6950 XT. C'est pourquoi
-une machine ne propose la 3D que si sa config contient `"enable_3d": true`.
+trellis.cpp v0.8.1 précède le correctif d'un bug Vulkan qui touche les cartes RDNA2 (RX 6000). Avec le pilote AMD
+Windows, la multiplication entière Q8_0 de ggml-vulkan rend des NaN quand la dimension contractée est petite (K = 32
+ou 64). Six matrices des poids q8 sont dans ce cas :
+- le flux de forme tourne alors sur du bruit, sans le dire (NaN mis à zéro) ;
+- puis le décodeur plante en [5/7], code 0xC0000409.
 
-Essai sans hub, worker arrêté (fichier `STOP`, attendre qu'il s'arrête) :
+Où en est le correctif :
+- issue #50, corrigé dans main le 23/10/2026 (PR #55) ;
+- le 13/11/2026, aucune version publiée ne le contient (dernière : v0.8.1 du 25/09). Les binaires de main ne sont
+  pas téléchargeables sans compte GitHub.
+
+Le catalogue garde donc le contournement `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`.
+- L'auteur du correctif l'a validé sur un iGPU RDNA2 (gfx1036) avec le pilote AMD Windows : chaîne complète, GLB texturé.
+- Il n'a jamais été essayé sur une RX 6000 dédiée.
+
+C'est pourquoi une machine ne propose la 3D que si `enable_3d` est vrai, dans sa config ou posé par le hub.
+
+L'essai 3D le vérifie.
+- Il fait d'abord une image 512 s'il n'a pas d'image d'entrée.
+- Le rapport donne :
+  - `glb` : sommets, triangles, textures et boîte englobante. Un GLB sans triangle est un échec ;
+  - `nan_lines` : les lignes du journal qui parlent de NaN ;
+  - `log` : la fin du journal du moteur, avec les étapes [1/7] à [7/7].
+
+Essai local, worker arrêté (fichier `STOP`, attendre qu'il s'arrête) :
 
 ```powershell
 $py = 'C:\reuse-worker\runtime\python-3.14.10\python.exe'
@@ -163,9 +183,85 @@ $py = 'C:\reuse-worker\runtime\python-3.14.10\python.exe'
 & $py C:\reuse-worker\app\reuse_worker.py --base C:\reuse-worker --gpu-test 3d      # GLB à partir de cette image
 ```
 
-Le rapport est écrit dans `logs\gpu-test.json` : `ok`, `compute_s`, `device`, et `error` en cas d'échec. La sortie
-brute du moteur est dans `gpu\logs\last-<type>.log`. L'essai 3D réussi, la 3D s'ouvre en ajoutant
-`"enable_3d": true` à la config, puis en supprimant `STOP`.
+Le rapport est écrit dans `logs\gpu-test.json`. La sortie brute du moteur est dans `gpu\logs\last-<type>.log`.
+
+## Essais et réglages à distance (sans toucher au PC)
+
+Tout passe par le jeton admin RE-USE. Le worker reçoit les ordres à son prochain échange avec le hub.
+
+```bash
+H=https://hub.example.com/api/reuse/workers/gpu-box; A="Authorization: Bearer $HUB_REUSE_ADMIN_TOKEN"; J='Content-Type: application/json'
+curl -H "$A" -H "$J" -d '{"kind":"3d"}' $H/tests                 # 201 {test:{id,status:"pending"}[, warning]}
+curl -H "$A" $H/tests/7                                          # status, stage, progress, puis ok, error, result
+curl -H "$A" -o essai.glb $H/tests/7/output                       # le PNG ou le GLB produit, pour le regarder
+curl -H "$A" -X POST $H/tests/7/cancel                           # arrêt sous 30 s
+curl -H "$A" -H "$J" -d '{"enable_3d":true}' $H/settings         # null retire le réglage : la config du PC revaut
+curl -H "$A" $H/settings                                         # réglages posés + journal (qui, quand, avant, après)
+```
+
+Ce que fait un essai :
+- Types d'essai :
+  - `image` (512 par défaut ; paramètres width, height, steps, seed) ;
+  - `3d` (res, steps, seed, texture) ;
+  - `comfyui` (width, height, steps, seed, runs) ;
+  - `comfyui_remove`.
+- Le worker le lance entre deux travaux, dans son créneau horaire et hors pause. Il n'y a qu'un essai ouvert à la fois
+  par machine. Tant qu'un essai attend, la machine ne reçoit pas de nouveau travail.
+- Pendant l'essai, le worker envoie son étape toutes les 20 s.
+- Un essai devient un échec dans deux cas :
+  - plus de nouvelles pendant 15 minutes (worker redémarré) ;
+  - jamais démarré en 24 h.
+- Un essai n'est jamais redonné après un redémarrage, pour qu'il ne puisse pas tourner en boucle.
+- Le rapport (32 Ko au plus sur le hub) est aussi écrit sur le PC, dans `logs\gpu-test.json`.
+- Le fichier produit (PNG de l'image ou de ComfyUI, GLB de la 3D) est envoyé au hub avant le rapport, vérifié
+  (empreinte, format), et gardé pour les 10 derniers essais de chaque machine : `output.url` dans le test.
+- `warning`, à la création, dit pourquoi l'essai risque d'attendre :
+  - version du worker sans essais à distance (envoyer d'abord `{"update":true}` à `/order`) ;
+  - hors créneau ;
+  - en pause.
+
+Réglages que le hub peut poser, et aucun autre :
+- `enable_3d` (vrai ou faux) ;
+- `gpu_max_gb` (5 à 200) ;
+- `gpu_keep_loaded_s` (0 à 7200).
+
+Ils sont envoyés à chaque échange. Le worker les pose sur sa config en mémoire, sans réécrire le fichier du PC.
+
+## ComfyUI : banc d'essai seulement
+
+Pourquoi : comparer ComfyUI (IP-Adapter, LoRA, tuiles, nœuds) à stable-diffusion.cpp sur la même carte et le même
+modèle, avec des mesures. ComfyUI n'est pas un type de travail : l'essai l'installe, le mesure, puis l'arrête.
+
+Voie retenue (recherche du 13/11/2026) : les roues PyTorch ROCm stables d'AMD (projet TheRock, index
+`stable.repo.amd.com/rocm/whl-next`), dans un Python 3.13 embarqué, sans droits admin ni HIP SDK.
+- torch 2.13.0+rocm10.0.0, avec les noyaux `device-gfx1030`. TheRock classe gfx1030 « Release Ready » sous Windows.
+- Les autres voies sont écartées :
+  - le portable AMD officiel de ComfyUI (v0.45.0) ne contient aucun noyau gfx1030 ;
+  - ZLUDA exige le HIP SDK, donc des droits admin ;
+  - torch-directml est arrêté à torch 2.4, alors que ComfyUI demande au moins 2.7.
+- ComfyUI v0.45.0 est lancé sur 127.0.0.1 sans interface, sans nœuds additionnels ni nœuds d'API, avec
+  `--use-quad-cross-attention` (pas d'AOTriton pour gfx1030).
+- Le workflow est la référence officielle de Comfy-Org (`benchmarks/image_z_image_turbo.json`) : Z-Image Turbo bf16,
+  calcul en fp16 sur RDNA2, 1024x1024, 8 étapes, `res_multistep`.
+- `runs` passages (2 par défaut) :
+  - le premier paie le chargement ;
+  - le second donne `s_per_step`, comparé aux 13,2 s par étape de sd.cpp (`speedup_vs_sdcpp`).
+- Une image unie (NaN en fp16) est un échec.
+
+Place sur le disque : environ 27 Go dans `gpu\comfyui`.
+- 20,7 Go de poids. Le VAE est partagé avec le moteur image par un lien physique quand c'est possible.
+- Environ 5,5 Go pour Python, PyTorch ROCm et les dépendances.
+- Avec l'image (11,2 Go) et la 3D (10 Go), le total dépasse le plafond de 30 Go par défaut. L'essai le dit avant tout
+  téléchargement, chiffres à l'appui (`disk`). Pour aller plus loin, relever `gpu_max_gb` depuis le hub (55 suffit).
+  Les 10 Go laissés libres sur le disque restent garantis.
+
+Tout est rangé sous `gpu\comfyui` : Python, ComfyUI, poids, sorties, base SQLite, mais aussi les fichiers temporaires
+de pip, les caches MIOpen, Hugging Face et torch (variables d'environnement), et pip sans cache.
+- Versions épinglées : Python, pip, setuptools et l'archive ComfyUI par SHA-256, les poids par commit Hugging Face et
+  SHA-256, torch à la version exacte.
+- Les dépendances de ComfyUI (`requirements.txt`) viennent de PyPI, torch bloqué par contrainte.
+
+Pour tout retirer : essai `comfyui_remove`, ou supprimer le dossier `gpu\comfyui`.
 
 ## Côté hub
 
@@ -193,6 +289,8 @@ brute du moteur est dans `gpu\logs\last-<type>.log`. L'essai 3D réussi, la 3D s
   5. un nouveau morceau RE-USE.
 
   Une machine qui n'annonce rien (ancienne version du worker) ne reçoit jamais de travail GPU.
+- **Pilotage à distance** : réglages et essais GPU d'une machine (voir plus haut). Tables `reuse_worker_settings`,
+  `reuse_worker_events` (journal), `reuse_worker_tests` ; route du worker `POST /api/reuse/worker/tests/:id`.
 - **Contrôle des résultats** : le hub vérifie ce qu'il reçoit. Une image doit être un PNG de la taille demandée,
   un modèle 3D un GLB 2.0 dont l'en-tête annonce la bonne longueur. Sinon il répond 422, l'essai compte, et après
   deux essais le travail passe en échec.

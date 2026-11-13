@@ -29,6 +29,78 @@
       "env_note": "v0.8.1 precede le correctif RDNA2 (trellis.cpp issue #50, PR #55 du 23/10/2026) : sans cette variable, NaN sur RX 6000 avec les poids q8."
     }
   },
+  "benchmarks": {
+    "comfyui": {
+      "label": "ComfyUI v0.45.0 + PyTorch 2.13.0 ROCm 10.0 (TheRock, gfx1030), banc d'essai Z-Image Turbo",
+      "license": "ComfyUI GPL-3.0 ; PyTorch BSD-3 ; ROCm TheRock MIT, bibliotheques Apache-2.0/MIT/BSD ; Z-Image Turbo Apache-2.0 ; Qwen3-4B Apache-2.0",
+      "notes": "Essai seulement, jamais un type de travail. Seule voie gfx1030 sous Windows sans droits admin (11/2026) : roues PyTorch ROCm stables d'AMD (index whl-next, gfx1030 Release Ready dans TheRock SUPPORTED_GPUS.md) dans un Python embarque. Le portable AMD officiel de ComfyUI ne contient aucun noyau gfx1030 ; ZLUDA exige le HIP SDK (admin) ; torch-directml est arrete a torch 2.4. Tout sous gpu\\comfyui (caches pip, MIOpen et temporaires compris).",
+      "dir": "comfyui",
+      "max_gb": 27,
+      "env_gb": 5.5,
+      "python": {
+        "url": "https://www.python.org/ftp/python/3.13.17/python-3.13.17-embed-amd64.zip",
+        "sha256": "9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38",
+        "size": 11441267
+      },
+      "pip": {
+        "url": "https://files.pythonhosted.org/packages/07/25/ee8c38ae72d66b844ce8eb9711ba905dba21ca1a8a0c960057c41cd23337/pip-26.3-py3-none-any.whl",
+        "sha256": "f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13",
+        "size": 1950951
+      },
+      "setuptools": {
+        "url": "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl",
+        "sha256": "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
+        "size": 876263,
+        "note": "Le paquet rocm n'existe qu'en source (setuptools>=70.2) : construit sans isolation, car le Python embarque ignore PYTHONPATH (isolation de pip)."
+      },
+      "source": {
+        "url": "https://github.com/Comfy-Org/ComfyUI/archive/refs/tags/v0.45.0.zip",
+        "sha256": "a3dab8df0ba52b73a4878adc507d29680683b90b87d169c9194437c54aea64da",
+        "size": 13609664,
+        "root": "ComfyUI-0.45.0"
+      },
+      "torch": {
+        "index_url": "https://stable.repo.amd.com/rocm/whl-next/",
+        "packages": ["torch[device-gfx1030]==2.13.0+rocm10.0.0", "torchvision[device-gfx1030]==0.28.0+rocm10.0.0"],
+        "check": "import torch\nprint('TORCH', torch.__version__, torch.version.hip, torch.cuda.is_available(), torch.cuda.device_count())\nfor i in range(torch.cuda.device_count()):\n    p = torch.cuda.get_device_properties(i)\n    print('DEV', i, p.gcnArchName.split(':')[0], p.total_memory, p.name)"
+      },
+      "files": [
+        { "dir": "diffusion_models", "name": "z_image_turbo_bf16.safetensors", "size": 12309866400,
+          "sha256": "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6",
+          "url": "https://huggingface.co/Comfy-Org/Z-Image-Turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/diffusion_models/z_image_turbo_bf16.safetensors" },
+        { "dir": "text_encoders", "name": "qwen_3_4b.safetensors", "size": 8044982048,
+          "sha256": "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
+          "url": "https://huggingface.co/Comfy-Org/Z-Image-Turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/text_encoders/qwen_3_4b.safetensors" },
+        { "dir": "vae", "name": "ae.safetensors", "size": 335304388,
+          "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+          "url": "https://huggingface.co/Comfy-Org/Z-Image-Turbo/resolve/6fc90a3b1b653e935a0d175e260736de25b84df5/split_files/vae/ae.safetensors",
+          "reuse": "z-image-turbo/ae.safetensors" }
+      ],
+      "args": ["--listen", "127.0.0.1", "--port", "{port}", "--disable-auto-launch", "--disable-api-nodes", "--disable-all-custom-nodes",
+               "--use-quad-cross-attention", "--disable-pinned-memory", "--log-stdout",
+               "--base-directory", "{base}"],
+      "env": { "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "MIOPEN_FIND_MODE": "2", "HF_HUB_OFFLINE": "1", "DO_NOT_TRACK": "1" },
+      "reference": { "engine": "stable-diffusion.cpp Vulkan, Z-Image Turbo Q8_0, 1024x1024, encodeur texte sur CPU (mesure du 12/11, job 15)", "s_per_step": 13.2 },
+      "workflow_source": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/benchmarks/image_z_image_turbo.json (30/09/2026)",
+      "workflow": {
+        "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "bench", "images": ["57:8", 0] } },
+        "57:30": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen_3_4b.safetensors", "type": "lumina2", "device": "default" } },
+        "57:29": { "class_type": "VAELoader", "inputs": { "vae_name": "ae.safetensors" } },
+        "57:33": { "class_type": "ConditioningZeroOut", "inputs": { "conditioning": ["57:27", 0] } },
+        "57:8": { "class_type": "VAEDecode", "inputs": { "samples": ["57:3", 0], "vae": ["57:29", 0] } },
+        "57:28": { "class_type": "UNETLoader", "inputs": { "unet_name": "z_image_turbo_bf16.safetensors", "weight_dtype": "default" } },
+        "57:27": { "class_type": "CLIPTextEncode", "inputs": { "text": "{prompt}", "clip": ["57:30", 0] } },
+        "57:13": { "class_type": "EmptySD3LatentImage", "inputs": { "width": "{width}", "height": "{height}", "batch_size": 1 } },
+        "57:11": { "class_type": "ModelSamplingAuraFlow", "inputs": { "shift": 3, "sampling": "flow", "model": ["57:28", 0] } },
+        "57:3": { "class_type": "KSampler", "inputs": { "seed": "{seed}", "steps": "{steps}", "cfg": 1, "sampler_name": "res_multistep", "scheduler": "simple",
+                                                         "denoise": 1, "model": ["57:11", 0], "positive": ["57:27", 0], "negative": ["57:33", 0], "latent_image": ["57:13", 0] } }
+      },
+      "defaults": { "width": 1024, "height": 1024, "steps": 8, "seed": 42, "runs": 2,
+                    "prompt": "a red ceramic teapot on a wooden table, soft morning light, studio photo" },
+      "start_timeout_s": 900,
+      "timeout_s": 3600
+    }
+  },
   "types": {
     "image": {
       "label": "Image a partir d'un texte (ou d'un texte et d'une image de depart)",

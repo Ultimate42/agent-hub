@@ -676,6 +676,39 @@ def is_glb(path):
     return len(head) == 12 and head[:4] == b'glTF' and struct.unpack('<II', head[4:12]) == (2, os.path.getsize(path))
 
 
+def glb_stats(path):
+    """Ce que dit un GLB de lui-même (morceau JSON) : sommets, triangles, textures, boîte englobante. Un maillage fait de
+    bruit (flux tombé en NaN, trellis.cpp #50) se voit à ses chiffres : quasi vide, ou boîte dégénérée. None si illisible."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(20)
+            if len(head) < 20 or head[:4] != b'glTF' or head[16:20] != b'JSON':
+                return None
+            doc = json.loads(f.read(struct.unpack('<I', head[12:16])[0]))
+    except (OSError, ValueError, struct.error):
+        return None
+    acc = doc.get('accessors') or []
+    vertices = triangles = 0
+    lo, hi = [float('inf')] * 3, [float('-inf')] * 3
+    for mesh in doc.get('meshes') or []:
+        for prim in mesh.get('primitives') or []:
+            pos = (prim.get('attributes') or {}).get('POSITION')
+            if isinstance(pos, int) and pos < len(acc):
+                a = acc[pos]
+                vertices += int(a.get('count') or 0)
+                for i in range(3):
+                    if len(a.get('min') or []) == 3 and len(a.get('max') or []) == 3:
+                        lo[i], hi[i] = min(lo[i], a['min'][i]), max(hi[i], a['max'][i])
+            ind = prim.get('indices')
+            if isinstance(ind, int) and ind < len(acc):
+                triangles += int(acc[ind].get('count') or 0) // 3
+    out = {'vertices': vertices, 'triangles': triangles, 'meshes': len(doc.get('meshes') or []),
+           'textures': len(doc.get('images') or []), 'materials': len(doc.get('materials') or [])}
+    if vertices and all(abs(v) != float('inf') for v in lo + hi):
+        out['bbox_size'] = [round(hi[i] - lo[i], 4) for i in range(3)]
+    return out
+
+
 def folder_bytes(path):
     total = 0
     for root, _, files in os.walk(path):
@@ -858,7 +891,8 @@ class EngineTrace:
     ou des poids relus du disque à chaque travail ne se voient qu'à la lenteur."""
     KEEP = re.compile(r'ggml_vulkan|vulkan\d|auto-fit|devices?:|free\s+-?\d+ MiB|RAM\s+free|params\s+-?\d+ MiB|--backend|using CPU|'
                       r'no GPU|buffer size|completed, taking|completed in|memory-mapped|out of memory|tiling|model manager|'
-                      r'offload|staged|\bWARN|\bERROR|failed|error', re.I)
+                      r'offload|staged|\bWARN|\bERROR|failed|error|^\s*\[\d+/\d+\]', re.I)
+    STAGE = re.compile(r'^\s*\[(\d+)/(\d+)\]\s*(.+)')   # étapes de trellis.cpp : « [5/7] FlexiDualGrid shape decode -> mesh »
     BAR = re.compile(r'\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)\s*(s/it|it/s|[KMG]B/s)')
     TAKING = (('load_s', r'loading tensors completed, taking ([\d.]+)s'), ('encode_s', r'get_learned_condition completed, taking ([\d.]+)s'),
               ('sampling_s', r'sampling completed, taking ([\d.]+)s'), ('decode_s', r'decode_first_stage completed, taking ([\d.]+)s'),
@@ -912,6 +946,11 @@ class EngineTrace:
         if not self.KEEP.search(line):
             return
         self.keep(line)
+        m = self.STAGE.match(line)
+        if m and int(m.group(2)):
+            a, b = int(m.group(1)), int(m.group(2))
+            self.phase = '%d/%d %s' % (a, b, m.group(3).strip()[:80])
+            self.progress = max(self.progress, 0.3 + 0.65 * (a - 1) / b)
         low = line.lower()
         m = re.search(r'ggml_vulkan: \d+ = ([^|(\r\n]+)', line)
         if m and 'device' not in self.meta:
@@ -1436,6 +1475,8 @@ class Worker:
             raise SystemExit('Config absente ou incomplète : %s (voir reuse-worker.config.example.json)' % (base / 'reuse-worker.config.json'))
         if not str(self.config['hub_url']).startswith('https://') and not self.config.get('allow_http'):
             raise SystemExit('hub_url doit commencer par https:// (le jeton ne circule jamais en clair)')
+        self.local_config = dict(self.config)   # le fichier du PC ; le hub peut poser par-dessus quelques réglages (REMOTE_SETTINGS)
+        self.remote_settings = {}
         self.hub = Hub(self.config['hub_url'], self.config['token'])
         self.version = (self.app / 'version.txt').read_text().strip() if (self.app / 'version.txt').exists() else 'dev'
         self.engine = Engine(base, self.config)
@@ -1462,6 +1503,7 @@ class Worker:
             'update_ack': (read_json(self.base / 'update-ack.json', {}) or {}).get('order'),
             'gpu': ','.join(self.gpu.types()),        # types de génération proposés (le hub n'en donne pas d'autres)
             'gpu_state': self.gpu.describe() or None,
+            'tests': ','.join(GPU_TEST_KINDS),         # essais GPU que cette version sait faire sur ordre du hub
         }
 
     def set_state(self, state, job=None):
@@ -1841,7 +1883,7 @@ class Worker:
             if status == 403:
                 raise SystemExit('Le hub refuse le jeton : vérifier "token" dans reuse-worker.config.json.')
             if status == 200 and body:
-                self.apply_orders(body.get('orders') or {})
+                self.apply_orders(body.get('orders') or {}, tests=False)   # un essai attendra que le moteur soit prêt
         except OSError as e:
             log.warning('Hub injoignable au démarrage (%s) : je continue avec la version installée.', e)
         # 2. moteur
@@ -1855,6 +1897,10 @@ class Worker:
             return EXIT_NOT_READY
         kill_orphan(self.gpu.pidfile, (b'sd-cli', b'trellis-cli'))
         kill_orphan(self.gpu.server_pidfile, (b'sd-server',))
+        try:
+            comfy_kill_orphan(comfy_layout(self.base, comfy_spec(self.app)))   # essai ComfyUI coupé par un arrêt du worker
+        except (RuntimeError, KeyError):
+            pass
         skipped = {}
         if self.gpu.types(skipped):
             log.info('Générations GPU proposées : %s', self.gpu.describe())
@@ -1920,11 +1966,104 @@ class Worker:
             self.paused_logged = paused
         self.state['state'] = 'en pause' if paused else 'en attente'
 
-    def apply_orders(self, orders):
+    def apply_orders(self, orders, tests=True):
         self.note_pause(orders)
+        self.apply_settings(orders.get('settings'))
         order = int(orders.get('update') or 0)
         acked = (read_json(self.base / 'update-ack.json', {}) or {}).get('order')
         self.update(orders.get('worker_version'), order if order and order != acked else 0)
+        test = orders.get('gpu_test')
+        if tests and isinstance(test, dict) and test.get('id') and not orders.get('paused'):
+            self.run_remote_test(test)
+
+    def apply_settings(self, settings):
+        """Réglages posés par le hub par-dessus le fichier du PC. Seules les clés de REMOTE_SETTINGS, du bon type, sont prises ;
+        une clé que le hub retire revient à la valeur du fichier. Le même dict est lu par Gpu et Engine : modifié sur place."""
+        if not isinstance(settings, dict):
+            return
+        kept = {}
+        for k, v in settings.items():
+            kinds = REMOTE_SETTINGS.get(k)
+            if kinds and isinstance(v, kinds) and not (bool not in kinds and isinstance(v, bool)):
+                kept[k] = v
+        if kept == self.remote_settings:
+            return
+        before = {k: self.config.get(k) for k in set(kept) | set(self.remote_settings)}
+        merged = dict(self.local_config, **kept)
+        self.config.clear()
+        self.config.update(merged)
+        self.remote_settings = kept
+        changes = ['%s : %s -> %s' % (k, before[k], self.config.get(k)) for k in sorted(before) if before[k] != self.config.get(k)]
+        log.info('Réglages du hub appliqués (%s)%s.', ', '.join(changes) or 'aucun changement effectif',
+                 '' if kept else ' : retour au fichier de config')
+        if self.gpu.server and before.get('gpu_keep_loaded_s') != self.config.get('gpu_keep_loaded_s'):
+            self.gpu.idle()
+
+    def run_remote_test(self, test):
+        """Essai GPU demandé par le hub (POST /api/reuse/workers/:nom/tests), entre deux travaux : même code que --gpu-test.
+        Avancement envoyé toutes les 20 s (le hub peut annuler), rapport final remonté et écrit dans logs/gpu-test.json."""
+        tid, kind = int(test['id']), str(test.get('kind'))
+        route = '/api/reuse/worker/tests/%d' % tid
+        now = {'progress': 0.0, 'stage': 'préparation'}
+        stop, finished = threading.Event(), threading.Event()
+
+        def post(body, timeout=30):
+            status, answer = self.hub.request('POST', route, body=body, timeout=timeout)
+            if status in (404, 409) or (status == 200 and (answer or {}).get('cancel')):
+                stop.set()
+            return status
+
+        try:   # d'abord dire « je commence » : le hub ne redonnera plus cet essai, même si ce worker redémarre
+            if post({'status': 'running', 'stage': 'préparation', 'progress': 0, 'info': self.info()}) != 200:
+                log.warning('Essai GPU %d refusé par le hub (annulé ou déjà fini) : ignoré.', tid)
+                return
+        except OSError as e:
+            log.warning('Essai GPU %d : hub injoignable (%s), il sera redonné.', tid, e)
+            return
+        if kind not in GPU_TEST_KINDS:
+            post({'status': 'failed', 'report': {'ok': False, 'error': 'essai %r inconnu de cette version' % kind}})
+            return
+        log.info('Essai GPU %d (%s) demandé par le hub : %s', tid, kind, json.dumps(test.get('params') or {}))
+        self.set_state('essai %s' % kind, 'essai %d' % tid)
+        self.gpu.stop_server('essai GPU demandé')   # la carte entière pour l'essai
+
+        def progress(frac, stage):
+            now.update(progress=round(max(0.0, min(1.0, frac)), 3), stage=str(stage)[:200])
+
+        def beat():
+            while not finished.wait(20):
+                try:
+                    post({'status': 'running', 'stage': now['stage'], 'progress': now['progress'], 'info': self.info()})
+                except OSError:
+                    pass
+        threading.Thread(target=beat, daemon=True).start()
+        try:
+            report = gpu_test_report(self.base, dict(self.config), kind, test.get('params') or {}, None, stop, progress)
+        finally:
+            finished.set()
+        report['test_id'] = tid
+        write_json(self.base / 'logs' / 'gpu-test.json', report)
+        log.info('ESSAI GPU %d %s : %s', tid, 'REUSSI' if report.get('ok') else 'RATE', json.dumps(report, ensure_ascii=False)[:2000])
+        if stop.is_set() and not report.get('ok'):
+            report.setdefault('error', 'annulé par le hub')
+        out = Path(report['output']) if report.get('output') else None
+        if out is not None and out.suffix in ('.png', '.glb') and out.exists() and out.stat().st_size <= (96 << 20):
+            try:   # le fichier lui-même (image, GLB), pour le regarder : avant le rapport final, le hub le rattache à l'essai
+                data = out.read_bytes()
+                status, answer = self.hub.request('POST', '%s/output?ext=%s' % (route, out.suffix[1:]), raw=data, timeout=300,
+                                                  headers={'X-Sha256': hashlib.sha256(data).hexdigest(), 'Content-Type': 'application/octet-stream'})
+                report['output_sent'] = status == 200
+                if status != 200:
+                    log.warning('Fichier de l\'essai %d refusé par le hub (HTTP %s : %s).', tid, status, (answer or {}).get('error'))
+            except OSError as e:
+                report['output_sent'] = False
+                log.warning('Fichier de l\'essai %d non envoyé (%s).', tid, e)
+        try:
+            self.hub.retrying('Envoi du rapport d\'essai', lambda: post({'status': 'done' if report.get('ok') else 'failed', 'report': report,
+                                                                          'info': self.info()}, timeout=60), tries=5)
+        except (OSError, Refused) as e:
+            log.warning('Rapport de l\'essai %d non remis (%s) : il reste dans logs/gpu-test.json.', tid, e)
+        self.set_state('en attente')
 
 
 CRASH_TEST_SECONDS = float(os.environ.get('REUSE_CRASH_TEST_SECONDS') or 10.0)   # variable : tests seulement
@@ -1973,10 +2112,583 @@ def crash_test(base):
     return 0 if report['ok'] else 1
 
 
+# --------------------------------------------------------------------------------------------
+# ComfyUI : banc d'essai seulement (catalogue « benchmarks.comfyui »), jamais un type de travail
+# --------------------------------------------------------------------------------------------
+# gpu/comfyui/python/        Python embarqué officiel (python.org), pip installé depuis sa roue épinglée
+# gpu/comfyui/<source>/      ComfyUI à la version épinglée (archive GitHub vérifiée par SHA-256)
+# gpu/comfyui/data/          --base-directory : models/, output/, temp/, user/ (base SQLite comprise)
+# gpu/comfyui/tmp, cache/    TEMP de pip et du moteur, caches MIOpen / Hugging Face / torch : rien dans le profil Windows
+# Supprimer gpu/comfyui (essai comfyui_remove) retire tout.
+
+class ComfyTrace(EngineTrace):
+    """Sortie de ComfyUI : barres tqdm (« 3/8 [00:40<01:07, 13.40s/it] »), temps d'exécution, choix de précision et de
+    chargement (partiel = la mémoire vidéo ne suffit pas), erreurs HIP."""
+    KEEP = re.compile(r'Total VRAM|pytorch version|Device:|Set vram state|attention|weight dtype|manual cast|loaded (completely|partially)|'
+                      r'Requested to load|Prompt executed|out of memory|HIP|hipError|MIOpen|rocBLAS|Traceback|Error|\bWARN|Exception|'
+                      r'Starting server|To see the GUI|TORCH ', re.I)
+    BAR = re.compile(r'\|\s*(\d+)/(\d+)\s*\[[^\]]*?,\s*([\d.]+)(s/it|it/s)\]')
+    TAKING = (('executed_s', r'Prompt executed in ([\d.]+) seconds'),)
+
+
+def comfy_spec(app=None):
+    catalog = read_json((app or Path(__file__).resolve().parent) / GPU_CATALOG, {}) or {}
+    spec = (catalog.get('benchmarks') or {}).get('comfyui')
+    if not spec:
+        raise RuntimeError('banc ComfyUI absent du catalogue publié')
+    return spec
+
+
+def comfy_layout(base, spec):
+    root = base / 'gpu' / spec.get('dir', 'comfyui')
+    return {'root': root, 'python': root / 'python', 'src': root / spec['source']['root'], 'data': root / 'data',
+            'tmp': root / 'tmp', 'cache': root / 'cache', 'downloads': root / 'downloads', 'pid': root / 'comfyui.pid',
+            'exe': root / 'python' / ('python.exe' if IS_WINDOWS else 'bin/python3')}
+
+
+def comfy_marker(spec, step):
+    """Témoin d'une étape d'installation : change avec ce que le catalogue épingle pour elle (nouvelle version = refaite)."""
+    part = {'python': spec['python'], 'pip': [spec['pip'], spec.get('setuptools')], 'source': spec['source'], 'torch': spec['torch'],
+            'requirements': [spec['source'], spec['torch']]}[step]
+    return hashlib.sha256(json.dumps(part, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def comfy_done(lay, spec, step):
+    try:
+        return (lay['root'] / ('.ok-' + step)).read_text().strip() == comfy_marker(spec, step)
+    except OSError:
+        return False
+
+
+def comfy_need_bytes(lay, spec):
+    """Octets encore à poser sur le disque pour l'essai (poids manquants, environnement Python s'il n'est pas prêt)."""
+    need = 0
+    for f in spec.get('files') or []:
+        dest = lay['data'] / 'models' / f['dir'] / f['name']
+        if not Path(str(dest) + '.ok').exists():
+            part = Path(str(dest) + '.part')
+            need += int(f['size']) - (part.stat().st_size if part.exists() else 0)
+    if not all(comfy_done(lay, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')):
+        need += int(float(spec.get('env_gb') or 5) * 1e9)
+    return max(0, need)
+
+
+def write_pth(python_dir, src_dir):
+    """Python embarqué : son fichier ._pth fixe sys.path (PYTHONPATH ignoré, dossier du script non ajouté). On y met le
+    dossier de ComfyUI et « import site » (site-packages, donc pip et ses paquets)."""
+    pths = sorted(Path(python_dir).glob('python3*._pth'))
+    if not pths:
+        raise RuntimeError('Python embarqué sans fichier ._pth')
+    pth = pths[0]
+    lines = [l.strip() for l in pth.read_text().splitlines() if l.strip() and not l.strip().startswith('#')]
+    lines = [l for l in lines if l != 'import site']
+    rel = os.path.relpath(str(src_dir), str(python_dir))
+    if rel not in lines:
+        lines.append(rel)
+    pth.write_text('\n'.join(lines + ['import site']) + '\n')
+    return pth
+
+
+def comfy_workflow(spec, values):
+    """Graphe API du catalogue, valeurs posées : « {nom} » est remplacé en entier (nombre ou texte), rien d'autre n'est évalué."""
+    def fill(v):
+        if isinstance(v, str):
+            m = re.fullmatch(r'\{(\w+)\}', v)
+            if m:
+                if m.group(1) not in values:
+                    raise RuntimeError('workflow : valeur %s manquante' % m.group(1))
+                return values[m.group(1)]
+            return v
+        if isinstance(v, list):
+            return [fill(x) for x in v]
+        if isinstance(v, dict):
+            return {k: fill(x) for k, x in v.items()}
+        return v
+    return fill(spec['workflow'])
+
+
+def png_stats(path, sample=4099):
+    """Moyenne et écart des octets de l'image décompressée (échantillon) : une image noire ou unie (NaN en fp16) a un écart nul."""
+    import zlib
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    pos, idat = 8, bytearray()
+    while pos + 8 <= len(data):
+        n, kind = struct.unpack('>I4s', data[pos:pos + 8])
+        if kind == b'IDAT':
+            idat += data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+    try:
+        raw = zlib.decompress(bytes(idat))
+    except zlib.error:
+        return None
+    vals = raw[::max(1, len(raw) // sample)] if raw else b''
+    if not vals:
+        return None
+    mean = sum(vals) / len(vals)
+    return {'mean': round(mean, 1), 'std': round((sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5, 1)}
+
+
+def run_logged(args, log_path, env, timeout, stop=None, cwd=None, what='commande'):
+    """Lance une commande d'installation, sortie ajoutée au journal ; -> sortie (fin). Lève RuntimeError si elle échoue."""
+    flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+    t0 = time.time()
+    tail = bytearray()
+    with open(log_path, 'ab') as out:
+        out.write(('\n=== %s : %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), ' '.join(str(a) for a in args))).encode('utf-8', 'replace'))
+        proc = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                env=env, cwd=cwd, creationflags=flags)
+
+        def reader():
+            for block in iter(lambda: proc.stdout.read(4096), b''):
+                out.write(block)
+                tail.extend(block)
+                if len(tail) > 16384:
+                    del tail[:len(tail) - 16384]
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        try:
+            while proc.poll() is None:
+                if stop is not None and stop.is_set():
+                    raise JobLost('%s interrompue' % what)
+                if time.time() - t0 > timeout:
+                    raise RuntimeError('%s trop longue (plus de %s), arrêtée' % (what, fmt_duration(timeout)))
+                time.sleep(1)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            th.join(5)
+            proc.stdout.close()
+    text = bytes(tail).decode('utf-8', 'replace')
+    if proc.returncode != 0:
+        last = [l for l in text.strip().splitlines() if l.strip()][-3:]
+        raise RuntimeError('%s a échoué (code %s) : %s' % (what, proc.returncode, ' | '.join(last)[-400:]))
+    return text
+
+
+def comfy_env(lay, spec):
+    """Environnement du Python de l'essai : tout fichier temporaire ou cache reste sous gpu/comfyui."""
+    env = dict(os.environ)
+    for k in ('PYTHONPATH', 'PYTHONHOME', 'PIP_INDEX_URL', 'PIP_EXTRA_INDEX_URL', 'PIP_CONFIG_FILE'):
+        env.pop(k, None)
+    env.update({k: str(v) for k, v in (spec.get('env') or {}).items()})
+    for d in ('tmp', 'cache'):
+        lay[d].mkdir(parents=True, exist_ok=True)
+    c = lay['cache']
+    env.update(TEMP=str(lay['tmp']), TMP=str(lay['tmp']), TMPDIR=str(lay['tmp']), PIP_NO_CACHE_DIR='1', PIP_DISABLE_PIP_VERSION_CHECK='1',
+               PIP_CONFIG_FILE=os.devnull, PYTHONNOUSERSITE='1', HF_HOME=str(c / 'hf'), TORCH_HOME=str(c / 'torch'), XDG_CACHE_HOME=str(c),
+               MIOPEN_USER_DB_PATH=str(c / 'miopen'), MIOPEN_CUSTOM_CACHE_DIR=str(c / 'miopen'), TRITON_CACHE_DIR=str(c / 'triton'))
+    return env
+
+
+def comfy_install(base, spec, gpu, stop, progress, report):
+    """Installe ce qui manque, étape par étape (témoins .ok-<étape>), après contrôle du plafond et de la place libre."""
+    lay = comfy_layout(base, spec)
+    root = lay['root']
+    root.mkdir(parents=True, exist_ok=True)
+    need = comfy_need_bytes(lay, spec)
+    used = folder_bytes(gpu.root) if gpu.root.exists() else 0
+    free = shutil.disk_usage(str(root)).free
+    report['disk'] = {'need_gb': round(need / 1e9, 1), 'gpu_folder_gb': round(used / 1e9, 1), 'cap_gb': round(gpu.max_bytes() / 1e9, 1),
+                      'free_gb': round(free / 1e9, 1), 'keep_free_gb': round(gpu.keep_free_bytes() / 1e9, 1),
+                      'comfyui_max_gb': spec.get('max_gb')}
+    if need and used + need > gpu.max_bytes():
+        raise RuntimeError('dossier gpu plafonné à %.0f Go : l\'essai ComfyUI en demande %.1f de plus (%.1f déjà pris). Relever "gpu_max_gb" '
+                           '(réglage du hub ou config) ou retirer ComfyUI (essai comfyui_remove).' % (gpu.max_bytes() / 1e9, need / 1e9, used / 1e9))
+    if need and need + gpu.keep_free_bytes() > free:
+        raise RuntimeError('disque presque plein : %.1f Go à poser, %.1f Go libres, %.0f Go à laisser libres ("gpu_keep_free_gb").'
+                           % (need / 1e9, free / 1e9, gpu.keep_free_bytes() / 1e9))
+    env = comfy_env(lay, spec)
+    logs = gpu.root / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    ilog = logs / 'comfyui-install.log'
+    py = lay['exe']
+    timings = report.setdefault('install_s', {})
+
+    def step(name, frac, label, fn):
+        if comfy_done(lay, spec, name):
+            return
+        progress(frac, label)
+        t0 = time.time()
+        fn()
+        (root / ('.ok-' + name)).write_text(comfy_marker(spec, name))
+        timings[name] = round(time.time() - t0, 1)
+
+    def python():
+        if not IS_WINDOWS:
+            raise RuntimeError('le banc ComfyUI n\'est prévu que sous Windows (roues ROCm win_amd64 du catalogue)')
+        archive = download(spec['python']['url'], lay['downloads'] / Path(spec['python']['url']).name, spec['python']['sha256'], 'Python embarqué')
+        rmtree(lay['python'])
+        safe_extract(archive, lay['python'])
+        write_pth(lay['python'], lay['src'])
+
+    def pip():
+        wheel = download(spec['pip']['url'], lay['downloads'] / Path(spec['pip']['url']).name, spec['pip']['sha256'], 'pip')
+        wheels = [wheel]
+        if spec.get('setuptools'):
+            wheels.append(download(spec['setuptools']['url'], lay['downloads'] / Path(spec['setuptools']['url']).name, spec['setuptools']['sha256'], 'setuptools'))
+        run_logged([py, str(wheel) + '/pip', 'install', '--no-index', '--no-warn-script-location'] + [str(w) for w in wheels], ilog, env, 600, stop,
+                   what='installation de pip')
+
+    def source():
+        archive = download(spec['source']['url'], lay['downloads'] / ('comfyui-' + spec['source']['sha256'][:12] + '.zip'), spec['source']['sha256'], 'ComfyUI')
+        rmtree(lay['src'])
+        safe_extract(archive, lay['root'])
+        if not (lay['src'] / 'main.py').exists():
+            raise RuntimeError('archive ComfyUI sans %s/main.py' % spec['source']['root'])
+
+    def torch():
+        # Sans isolation de construction : le paquet « rocm » (source seulement) se construit avec le setuptools déjà installé
+        run_logged([py, '-s', '-m', 'pip', 'install', '--no-warn-script-location', '--no-build-isolation', '--index-url', spec['torch']['index_url']]
+                   + list(spec['torch']['packages']),
+                   ilog, env, 3600, stop, what='installation de PyTorch ROCm')
+
+    def requirements():
+        pins = [re.sub(r'\[[^\]]*\]', '', p) for p in spec['torch']['packages']]   # torch reste celui d'AMD : jamais remplacé par PyPI
+        (root / 'constraints.txt').write_text('\n'.join(pins) + '\n')
+        run_logged([py, '-s', '-m', 'pip', 'install', '--no-warn-script-location', '-r', lay['src'] / 'requirements.txt', '-c', root / 'constraints.txt'],
+                   ilog, env, 3600, stop, what='installation des dépendances de ComfyUI')
+
+    step('python', 0.01, 'installation de Python', python)
+    step('pip', 0.02, 'installation de pip', pip)
+    step('source', 0.03, 'téléchargement de ComfyUI', source)
+    step('torch', 0.05, 'installation de PyTorch ROCm (environ 1,5 Go)', torch)
+    step('requirements', 0.15, 'installation des dépendances de ComfyUI', requirements)
+    files = spec.get('files') or []
+    total = float(sum(int(f['size']) for f in files)) or 1.0
+    done = 0.0
+    for f in files:
+        dest = lay['data'] / 'models' / f['dir'] / f['name']
+        mark = Path(str(dest) + '.ok')
+        reuse = gpu.root / 'models' / f['reuse'] if f.get('reuse') else None
+        if not mark.exists() and reuse is not None and Path(str(reuse) + '.ok').exists() and not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(reuse, dest)          # même fichier que le moteur image (même empreinte) : rien de plus sur le disque
+            except OSError:
+                shutil.copyfile(reuse, dest)
+        download_resume(f['url'], dest, f['sha256'], int(f['size']), '%s (ComfyUI)' % f['name'], stop,
+                        lambda frac, f=f: progress(0.2 + 0.3 * (done + frac * int(f['size'])) / total, 'téléchargement de %s' % f['name']))
+        done += int(f['size'])
+    return lay, env
+
+
+def comfy_kill_orphan(lay):
+    """ComfyUI resté en marche après la mort du worker : arrêté, seulement si ce numéro est bien le Python de gpu/comfyui."""
+    try:
+        pid = int(lay['pid'].read_text())
+    except (OSError, ValueError):
+        return
+    try:
+        if pid != os.getpid():
+            if IS_WINDOWS:
+                shell = shutil.which('powershell') or shutil.which('pwsh')
+                path = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command', '(Get-Process -Id %d -ErrorAction SilentlyContinue).Path' % pid],
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
+                                      timeout=60).stdout.decode('utf-8', 'replace').strip() if shell else ''
+                if path and Path(path).resolve() == lay['exe'].resolve():
+                    subprocess.run(['taskkill', '/PID', str(pid), '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
+                    log.info('ComfyUI resté en marche après une coupure : arrêté.')
+            elif str(lay['root']).encode() in Path('/proc/%d/cmdline' % pid).read_bytes():
+                os.kill(pid, 9)
+                log.info('ComfyUI resté en marche après une coupure : arrêté.')
+    except (OSError, subprocess.SubprocessError):
+        pass
+    lay['pid'].unlink(missing_ok=True)
+
+
+def comfy_local(port, method, path, body=None, timeout=30):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request('http://127.0.0.1:%d%s' % (port, path), data=data, method=method,
+                                 headers={'Content-Type': 'application/json'} if data else {})
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            text = r.read()
+            return r.status, (json.loads(text) if text[:1] in (b'{', b'[') else None)
+    except urllib.error.HTTPError as e:
+        text = e.read()
+        try:
+            return e.code, json.loads(text)
+        except ValueError:
+            return e.code, {'error': text[:300].decode('utf-8', 'replace')}
+
+
+def comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report):
+    """ComfyUI lancé sur 127.0.0.1 sans interface, le workflow de référence joué runs fois (graine différente à chaque fois,
+    sinon ComfyUI ressert son cache), mesures par passage, puis arrêt : la carte est rendue."""
+    probe = socket.socket()
+    probe.bind(('127.0.0.1', 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    lay['data'].mkdir(parents=True, exist_ok=True)
+    args = [str(lay['exe']), '-s', str(lay['src'] / 'main.py')] + build_command(spec['args'], {'port': port, 'base': str(lay['data'])})
+    flags, kwargs = gpu.spawn_options()
+    logs = gpu.root / 'logs'
+    out_log = open(logs / 'comfyui.log', 'wb')
+    t0 = time.time()
+    proc = subprocess.Popen(args, cwd=str(lay['src']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            env=env, creationflags=flags, **kwargs)
+    lay['pid'].write_text(str(proc.pid))
+    box = {'trace': ComfyTrace(int(values['steps'])), 'all': ComfyTrace()}
+
+    def reader():
+        for block in iter(lambda: proc.stdout.read1(4096) if hasattr(proc.stdout, 'read1') else proc.stdout.read(4096), b''):
+            out_log.write(block)
+            out_log.flush()
+            box['trace'].feed(block)
+            box['all'].feed(block)
+        out_log.close()
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+    gpu.last_trace = box['all']
+    try:
+        start_timeout = float(spec.get('start_timeout_s') or 900)
+        while True:
+            if stop is not None and stop.is_set():
+                raise JobLost('essai interrompu')
+            if proc.poll() is not None:
+                raise RuntimeError('ComfyUI s\'est arrêté au démarrage (code %s) : %s' % (proc.returncode, ' | '.join(box['all'].lines[-4:])[-400:]))
+            if time.time() - t0 > start_timeout:
+                raise RuntimeError('ComfyUI pas prêt après %s' % fmt_duration(start_timeout))
+            try:
+                status, stats = comfy_local(port, 'GET', '/system_stats', timeout=5)
+                if status == 200:
+                    break
+            except OSError:
+                pass
+            progress(0.5, 'démarrage de ComfyUI')
+            time.sleep(2)
+        report['start_s'] = round(time.time() - t0, 1)
+        dev = ((stats or {}).get('devices') or [{}])[0]
+        report['comfyui_system'] = {k: (stats or {}).get('system', {}).get(k) for k in ('comfyui_version', 'pytorch_version', 'python_version', 'os')}
+        report['device'] = {k: dev.get(k) for k in ('name', 'type', 'vram_total', 'vram_free')}
+        timeout = float(spec.get('timeout_s') or 3600)
+        out_runs = []
+        for i in range(runs):
+            trace = ComfyTrace(int(values['steps']))
+            box['trace'] = trace
+            wf = comfy_workflow(spec, dict(values, seed=int(values['seed']) + i))
+            t1 = time.time()
+            status, answer = comfy_local(port, 'POST', '/prompt', {'prompt': wf, 'client_id': 'reuse-bench'}, timeout=60)
+            pid = (answer or {}).get('prompt_id')
+            if status != 200 or not pid:
+                raise RuntimeError('ComfyUI refuse le workflow (HTTP %s) : %s' % (status, json.dumps(answer, ensure_ascii=False)[:400]))
+            entry = None
+            while entry is None:
+                if stop is not None and stop.is_set():
+                    raise JobLost('essai interrompu')
+                if proc.poll() is not None:
+                    raise RuntimeError('ComfyUI s\'est arrêté pendant le calcul (code %s) : %s' % (proc.returncode, ' | '.join(box['all'].lines[-4:])[-400:]))
+                if time.time() - t1 > timeout:
+                    raise RuntimeError('passage %d trop long (plus de %s)' % (i + 1, fmt_duration(timeout)))
+                progress(0.55 + 0.4 * (i + max(0.0, min(1.0, (trace.progress - 0.35) / 0.55))) / runs, 'passage %d/%d : %s' % (i + 1, runs, trace.stage()))
+                time.sleep(1)
+                status, hist = comfy_local(port, 'GET', '/history/%s' % pid, timeout=30)
+                if status == 200 and isinstance(hist, dict) and pid in hist:
+                    entry = hist[pid]
+            st = entry.get('status') or {}
+            run = {'run': i + 1, 'seed': int(values['seed']) + i, 'wall_s': round(time.time() - t1, 1), **trace.summary()}
+            if st.get('status_str') != 'success':
+                msgs = [m for m in st.get('messages') or [] if m and m[0] == 'execution_error']
+                err = (msgs[0][1] if msgs else {}) or {}
+                raise RuntimeError('passage %d raté : %s %s' % (i + 1, err.get('exception_type', ''), str(err.get('exception_message', st))[:300]))
+            images = [im for node in (entry.get('outputs') or {}).values() for im in node.get('images') or []]
+            if not images:
+                raise RuntimeError('passage %d : aucune image produite' % (i + 1))
+            im = images[0]
+            path = lay['data'] / 'output' / (im.get('subfolder') or '') / im['filename']
+            size = png_size(path) if path.exists() else None
+            if tuple(size or ()) != (int(values['width']), int(values['height'])):
+                raise RuntimeError('passage %d : image %s au lieu de %dx%d' % (i + 1, size, values['width'], values['height']))
+            run['image'] = png_stats(path)
+            kept = gpu.root.parent / 'logs' / ('gpu-test-comfyui-%d.png' % (i + 1))
+            shutil.copyfile(path, kept)
+            report['output'] = str(kept)
+            out_runs.append(run)
+        report['runs'] = out_runs
+        _, stats = comfy_local(port, 'GET', '/system_stats', timeout=10)
+        dev = ((stats or {}).get('devices') or [{}])[0]
+        report['device']['vram_free_after'] = dev.get('vram_free')
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(30)
+            except subprocess.TimeoutExpired:
+                pass
+        th.join(5)
+        proc.stdout.close()
+        lay['pid'].unlink(missing_ok=True)
+    return out_runs
+
+
+def comfy_test_report(base, config, kind, params, stop, progress, report):
+    """Essai comfyui (installation au besoin, mesure) ou comfyui_remove (tout retirer). -> rapport."""
+    gpu = Gpu(base, config, Path(__file__).resolve().parent)
+    try:
+        spec = comfy_spec()
+        lay = comfy_layout(base, spec)
+        comfy_kill_orphan(lay)
+        if kind == 'comfyui_remove':
+            freed = folder_bytes(lay['root']) if lay['root'].exists() else 0
+            rmtree(lay['root'])
+            if lay['root'].exists():
+                raise RuntimeError('%s n\'a pas pu être supprimé entièrement (fichier ouvert ?)' % lay['root'])
+            report.update(ok=True, freed_gb=round(freed / 1e9, 2), removed=str(lay['root']))
+            return report
+        values = dict(spec.get('defaults') or {})
+        values.update({k: v for k, v in params.items() if k in ('width', 'height', 'steps', 'seed')})
+        runs = int(params.get('runs') or values.pop('runs', 2) or 2)
+        values.pop('runs', None)
+        report['params'] = dict(values, runs=runs)
+        report['engine'] = spec.get('label')
+        t0 = time.time()
+        lay, env = comfy_install(base, spec, gpu, stop, progress, report)
+        # Contrôle à chaque essai (10 à 20 s) : version, carte et architecture vues par PyTorch
+        out = run_logged([lay['exe'], '-s', '-c', spec['torch']['check']], gpu.root / 'logs' / 'comfyui-install.log', env, 300, stop,
+                         what='contrôle de PyTorch')
+        line = ([l for l in out.splitlines() if l.startswith('TORCH ')] or [''])[-1].split(' ', 1)[-1]
+        report['torch'] = line[:300]
+        devices = []
+        for l in out.splitlines():
+            m = re.match(r'DEV (\d+) (\S+) (\d+) (.*)', l.strip())
+            if m:
+                devices.append({'index': int(m.group(1)), 'arch': m.group(2), 'memory_gb': round(int(m.group(3)) / 1e9, 1), 'name': m.group(4)[:80]})
+        report['torch_devices'] = devices
+        if ' True ' not in ' %s ' % line or not devices:
+            raise RuntimeError('PyTorch ROCm ne voit pas la carte : %s' % (line or out.strip()[-300:]))
+        # Un processeur AMD à graphique intégré est aussi vu par ROCm : ComfyUI calcule sur la carte qui a le plus de mémoire
+        card = max(devices, key=lambda d: d['memory_gb'])
+        if len(devices) > 1:
+            env['HIP_VISIBLE_DEVICES'] = str(card['index'])
+        report['torch_device'] = card
+        report['install_total_s'] = round(time.time() - t0, 1)
+        runs_out = comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report)
+        warm = runs_out[-1]
+        ref = (spec.get('reference') or {}).get('s_per_step')
+        report.update(ok=True, compute_s=warm.get('wall_s'), s_per_step=warm.get('s_per_step'), executed_s=warm.get('executed_s'),
+                      first_run_s=runs_out[0].get('wall_s'))
+        if ref and warm.get('s_per_step'):
+            report['reference'] = spec.get('reference')
+            report['speedup_vs_sdcpp'] = round(ref / warm['s_per_step'], 2)
+        if any((r.get('image') or {}).get('std', 1) < 2 for r in runs_out):
+            report.update(ok=False, error='image unie (noire ?) : calcul en fp16 tombé en NaN probable, voir log')
+        report['size_gb'] = round(folder_bytes(lay['root']) / 1e9, 1)
+    except JobLost as e:
+        report['error'] = 'annulé : %s' % e
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+        report['error'] = str(e)[:400]
+    raw = gpu.root / 'logs' / ('comfyui.log' if (gpu.root / 'logs' / 'comfyui.log').exists() and report.get('install_total_s') is not None
+                               else 'comfyui-install.log')
+    report['log_file'] = str(raw)
+    report['log'] = log_tail(raw)
+    if gpu.last_trace is not None:
+        report['engine_lines'] = gpu.last_trace.lines[-40:]
+    return report
+
+
+# Essais GPU : en local (--gpu-test, worker arrêté) ou demandés par le hub (ordre gpu_test, worker en marche, entre deux
+# travaux). Même code, même rapport (logs/gpu-test.json), remonté au hub dans le second cas.
+GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove')
+# Réglages que le hub peut poser sur cette machine (POST /api/reuse/workers/:nom/settings), avec leurs types. Aucun autre.
+REMOTE_SETTINGS = {'enable_3d': (bool,), 'gpu_max_gb': (int, float), 'gpu_keep_loaded_s': (int, float)}
+LOG_TAIL_LINES = 60
+
+
+def log_tail(path, lines=LOG_TAIL_LINES, width=300):
+    """Dernières lignes lisibles d'un journal de moteur (barres de progression et codes couleur retirés)."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 256 * 1024))
+            text = f.read().decode('utf-8', 'replace')
+    except OSError:
+        return []
+    out = []
+    for raw in re.split(r'[\r\n]+', text):
+        line = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw).strip()
+        if line:
+            out.append(line[:width])
+    return out[-lines:]
+
+
+def gpu_test_report(base, config, kind, params=None, input_path=None, stop=None, progress=None):
+    """Un essai, sans verrou (l'appelant garantit que rien d'autre ne calcule). -> rapport (dict). Ne lève pas."""
+    params = dict(params or {})
+    progress = progress or (lambda frac, stage: None)
+    config = {k: v for k, v in (config or {}).items() if k not in ('token', 'hub_url')}
+    report = {'ok': False, 'kind': kind, 'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+              'system': '%s %s %s' % (platform.system(), platform.release(), platform.machine())}
+    if kind in ('comfyui', 'comfyui_remove'):
+        return comfy_test_report(base, config, kind, params, stop, progress, report)
+    if kind == '3d':
+        config['enable_3d'] = True   # l'essai est justement là pour décider d'ouvrir la 3D
+    gpu = Gpu(base, config, Path(__file__).resolve().parent)
+    work = base / 'work' / 'gpu-test'
+    try:
+        spec = (gpu.catalog.get('types') or {}).get(kind)
+        if not spec:
+            raise RuntimeError('type %s absent du catalogue' % kind)
+        model = spec['default_model']
+        if kind == 'image':
+            values = {'width': 512, 'height': 512, 'steps': 8, 'cfg_scale': 1.0, 'seed': 42, 'sampler': 'euler', 'negative_prompt': ''}
+        else:
+            values = {'res': '512', 'steps': 12, 'seed': 42, 'texture': True}
+        values.update({k: v for k, v in params.items() if k in values})
+        job = {'kind': kind, 'model': model, 'params': values,
+               'prompt': 'a red ceramic teapot on a white table, studio photo' if spec.get('prompt') != 'none' else ''}
+        report['params'] = values
+        src = None
+        if spec.get('input') == 'required':
+            src = Path(input_path) if input_path else base / 'logs' / 'gpu-test.png'
+            if not src.exists() and not input_path:
+                # Pas d'image d'entrée : l'essai image la fabrique d'abord (même moteur que les travaux image)
+                progress(0.0, 'image d\'entrée (essai image 512)')
+                first = gpu_test_report(base, config, 'image', {}, None, stop, lambda f, st: progress(0.1 * f, 'image d\'entrée : ' + st))
+                report['input_image'] = {k: first.get(k) for k in ('ok', 'compute_s', 'error')}
+                if not first.get('ok'):
+                    raise RuntimeError('image d\'entrée ratée : %s' % first.get('error'))
+            if not src.exists():
+                raise RuntimeError('image d\'entrée introuvable : %s (lancer d\'abord l\'essai image, ou --gpu-input)' % src)
+        rmtree(work)
+        work.mkdir(parents=True)
+        out, compute_s, meta = gpu.run(job, src, work, stop, progress)
+        dest = base / 'logs' / ('gpu-test.' + out.suffix.lstrip('.'))
+        shutil.copyfile(out, dest)
+        report.update(ok=True, model=model, compute_s=round(compute_s, 1), output=str(dest), size=os.path.getsize(dest),
+                      sha256=sha256_file(dest), **meta)
+        if out.suffix == '.glb':
+            report['glb'] = glb_stats(dest)
+            if not (report['glb'] or {}).get('triangles'):
+                report.update(ok=False, error='GLB sans triangle : maillage vide (flux tombé en NaN ?), voir log')
+    except JobLost as e:
+        report['error'] = 'annulé : %s' % e
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+        report['error'] = str(e)[:400]
+    raw = gpu.root / 'logs' / ('server-image.log' if kind == 'image' and gpu.server else 'last-%s.log' % kind)
+    if not raw.exists():
+        raw = gpu.root / 'logs' / ('last-%s.log' % kind)
+    tail = log_tail(raw)
+    report['log_file'] = str(raw)
+    report['log'] = tail
+    # trellis.cpp v0.8.1 sur RDNA2 sans contournement : flux NaN mis à zéro en silence (#50). Toute ligne qui en parle est remontée.
+    report['nan_lines'] = [l for l in tail if re.search(r'nan', l, re.I)][:20]
+    if gpu.last_trace is not None:
+        report['engine_lines'] = gpu.last_trace.lines[-40:]
+    gpu.stop_server()   # l'essai ne laisse rien tourner derrière lui
+    rmtree(work)
+    return report
+
+
 def gpu_test(base, kind, input_path=None):
     """Essai d'une génération sans hub : installe (si besoin) et calcule une petite image, ou un modèle 3D à partir
-    d'une image (--gpu-input, sinon l'image de l'essai précédent). Le worker doit être arrêté (fichier STOP) :
-    jamais deux calculs sur la carte. Écrit logs/gpu-test.json et le résultat dans logs/gpu-test.<ext>."""
+    d'une image (--gpu-input, sinon l'image de l'essai précédent, sinon une image faite d'abord). Le worker doit être
+    arrêté (fichier STOP) : jamais deux calculs sur la carte. Écrit logs/gpu-test.json et le résultat dans logs/gpu-test.<ext>."""
     lock = open(base / '.worker.lock', 'a+')
     try:
         if IS_WINDOWS:
@@ -1990,38 +2702,8 @@ def gpu_test(base, kind, input_path=None):
         log.error('Le worker tourne : créer le fichier STOP dans %s, attendre son arrêt, puis relancer l\'essai.', base)
         return EXIT_NOT_READY
     config = read_json(base / 'reuse-worker.config.json', {}) or {}
-    config = {k: v for k, v in config.items() if k not in ('token', 'hub_url')}
-    if kind == '3d':
-        config.setdefault('enable_3d', True)   # l'essai est justement là pour décider d'ouvrir la 3D
-    gpu = Gpu(base, config, Path(__file__).resolve().parent)
-    report = {'ok': False, 'kind': kind, 'at': time.strftime('%Y-%m-%d %H:%M:%S'),
-              'system': '%s %s %s' % (platform.system(), platform.release(), platform.machine())}
-    work = base / 'work' / 'gpu-test'
-    try:
-        spec = (gpu.catalog.get('types') or {}).get(kind)
-        if not spec:
-            raise RuntimeError('type %s absent du catalogue' % kind)
-        model = spec['default_model']
-        params = {'width': 512, 'height': 512, 'steps': 8, 'cfg_scale': 1.0, 'seed': 42, 'sampler': 'euler', 'negative_prompt': ''} \
-            if kind == 'image' else {'res': '512', 'steps': 12, 'seed': 42, 'texture': True}
-        job = {'kind': kind, 'model': model, 'params': params,
-               'prompt': 'a red ceramic teapot on a white table, studio photo' if spec.get('prompt') != 'none' else ''}
-        src = None
-        if spec.get('input') == 'required':
-            src = Path(input_path) if input_path else base / 'logs' / 'gpu-test.png'
-            if not src.exists():
-                raise RuntimeError('image d\'entrée introuvable : %s (lancer d\'abord l\'essai image, ou --gpu-input)' % src)
-        rmtree(work)
-        work.mkdir(parents=True)
-        out, compute_s, meta = gpu.run(job, src, work, None, lambda f, st: None)
-        dest = base / 'logs' / ('gpu-test.' + out.suffix.lstrip('.'))
-        shutil.copyfile(out, dest)
-        report.update(ok=True, model=model, compute_s=round(compute_s, 1), output=str(dest), size=os.path.getsize(dest), **meta)
-    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
-        report['error'] = str(e)[:400]
-        report['log'] = str(gpu.root / 'logs' / ('last-%s.log' % kind))
-    gpu.stop_server()   # l'essai ne laisse rien tourner derrière lui
-    rmtree(work)
+    report = gpu_test_report(base, config, kind, None, input_path, None,
+                             lambda frac, stage: log.info('Essai %s : %s (%d %%)', kind, stage, round(100 * frac)))
     write_json(base / 'logs' / 'gpu-test.json', report)
     log.info('ESSAI GPU %s : %s', 'REUSSI' if report['ok'] else 'RATE', json.dumps(report, ensure_ascii=False))
     return 0 if report['ok'] else 1
@@ -2032,7 +2714,7 @@ def main():
     parser.add_argument('--base', required=True, help='dossier d\'installation (config, runtime, logs)')
     parser.add_argument('--launcher', help='script qui a lancé ce worker (mis à jour avec lui)')
     parser.add_argument('--crash-test', action='store_true', help='essai complet sans hub : installe, teste la carte, nettoie 10 s, écrit logs/crash-test.json')
-    parser.add_argument('--gpu-test', choices=('image', '3d'), help='essai de génération sans hub (worker arrêté) : logs/gpu-test.json')
+    parser.add_argument('--gpu-test', choices=GPU_TEST_KINDS, help='essai de génération sans hub (worker arrêté) : logs/gpu-test.json')
     parser.add_argument('--gpu-input', help='image d\'entrée de l\'essai 3D (défaut : logs/gpu-test.png)')
     args = parser.parse_args()
     base = Path(args.base).resolve()

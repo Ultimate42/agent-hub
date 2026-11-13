@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import sys
 import tarfile
@@ -513,6 +514,219 @@ class PrefetchTest(unittest.TestCase):
     def test_available_ram_is_a_number_or_none(self):
         v = w.available_ram()
         self.assertTrue(v is None or v > 0)
+
+def make_png(path, width, height, pixel=lambda x, y: (x * 7 + y * 13) % 256):
+    import zlib
+    rows = b''.join(b'\x00' + bytes(pixel(x, y) for x in range(width)) for y in range(height))
+    chunk = lambda kind, data: struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+    Path(path).write_bytes(w.PNG_MAGIC + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0))
+                           + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
+
+
+def make_glb(path, doc):
+    raw = json.dumps(doc).encode()
+    raw += b' ' * (-len(raw) % 4)
+    body = struct.pack('<I4s', len(raw), b'JSON') + raw
+    Path(path).write_bytes(b'glTF' + struct.pack('<II', 2, 12 + len(body)) + body)
+
+
+class GpuTestHelpersTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def test_glb_stats_counts_and_box(self):
+        p = self.dir / 'a.glb'
+        make_glb(p, {'asset': {'version': '2.0'}, 'images': [{}], 'materials': [{}],
+                     'meshes': [{'primitives': [{'attributes': {'POSITION': 0}, 'indices': 1}, {'attributes': {'POSITION': 2}}]}],
+                     'accessors': [{'count': 10, 'min': [-1, 0, 0], 'max': [1, 1, 1]}, {'count': 12}, {'count': 5, 'min': [0, 0, -2], 'max': [3, 1, 0]}]})
+        self.assertEqual(w.glb_stats(p), {'vertices': 15, 'triangles': 4, 'meshes': 1, 'textures': 1, 'materials': 1, 'bbox_size': [4, 1, 3]})
+        empty = self.dir / 'b.glb'
+        make_glb(empty, {'asset': {'version': '2.0'}})
+        self.assertEqual(w.glb_stats(empty)['triangles'], 0)
+        (self.dir / 'c.glb').write_bytes(b'not a glb')
+        self.assertIsNone(w.glb_stats(self.dir / 'c.glb'))
+
+    def test_png_stats_tell_a_flat_image(self):
+        make_png(self.dir / 'flat.png', 64, 64, lambda x, y: 0)
+        make_png(self.dir / 'busy.png', 64, 64)
+        self.assertLess(w.png_stats(self.dir / 'flat.png')['std'], 2)
+        self.assertGreater(w.png_stats(self.dir / 'busy.png')['std'], 20)
+        self.assertEqual(w.png_size(self.dir / 'busy.png'), (64, 64))
+
+    def test_log_tail_strips_bars_and_colours(self):
+        p = self.dir / 'x.log'
+        p.write_bytes(b'one\r\n\x1b[32mtwo\x1b[0m\r  |==>  | 1/8\r  |====>| 2/8\nthree\n' + b'\n'.join(b'l%d' % i for i in range(100)))
+        tail = w.log_tail(p, lines=5)
+        self.assertEqual(tail, ['l95', 'l96', 'l97', 'l98', 'l99'])
+        self.assertIn('two', w.log_tail(p, lines=200))
+        self.assertEqual(w.log_tail(self.dir / 'missing.log'), [])
+
+    def test_trellis_stages_are_followed(self):
+        t = w.EngineTrace()
+        t.feed(b'[1/7] preprocess\n[5/7] FlexiDualGrid shape decode -> mesh @res512\n')
+        self.assertEqual(t.stage(), '5/7 FlexiDualGrid shape decode -> mesh @res512')
+        self.assertAlmostEqual(t.progress, 0.3 + 0.65 * 4 / 7, places=3)
+        self.assertTrue(any('[5/7]' in l for l in t.lines))
+
+
+class ComfyTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.spec = w.comfy_spec()
+
+    def test_catalog_entry_is_pinned(self):
+        s = self.spec
+        for part in ('python', 'pip', 'setuptools', 'source'):
+            self.assertRegex(s[part]['sha256'], r'^[0-9a-f]{64}$')
+            self.assertTrue(s[part]['url'].startswith('https://'))
+        self.assertTrue(all(re.search(r'==\d', p) for p in s['torch']['packages']), 'torch pinned to an exact version')
+        self.assertTrue(all('/resolve/' in f['url'] and re.search(r'/resolve/[0-9a-f]{40}/', f['url']) for f in s['files']), 'models pinned to a commit')
+        self.assertIn('127.0.0.1', s['args'])
+        self.assertNotIn('0.0.0.0', s['args'])
+
+    def test_pth_gets_comfyui_and_site(self):
+        py = self.dir / 'python'
+        py.mkdir()
+        (py / 'python313._pth').write_text('python313.zip\n.\n\n# Uncomment to run site.main() automatically\n#import site\n')
+        w.write_pth(py, self.dir / 'ComfyUI-0.45.0')
+        self.assertEqual((py / 'python313._pth').read_text().split('\n')[:4], ['python313.zip', '.', os.path.join('..', 'ComfyUI-0.45.0'), 'import site'])
+        w.write_pth(py, self.dir / 'ComfyUI-0.45.0')   # deux fois : pas de doublon
+        self.assertEqual((py / 'python313._pth').read_text().count('ComfyUI'), 1)
+
+    def test_workflow_values_replace_whole_items_only(self):
+        wf = w.comfy_workflow(self.spec, {'prompt': 'a {width} teapot', 'width': 768, 'height': 512, 'steps': 4, 'seed': 7})
+        self.assertEqual(wf['57:13']['inputs']['width'], 768)
+        self.assertEqual(wf['57:3']['inputs']['steps'], 4)
+        self.assertEqual(wf['57:27']['inputs']['text'], 'a {width} teapot', 'a value is never re-read as a template')
+        self.assertEqual(wf['57:3']['inputs']['model'], ['57:11', 0])
+        with self.assertRaises(RuntimeError):
+            w.comfy_workflow(self.spec, {'prompt': 'x'})
+
+    def test_tqdm_and_execution_time(self):
+        t = w.ComfyTrace(8)
+        t.feed(b' 25%|##5       | 2/8 [00:26<01:19, 13.25s/it]\r 38%|###8      | 3/8 [00:39<01:06, 13.31s/it]\r')
+        t.feed(b'\nRequested to load ZImage\nloaded partially; 11800.00 MB usable\nPrompt executed in 131.52 seconds\n')
+        self.assertEqual(t.step, 3)
+        self.assertEqual(t.summary()['s_per_step'], 13.31)
+        self.assertEqual(t.summary()['executed_s'], 131.5)
+        self.assertTrue(any('loaded partially' in l for l in t.lines))
+
+    def test_disk_cap_refuses_before_any_download(self):
+        base = self.dir
+        (base / 'logs').mkdir()
+        report = w.comfy_test_report(base, {'gpu_max_gb': 1}, 'comfyui', {}, None, lambda f, s: None, {'ok': False})
+        self.assertFalse(report['ok'])
+        self.assertIn('plafonné', report['error'])
+        self.assertGreater(report['disk']['need_gb'], 20)
+        self.assertFalse((base / 'gpu' / 'comfyui' / 'downloads').exists(), 'nothing downloaded')
+
+    def test_remove_takes_everything_away(self):
+        root = self.dir / 'gpu' / 'comfyui'
+        (root / 'data' / 'models').mkdir(parents=True)
+        (root / 'data' / 'models' / 'x.safetensors').write_bytes(b'x' * 1000)
+        report = w.comfy_test_report(self.dir, {}, 'comfyui_remove', {}, None, None, {'ok': False})
+        self.assertTrue(report['ok'])
+        self.assertFalse(root.exists())
+        self.assertTrue((self.dir / 'gpu').exists(), 'only the ComfyUI folder')
+
+
+FAKE_COMFY = r'''
+import http.server, json, os, struct, sys, threading, time, zlib
+a = sys.argv[1:]
+port, base = int(a[a.index('--port') + 1]), a[a.index('--base-directory') + 1]
+assert '127.0.0.1' == a[a.index('--listen') + 1]
+history = {}
+print('Total VRAM 16368 MB, total RAM 32000 MB', flush=True)
+print('pytorch version: 2.13.0+rocm10.0.0', flush=True)
+print('HIP_VISIBLE_DEVICES %s TEMP %s' % (os.environ.get('HIP_VISIBLE_DEVICES'), os.environ.get('TEMP')), flush=True)
+def png(path, w, h):
+    rows = b''.join(b'\x00' + bytes((x * 7 + y * 13 + len(history)) % 256 for x in range(w)) for y in range(h))
+    c = lambda k, d: struct.pack('>I', len(d)) + k + d + struct.pack('>I', zlib.crc32(k + d))
+    open(path, 'wb').write(b'\x89PNG\r\n\x1a\n' + c(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 0, 0, 0, 0)) + c(b'IDAT', zlib.compress(rows)) + c(b'IEND', b''))
+def run(pid, wf):
+    steps = wf['57:3']['inputs']['steps']
+    for i in range(1, steps + 1):
+        print(' %3d%%|###   | %d/%d [00:01<00:02,  0.05s/it]' % (100 * i // steps, i, steps), end='\r', flush=True)
+        time.sleep(0.05)
+    print('\nPrompt executed in 0.42 seconds', flush=True)
+    lat = wf['57:13']['inputs']
+    os.makedirs(os.path.join(base, 'output'), exist_ok=True)
+    name = 'bench_%05d_.png' % (len(history) + 1)
+    png(os.path.join(base, 'output', name), lat['width'], lat['height'])
+    history[pid] = {'status': {'status_str': 'success', 'completed': True, 'messages': []},
+                    'outputs': {'9': {'images': [{'filename': name, 'subfolder': '', 'type': 'output'}]}}}
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *x):
+        pass
+    def answer(self, code, body):
+        out = json.dumps(body).encode()
+        self.send_response(code); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(out)))
+        self.end_headers(); self.wfile.write(out)
+    def do_GET(self):
+        if self.path == '/system_stats':
+            return self.answer(200, {'system': {'comfyui_version': '0.45.0', 'pytorch_version': '2.13.0+rocm10.0.0', 'python_version': sys.version, 'os': 'nt'},
+                                     'devices': [{'name': 'cuda:0 AMD Radeon RX 6950 XT : native', 'type': 'cuda', 'vram_total': 17163091968, 'vram_free': 16000000000}]})
+        pid = self.path.rsplit('/', 1)[-1]
+        return self.answer(200, {pid: history[pid]} if pid in history else {})
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        pid = 'p%d' % (len(history) + 100)
+        threading.Thread(target=run, args=(pid, body['prompt'])).start()
+        return self.answer(200, {'prompt_id': pid, 'number': 1})
+time.sleep(0.5)
+print('Starting server', flush=True)
+http.server.ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
+'''
+
+
+class ComfyBenchTest(unittest.TestCase):
+    """Le banc complet (lancement, workflow, mesures, image vérifiée, arrêt) contre un faux ComfyUI : l'installation est
+    marquée faite, le Python est celui des tests."""
+    def test_bench_measures_each_run_and_stops_comfyui(self):
+        base = Path(tempfile.mkdtemp())
+        (base / 'logs').mkdir()
+        spec = json.loads(json.dumps(w.comfy_spec()))
+        spec['torch']['check'] = ("print('TORCH 2.13.0+rocm10.0.0 7.1 True 2'); print('DEV 0 gfx1036 2147483648 AMD Radeon(TM) Graphics'); "
+                                  "print('DEV 1 gfx1030 17163091968 AMD Radeon RX 6950 XT')")
+        lay = w.comfy_layout(base, spec)
+        lay['exe'].parent.mkdir(parents=True)
+        os.symlink(sys.executable, lay['exe'])
+        lay['src'].mkdir(parents=True)
+        (lay['src'] / 'main.py').write_text(FAKE_COMFY)
+        for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+            (lay['root'] / ('.ok-' + step)).write_text(w.comfy_marker(spec, step))
+        for f in spec['files']:
+            dest = lay['data'] / 'models' / f['dir'] / f['name']
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b'fake')
+            st = dest.stat()
+            Path(str(dest) + '.ok').write_text('%s %d %d' % (f['sha256'], st.st_size, st.st_mtime_ns))
+        stages = []
+        orig = w.comfy_spec
+        w.comfy_spec = lambda app=None: spec
+        try:
+            report = w.comfy_test_report(base, {'gpu_keep_free_gb': 0}, 'comfyui', {'width': 256, 'height': 192, 'steps': 4, 'runs': 2},
+                                         None, lambda f, s: stages.append(s), {'ok': False})
+        finally:
+            w.comfy_spec = orig
+        self.assertTrue(report['ok'], json.dumps(report, ensure_ascii=False)[:1500])
+        self.assertEqual(len(report['runs']), 2)
+        self.assertEqual([r['seed'] for r in report['runs']], [42, 43], 'another seed each run (ComfyUI would serve its cache)')
+        self.assertEqual(report['runs'][1]['executed_s'], 0.4)
+        self.assertEqual(report['s_per_step'], 0.05)
+        self.assertEqual(report['speedup_vs_sdcpp'], round(13.2 / 0.05, 2))
+        self.assertEqual(report['torch'], '2.13.0+rocm10.0.0 7.1 True 2')
+        self.assertEqual(report['torch_device'], {'index': 1, 'arch': 'gfx1030', 'memory_gb': 17.2, 'name': 'AMD Radeon RX 6950 XT'},
+                         'integrated graphics seen too: the dedicated card is the one used')
+        self.assertEqual(report['device']['name'], 'cuda:0 AMD Radeon RX 6950 XT : native')
+        self.assertGreater(report['runs'][0]['image']['std'], 2)
+        self.assertTrue((base / 'logs' / 'gpu-test-comfyui-2.png').exists())
+        self.assertEqual(report['output'], str(base / 'logs' / 'gpu-test-comfyui-2.png'), 'the image sent to the hub')
+        self.assertFalse(lay['pid'].exists(), 'ComfyUI stopped, card given back')
+        self.assertTrue(any('passage 2/2' in s for s in stages))
+        self.assertTrue(any('Prompt executed' in l for l in report['log']))
+        self.assertTrue(any(l == 'HIP_VISIBLE_DEVICES 1 TEMP %s' % lay['tmp'] for l in report['log']), report['log'][:5])
+
 
 if __name__ == '__main__':
     w.log.addHandler(__import__('logging').NullHandler())

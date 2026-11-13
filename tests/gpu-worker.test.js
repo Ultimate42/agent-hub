@@ -93,7 +93,13 @@ a = sys.argv[1:]
 with open(os.environ['FAKE_GPU_LOG'], 'a') as f:
     f.write(json.dumps({'engine': 'trellis', 'args': a, 'env': os.environ.get('GGML_VK_DISABLE_INTEGER_DOT_PRODUCT'),
                         'models': sorted(os.listdir(a[a.index('--models') + 1]))}) + '\\n')
-body = b'{"asset":{"version":"2.0"}}  ' + open(a[0], 'rb').read()[:16]
+assert open(a[0], 'rb').read(8) == b'\\x89PNG\\r\\n\\x1a\\n', 'input is a PNG'
+for i, stage in enumerate(('preprocess', 'DINOv3 conditioning', 'sparse structure flow', 'shape flow', 'FlexiDualGrid shape decode -> mesh', 'texture', 'GLB export'), 1):
+    print('[%d/7] %s' % (i, stage), flush=True)
+doc = json.dumps({'asset': {'version': '2.0'}, 'meshes': [{'primitives': [{'attributes': {'POSITION': 0}, 'indices': 1}]}],
+                  'accessors': [{'count': 4, 'min': [0, 0, 0], 'max': [1, 2, 0.5]}, {'count': 6}]}).encode()
+doc += b' ' * (-len(doc) % 4)
+body = struct.pack('<I4s', len(doc), b'JSON') + doc
 with open(a[1], 'wb') as f:
     f.write(b'glTF' + struct.pack('<II', 2, 12 + len(body)) + body)
 `;
@@ -334,6 +340,45 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.strictEqual(run.args[run.args.indexOf('--res') + 1], '512');
     assert.ok(run.models.includes('ss_flow.gguf') && run.models.includes('dinov3.gguf'));
     assert.ok(!run.models.some(n => n.endsWith('.part')));
+  });
+
+  test('settings from the hub: 3d switched off then back to the config file, without touching the PC', async () => {
+    const announced = async () => (await admin('/api/reuse/workers')).workers.find(v => v.name === 'gpu-box').info.gpu;
+    const set = await admin('/api/reuse/workers/gpu-box/settings', { method: 'POST', body: JSON.stringify({ enable_3d: false }) });
+    assert.deepStrictEqual(set.settings, { enable_3d: false });
+    await until('3d no longer announced', async () => (await announced()) === 'image');
+    await admin('/api/reuse/workers/gpu-box/settings', { method: 'POST', body: JSON.stringify({ enable_3d: null }) });
+    await until('3d announced again (config file)', async () => (await announced()) === '3d,image');
+    assert.match(fs.readFileSync(path.join(pc, 'logs', 'worker.log'), 'utf8'), /Réglages du hub appliqués \(enable_3d : True -> False\)/);
+  });
+
+  test('remote GPU test: 3d ordered by the admin, image made first, report with GLB figures readable on the hub', async () => {
+    fs.rmSync(path.join(pc, 'logs', 'gpu-test.png'), { force: true });
+    const asked = await admin('/api/reuse/workers/gpu-box/tests', { method: 'POST', body: JSON.stringify({ kind: '3d', params: { steps: 6 } }) });
+    assert.strictEqual(asked.test.status, 'pending', JSON.stringify(asked));
+    assert.strictEqual(asked.warning, undefined, 'this worker announces remote tests');
+    const t = await until('test finished', async () => {
+      const r = await admin(`/api/reuse/workers/gpu-box/tests/${asked.test.id}`);
+      return ['done', 'failed'].includes(r.test.status) && r.test;
+    });
+    assert.strictEqual(t.status, 'done', JSON.stringify(t));
+    assert.strictEqual(t.result.input_image.ok, true, 'no input image: the image test ran first');
+    assert.deepStrictEqual(t.result.glb, { vertices: 4, triangles: 2, meshes: 1, textures: 0, materials: 0, bbox_size: [1, 2, 0.5] });
+    assert.strictEqual(t.result.params.steps, 6);
+    assert.ok(t.result.compute_s >= 0);
+    assert.ok(t.result.log.some(l => l.includes('[7/7] GLB export')), JSON.stringify(t.result.log));
+    assert.deepStrictEqual(t.result.nan_lines, []);
+    const run = runs().filter(r => r.engine === 'trellis').at(-1);
+    assert.strictEqual(run.args[run.args.indexOf('--steps') + 1], '6');
+    assert.strictEqual(run.env, '1', 'RDNA2 workaround passed to the test too');
+    assert.ok(fs.existsSync(path.join(pc, 'logs', 'gpu-test.glb')));
+    // The GLB itself, to look at: on the hub, same bytes as on the PC
+    assert.strictEqual(t.output.ext, 'glb');
+    assert.strictEqual(t.result.output_sent, true);
+    const glb = await admin(t.output.url, { raw: true });
+    assert.ok(glb.equals(fs.readFileSync(path.join(pc, 'logs', 'gpu-test.glb'))));
+    const history = (await admin('/api/reuse/workers/gpu-box/settings')).history.map(e => e.what);
+    assert.deepStrictEqual(history.slice(0, 3), ['test_finished', 'test_started', 'test_requested']);
   });
 
   test('RE-USE still works on the same worker', async () => {
