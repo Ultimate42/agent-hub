@@ -381,6 +381,21 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.deepStrictEqual(history.slice(0, 3), ['test_finished', 'test_started', 'test_requested']);
   });
 
+  test('remote 3d test with the object image published with the worker: no image engine needed', async () => {
+    fs.copyFileSync(path.join(SRC, 'gpu-test-object.png'), path.join(publish, 'gpu-test-object.png'));
+    await until('worker took the version with the object image', async () => fs.existsSync(path.join(pc, 'app', 'gpu-test-object.png')), 90);
+    const before = runs().filter(r => r.engine.startsWith('sd')).length;
+    const asked = await admin('/api/reuse/workers/gpu-box/tests', { method: 'POST', body: JSON.stringify({ kind: '3d' }) });
+    const t = await until('test finished', async () => {
+      const r = await admin(`/api/reuse/workers/gpu-box/tests/${asked.test.id}`);
+      return ['done', 'failed'].includes(r.test.status) && r.test;
+    }, 90);
+    assert.strictEqual(t.status, 'done', JSON.stringify(t));
+    assert.strictEqual(t.result.input, 'gpu-test-object.png');
+    assert.strictEqual(t.result.input_image, undefined);
+    assert.strictEqual(runs().filter(r => r.engine.startsWith('sd')).length, before, 'the image engine was not started');
+  });
+
   test('RE-USE still works on the same worker', async () => {
     assert.strictEqual(spawnSync('ffmpeg', ['-v', 'error', '-nostdin', '-f', 'lavfi', '-i', 'sine=frequency=300:duration=2.5',
       '-ac', '1', '-ar', '24000', '-c:a', 'flac', path.join(tmp, 'in.flac')]).status, 0);

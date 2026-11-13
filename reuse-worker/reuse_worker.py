@@ -2037,8 +2037,11 @@ class Worker:
                 except OSError:
                     pass
         threading.Thread(target=beat, daemon=True).start()
+        # 3D : image d'objet livrée avec le worker (tasse rendue maison, sans licence tierce) : l'essai ne dépend pas du moteur image
+        bundled = self.app / GPU_TEST_OBJECT
         try:
-            report = gpu_test_report(self.base, dict(self.config), kind, test.get('params') or {}, None, stop, progress)
+            report = gpu_test_report(self.base, dict(self.config), kind, test.get('params') or {},
+                                     bundled if kind == '3d' and bundled.exists() else None, stop, progress)
         finally:
             finished.set()
         report['test_id'] = tid
@@ -2595,6 +2598,7 @@ def comfy_test_report(base, config, kind, params, stop, progress, report):
 # Essais GPU : en local (--gpu-test, worker arrêté) ou demandés par le hub (ordre gpu_test, worker en marche, entre deux
 # travaux). Même code, même rapport (logs/gpu-test.json), remonté au hub dans le second cas.
 GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove')
+GPU_TEST_OBJECT = 'gpu-test-object.png'   # entrée de l'essai 3D demandé par le hub (512x512, fond blanc)
 # Réglages que le hub peut poser sur cette machine (POST /api/reuse/workers/:nom/settings), avec leurs types. Aucun autre.
 REMOTE_SETTINGS = {'enable_3d': (bool,), 'gpu_max_gb': (int, float), 'gpu_keep_loaded_s': (int, float)}
 LOG_TAIL_LINES = 60
@@ -2644,6 +2648,8 @@ def gpu_test_report(base, config, kind, params=None, input_path=None, stop=None,
                'prompt': 'a red ceramic teapot on a white table, studio photo' if spec.get('prompt') != 'none' else ''}
         report['params'] = values
         src = None
+        if input_path:
+            report['input'] = Path(input_path).name
         if spec.get('input') == 'required':
             src = Path(input_path) if input_path else base / 'logs' / 'gpu-test.png'
             if not src.exists() and not input_path:
