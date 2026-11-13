@@ -209,7 +209,12 @@ Ce que fait un essai :
   - `comfyui` (width, height, steps, seed, runs) ;
   - `comfyui_remove`.
 - Le worker le lance entre deux travaux, dans son créneau horaire et hors pause. Il n'y a qu'un essai ouvert à la fois
-  par machine. Tant qu'un essai attend, la machine ne reçoit pas de nouveau travail.
+  par machine. Tant qu'un essai attend, la machine ne reçoit pas de nouveau travail, mais seulement si sa version
+  annonce ce type d'essai (`info.tests`). Sinon elle continue ses travaux, et le `warning` du test dit pourquoi il attend.
+- L'essai s'arrête dans les 20 s environ dans trois cas : pause, fin du créneau, fichier `STOP` sur le PC. Le moteur
+  est arrêté et la carte rendue. Le rapport partiel reste lisible : statut `cancelled`, raison dans `error`.
+  Ce qui est installé ou téléchargé reste en place : l'essai suivant reprend là où celui-ci s'est arrêté
+  (téléchargements repris, étapes d'installation déjà faites sautées).
 - Pendant l'essai, le worker envoie son étape toutes les 20 s.
 - Un essai devient un échec dans deux cas :
   - plus de nouvelles pendant 15 minutes (worker redémarré) ;

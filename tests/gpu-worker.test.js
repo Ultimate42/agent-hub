@@ -88,12 +88,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(('127.0.0.1', int(opt('--listen-port'))), Handler).serve_forever()
 `;
 const FAKE_TRELLIS = `#!/usr/bin/env python3
-import json, os, struct, sys
+import json, os, struct, sys, time
 a = sys.argv[1:]
 with open(os.environ['FAKE_GPU_LOG'], 'a') as f:
     f.write(json.dumps({'engine': 'trellis', 'args': a, 'env': os.environ.get('GGML_VK_DISABLE_INTEGER_DOT_PRODUCT'),
                         'models': sorted(os.listdir(a[a.index('--models') + 1]))}) + '\\n')
 assert open(a[0], 'rb').read(8) == b'\\x89PNG\\r\\n\\x1a\\n', 'input is a PNG'
+if os.path.exists(os.environ['FAKE_GPU_LOG'] + '.trellis-slow'):
+    with open(os.environ['FAKE_GPU_LOG'], 'a') as f:
+        f.write(json.dumps({'engine': 'trellis-slow', 'pid': os.getpid()}) + '\\n')
+    print('[1/7] preprocess', flush=True)
+    time.sleep(120)
 for i, stage in enumerate(('preprocess', 'DINOv3 conditioning', 'sparse structure flow', 'shape flow', 'FlexiDualGrid shape decode -> mesh', 'texture', 'GLB export'), 1):
     print('[%d/7] %s' % (i, stage), flush=True)
 doc = json.dumps({'asset': {'version': '2.0'}, 'meshes': [{'primitives': [{'attributes': {'POSITION': 0}, 'indices': 1}]}],
@@ -394,6 +399,23 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.strictEqual(t.result.input, 'gpu-test-object.png');
     assert.strictEqual(t.result.input_image, undefined);
     assert.strictEqual(runs().filter(r => r.engine.startsWith('sd')).length, before, 'the image engine was not started');
+  });
+
+  test('remote test stopped when the machine is paused: engine killed within 30 s, partial report kept, next test runs', async () => {
+    fs.writeFileSync(`${fakeLog}.trellis-slow`, '');
+    const asked = await admin('/api/reuse/workers/gpu-box/tests', { method: 'POST', body: JSON.stringify({ kind: '3d' }) });
+    const slow = await until('engine computing', async () => runs().find(r => r.engine === 'trellis-slow'), 60);
+    await admin('/api/reuse/workers/gpu-box/order', { method: 'POST', body: JSON.stringify({ pause: true }) });
+    const t = await until('test stopped', async () => {
+      const r = await admin(`/api/reuse/workers/gpu-box/tests/${asked.test.id}`);
+      return r.test.status === 'cancelled' && r.test.result && r.test;
+    }, 45);
+    assert.match(t.error, /stopped: paused by the admin/);
+    assert.match(t.result.error, /annulé/);
+    assert.match(t.result.stopped, /paused/);
+    await until('engine killed', async () => !alive(slow.pid), 15);
+    fs.rmSync(`${fakeLog}.trellis-slow`);
+    await admin('/api/reuse/workers/gpu-box/order', { method: 'POST', body: JSON.stringify({ pause: false }) });
   });
 
   test('RE-USE still works on the same worker', async () => {

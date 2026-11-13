@@ -592,6 +592,18 @@ class ComfyTest(unittest.TestCase):
         self.assertEqual((py / 'python313._pth').read_text().split('\n')[:4], ['python313.zip', '.', os.path.join('..', 'ComfyUI-0.45.0'), 'import site'])
         w.write_pth(py, self.dir / 'ComfyUI-0.45.0')   # deux fois : pas de doublon
         self.assertEqual((py / 'python313._pth').read_text().count('ComfyUI'), 1)
+        w.write_pth(py, self.dir / 'ComfyUI-0.46.0')   # nouvelle version du catalogue : l'ancien dossier disparaît
+        self.assertEqual((py / 'python313._pth').read_text().split('\n')[:4], ['python313.zip', '.', os.path.join('..', 'ComfyUI-0.46.0'), 'import site'])
+
+    def test_markers_follow_python_and_comfyui_versions(self):
+        spec = json.loads(json.dumps(self.spec))
+        before = {s: w.comfy_marker(spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')}
+        spec['python']['sha256'] = '0' * 64
+        after = {s: w.comfy_marker(spec, s) for s in before}
+        self.assertEqual([s for s in before if before[s] != after[s]], ['python', 'pip', 'torch', 'requirements'], 'site-packages redone')
+        spec2 = json.loads(json.dumps(self.spec))
+        spec2['source']['sha256'] = '1' * 64
+        self.assertEqual([s for s in before if before[s] != w.comfy_marker(spec2, s)], ['source', 'requirements'])
 
     def test_workflow_values_replace_whole_items_only(self):
         wf = w.comfy_workflow(self.spec, {'prompt': 'a {width} teapot', 'width': 768, 'height': 512, 'steps': 4, 'seed': 7})
@@ -682,6 +694,41 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
 class ComfyBenchTest(unittest.TestCase):
     """Le banc complet (lancement, workflow, mesures, image vérifiée, arrêt) contre un faux ComfyUI : l'installation est
     marquée faite, le Python est celui des tests."""
+    def test_stopped_mid_bench_comfyui_is_killed_and_the_reason_kept(self):
+        import threading as th
+        stop = th.Event()
+        base, lay, report = self.bench({'steps': 4, 'runs': 3}, stop, lambda f, s: stop.set() if 'passage 2/3' in s else None)
+        self.assertFalse(report['ok'])
+        self.assertIn('annulé', report['error'])
+        self.assertFalse(lay['pid'].exists(), 'ComfyUI stopped, card given back')
+        self.assertFalse((base / 'logs' / 'gpu-test-comfyui-3.png').exists())
+        self.assertTrue(all((lay['root'] / ('.ok-' + s)).exists() for s in ('python', 'torch')), 'installation kept for the next test')
+
+    def bench(self, params, stop, progress):
+        base = Path(tempfile.mkdtemp())
+        (base / 'logs').mkdir()
+        spec = json.loads(json.dumps(w.comfy_spec()))
+        spec['torch']['check'] = "print('TORCH 2.13.0+rocm10.0.0 7.1 True 1'); print('DEV 0 gfx1030 17163091968 AMD Radeon RX 6950 XT')"
+        lay = w.comfy_layout(base, spec)
+        lay['exe'].parent.mkdir(parents=True)
+        os.symlink(sys.executable, lay['exe'])
+        lay['src'].mkdir(parents=True)
+        (lay['src'] / 'main.py').write_text(FAKE_COMFY)
+        for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+            (lay['root'] / ('.ok-' + step)).write_text(w.comfy_marker(spec, step))
+        for f in spec['files']:
+            dest = lay['data'] / 'models' / f['dir'] / f['name']
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b'fake')
+            st = dest.stat()
+            Path(str(dest) + '.ok').write_text('%s %d %d' % (f['sha256'], st.st_size, st.st_mtime_ns))
+        orig = w.comfy_spec
+        w.comfy_spec = lambda app=None: spec
+        try:
+            return base, lay, w.comfy_test_report(base, {'gpu_keep_free_gb': 0}, 'comfyui', params, stop, progress, {'ok': False})
+        finally:
+            w.comfy_spec = orig
+
     def test_bench_measures_each_run_and_stops_comfyui(self):
         base = Path(tempfile.mkdtemp())
         (base / 'logs').mkdir()

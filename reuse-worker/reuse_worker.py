@@ -2006,10 +2006,13 @@ class Worker:
         route = '/api/reuse/worker/tests/%d' % tid
         now = {'progress': 0.0, 'stage': 'préparation'}
         stop, finished = threading.Event(), threading.Event()
+        why = {}
 
         def post(body, timeout=30):
             status, answer = self.hub.request('POST', route, body=body, timeout=timeout)
             if status in (404, 409) or (status == 200 and (answer or {}).get('cancel')):
+                # Annulé, pause, fin du créneau : arrêt ; installé et téléchargé restent, l'essai suivant reprend là
+                why.setdefault('reason', (answer or {}).get('reason') or (answer or {}).get('error') or 'annulé par le hub')
                 stop.set()
             return status
 
@@ -2032,6 +2035,9 @@ class Worker:
 
         def beat():
             while not finished.wait(20):
+                if (self.base / 'STOP').exists():   # arrêt du worker demandé sur le PC : l'essai s'arrête aussi
+                    why.setdefault('reason', 'fichier STOP sur le PC')
+                    stop.set()
                 try:
                     post({'status': 'running', 'stage': now['stage'], 'progress': now['progress'], 'info': self.info()})
                 except OSError:
@@ -2048,7 +2054,8 @@ class Worker:
         write_json(self.base / 'logs' / 'gpu-test.json', report)
         log.info('ESSAI GPU %d %s : %s', tid, 'REUSSI' if report.get('ok') else 'RATE', json.dumps(report, ensure_ascii=False)[:2000])
         if stop.is_set() and not report.get('ok'):
-            report.setdefault('error', 'annulé par le hub')
+            report['stopped'] = why.get('reason', 'annulé')
+            report.setdefault('error', 'annulé : %s' % report['stopped'])
         out = Path(report['output']) if report.get('output') else None
         if out is not None and out.suffix in ('.png', '.glb') and out.exists() and out.stat().st_size <= (96 << 20):
             try:   # le fichier lui-même (image, GLB), pour le regarder : avant le rapport final, le hub le rattache à l'essai
@@ -2151,8 +2158,9 @@ def comfy_layout(base, spec):
 
 def comfy_marker(spec, step):
     """Témoin d'une étape d'installation : change avec ce que le catalogue épingle pour elle (nouvelle version = refaite)."""
-    part = {'python': spec['python'], 'pip': [spec['pip'], spec.get('setuptools')], 'source': spec['source'], 'torch': spec['torch'],
-            'requirements': [spec['source'], spec['torch']]}[step]
+    # Tout ce qui vit dans site-packages dépend du Python : une autre version de Python refait pip, torch et les dépendances
+    part = {'python': spec['python'], 'pip': [spec['python'], spec['pip'], spec.get('setuptools')], 'source': spec['source'],
+            'torch': [spec['python'], spec['torch']], 'requirements': [spec['python'], spec['source'], spec['torch']]}[step]
     return hashlib.sha256(json.dumps(part, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -2184,8 +2192,9 @@ def write_pth(python_dir, src_dir):
         raise RuntimeError('Python embarqué sans fichier ._pth')
     pth = pths[0]
     lines = [l.strip() for l in pth.read_text().splitlines() if l.strip() and not l.strip().startswith('#')]
-    lines = [l for l in lines if l != 'import site']
     rel = os.path.relpath(str(src_dir), str(python_dir))
+    # « import site » remis à la fin ; le dossier d'une autre version de ComfyUI retiré
+    lines = [l for l in lines if l != 'import site' and not (os.path.basename(l.rstrip('/\\')).startswith('ComfyUI-') and l != rel)]
     if rel not in lines:
         lines.append(rel)
     pth.write_text('\n'.join(lines + ['import site']) + '\n')
@@ -2311,9 +2320,14 @@ def comfy_install(base, spec, gpu, stop, progress, report):
     py = lay['exe']
     timings = report.setdefault('install_s', {})
 
+    def check_stop():
+        if stop is not None and stop.is_set():
+            raise JobLost('installation interrompue (reprise au prochain essai)')
+
     def step(name, frac, label, fn):
         if comfy_done(lay, spec, name):
             return
+        check_stop()
         progress(frac, label)
         t0 = time.time()
         fn()
@@ -2338,10 +2352,14 @@ def comfy_install(base, spec, gpu, stop, progress, report):
 
     def source():
         archive = download(spec['source']['url'], lay['downloads'] / ('comfyui-' + spec['source']['sha256'][:12] + '.zip'), spec['source']['sha256'], 'ComfyUI')
+        for old in lay['root'].glob('ComfyUI-*'):   # version précédente du catalogue
+            rmtree(old)
         rmtree(lay['src'])
         safe_extract(archive, lay['root'])
         if not (lay['src'] / 'main.py').exists():
             raise RuntimeError('archive ComfyUI sans %s/main.py' % spec['source']['root'])
+        if lay['python'].exists():
+            write_pth(lay['python'], lay['src'])   # le ._pth du Python pointe vers le dossier de cette version
 
     def torch():
         # Sans isolation de construction : le paquet « rocm » (source seulement) se construit avec le setuptools déjà installé
@@ -2364,6 +2382,7 @@ def comfy_install(base, spec, gpu, stop, progress, report):
     total = float(sum(int(f['size']) for f in files)) or 1.0
     done = 0.0
     for f in files:
+        check_stop()
         dest = lay['data'] / 'models' / f['dir'] / f['name']
         mark = Path(str(dest) + '.ok')
         reuse = gpu.root / 'models' / f['reuse'] if f.get('reuse') else None
