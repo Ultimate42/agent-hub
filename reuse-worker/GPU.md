@@ -52,12 +52,50 @@ effacés du hub 72 h après la fin.
 
 Un type qu'aucune machine ne propose est refusé tout de suite (409), pour ne pas attendre pour rien.
 
+## FLUX 3 Image Klein : texte et images de référence
+
+Même route, même suivi. On ajoute `"model": "flux3-klein"` et, si on veut, `references`, une liste d'images en base64.
+
+```bash
+jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", size:"1024x1024",
+  prompt:"The red mug from the first image on a rustic oak kitchen table by a window, soft morning light, steam rising, photo.",
+  references:[$r]}' | curl -H "$A" -H 'Content-Type: application/json' -d @- "$H/api/gpu/jobs"
+```
+
+- `references` :
+  - de 0 à 4 images, PNG ou JPEG, de 4 Mo au plus chacune. ComfyUI les ramène à 1 mégapixel (lanczos), on peut donc
+    envoyer la photo telle quelle ;
+  - le modèle en accepte jusqu'à 10. On s'arrête à 4 : chaque référence ajoute environ 4 000 jetons d'image au calcul
+    de chaque étape, sur une carte de 16 Go déjà pleine aux trois quarts avec les poids ;
+  - dans le prompt, on les cite dans l'ordre : « the first image », « the second image »…
+  - les références passent par le mécanisme natif de Klein (nœud ReferenceMultiLatent, workflow de référence de BFL),
+    pas par l'image vers image. `image` est refusé pour ce modèle.
+- Le prompt : écrire une description complète de la scène, en anglais, comme une légende détaillée. Le hub n'ajoute pas
+  l'agrandisseur de prompt de BFL (Qwen3.5 9B, 18,8 Go), qui ne tiendrait ni sur la carte ni dans le plafond du dossier.
+  Un prompt court donne une image générique.
+- Taille : 1024x1024 conseillé, et 1248 au plus pour du carré. Largeur et hauteur vont de 256 à 1536, en multiples de 16.
+- `steps` : 16 par défaut (modèle distillé, sans guidage), de 4 à 32. `seed` : comme pour Z-Image.
+- Le modèle par défaut reste Z-Image Turbo. Un travail Klein ne va qu'à une machine qui annonce le modèle
+  (`info.gpu_models`), c'est-à-dire qui a passé l'essai `comfyui`. Sinon le hub répond 409.
+- Temps : `compute_s` dans le job. `engine` donne :
+  - `s_per_step` et `executed_s` (temps donné par ComfyUI) ;
+  - `wall_s` ;
+  - `server_start_s` au premier travail d'une série. ComfyUI reste chargé `gpu_keep_loaded_s`, 10 minutes par défaut.
+- Place : 20,3 Go de poids (modèle 11,1, encodeur 8,9, VAE 0,3). Avec le reste du dossier `gpu\`, il faut relever
+  `gpu_max_gb` à 75.
+- Provenance des fichiers : le dépôt officiel de BFL (`black-forest-labs/flux-3-image-klein-comfy`) exige une connexion
+  Hugging Face, que le PC n'a pas. Les fichiers viennent donc du miroir `rootlocalghost/flux-3-image-klein-comfy`, à un
+  commit épinglé.
+  - Les empreintes du modèle et du VAE sont identiques sur un second miroir indépendant (`ml-resources`).
+  - Les trois fichiers ont été rehachés au téléchargement.
+
 ## Modèles retenus (11/2026)
 
 | Type | Modèle | Moteur | Licence | Disque |
 |---|---|---|---|---|
 | image | Z-Image Turbo 6B (Tongyi-MAI), diffusion Q8_0 + encodeur Qwen3-4B Q8_0 + VAE | stable-diffusion.cpp master-1091-b9d7176, Vulkan | Apache-2.0 | 11,2 Go |
 | 3d (expérimental) | TRELLIS.2 4B (Microsoft), GGUF q8 | trellis.cpp v0.8.1, Vulkan | MIT, DINOv3 sous licence Meta | 10 Go |
+| image (`model: "flux3-klein"`) | FLUX 3 Image Klein 5.6B distillé (Black Forest Labs), BF16, encodeur Qwen3-VL-4B BF16, VAE FLUX.2 | ComfyUI v0.45.0 + PyTorch ROCm (même environnement que le banc) | FLUX Kommunity License (non commercial, sorties commerciales si CA < 5 M$) | 20,3 Go |
 | banc d'essai | Z-Image Turbo bf16 (Comfy-Org) | ComfyUI v0.45.0 + PyTorch 2.13.0 ROCm 10.0 gfx1030 | GPL-3.0, MIT, Apache-2.0, BSD | 27 Go |
 
 Le choix de l'image vient du classement « open weights » d'Artificial Analysis (11/2026). Z-Image Turbo y est

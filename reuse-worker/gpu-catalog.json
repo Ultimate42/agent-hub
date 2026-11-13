@@ -162,7 +162,215 @@
                         "--listen-ip", "127.0.0.1", "--listen-port", "{port}"]
           },
           "timeout_s": 1800
-        }
+        },
+        "flux3-klein": {
+           "label": "FLUX 3 Image Klein 5.6B distille (Black Forest Labs), BF16, par ComfyUI : texte vers image et jusqu'a 4 images de reference",
+           "license": "FLUX Kommunity License (Black Forest Labs) : usage non commercial, et sorties commerciales pour les utilisateurs eligibles (chiffre d'affaires < 5 M$), voir LICENSE.md du depot",
+           "source": "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy",
+           "mirror_note": "Depot officiel a acces controle (connexion Hugging Face exigee) : fichiers pris sur le miroir rootlocalghost/flux-3-image-klein-comfy, commit epingle. Empreintes du modele et du VAE identiques sur un second miroir independant (ml-resources/flux-3-image-klein) ; le README officiel dit que ce sont les memes fichiers que model.safetensors et ae.safetensors du depot d'origine.",
+           "engine": "comfyui",
+           "min_vram_gb": 14,
+           "notes": "Distille : 16 etapes, sans guidage (cfg 1). Ecrire une description complete de la scene, en anglais, comme une legende detaillee : le hub n'ajoute pas l'agrandisseur de prompt de BFL (Qwen3.5 9B, 18,8 Go). Resolution conseillee 1024x1024 (jusqu'a 1248 au carre, multiples de 16). references : 0 a 4 images PNG ou JPEG de 4 Mo au plus, ramenees par ComfyUI a 1 megapixel ; dans le prompt, les citer dans l'ordre (the first image, the second image...).",
+           "files": [
+            {
+             "dir": "diffusion_models",
+             "name": "flux3-image-klein-bf16.safetensors",
+             "size": 11097404512,
+             "sha256": "c3e9813cdd049c831c836b2e9db61150e49a93fc1a4c63b256494642fee0bd7c",
+             "url": "https://huggingface.co/rootlocalghost/flux-3-image-klein-comfy/resolve/60e70bc0b4a78d77e892b9c418304c3ea19081ba/diffusion_models/flux3-image-klein-bf16.safetensors"
+            },
+            {
+             "dir": "text_encoders",
+             "name": "qwen3vl_4b_bf16.safetensors",
+             "size": 8875719408,
+             "sha256": "f0b24fc5c8d7c0ea6ca909da14c20af5cac53f22506be942c6c956f838b9630f",
+             "url": "https://huggingface.co/rootlocalghost/flux-3-image-klein-comfy/resolve/60e70bc0b4a78d77e892b9c418304c3ea19081ba/text_encoders/qwen3vl_4b_bf16.safetensors"
+            },
+            {
+             "dir": "vae",
+             "name": "flux2-vae.safetensors",
+             "size": 336211292,
+             "sha256": "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+             "url": "https://huggingface.co/rootlocalghost/flux-3-image-klein-comfy/resolve/60e70bc0b4a78d77e892b9c418304c3ea19081ba/vae/flux2-vae.safetensors"
+            }
+           ],
+           "references": {
+            "max": 4,
+            "max_bytes": 4194304,
+            "formats": [
+             "png",
+             "jpg"
+            ],
+            "megapixels": 1.0
+           },
+           "params": {
+            "width": {
+             "type": "int",
+             "min": 256,
+             "max": 1536,
+             "multiple": 16,
+             "default": 1024
+            },
+            "height": {
+             "type": "int",
+             "min": 256,
+             "max": 1536,
+             "multiple": 16,
+             "default": 1024
+            },
+            "steps": {
+             "type": "int",
+             "min": 4,
+             "max": 32,
+             "default": 16
+            },
+            "seed": {
+             "type": "int",
+             "min": 0,
+             "max": 2147483647,
+             "default": "random"
+            }
+           },
+           "workflow_source": "workflows/flux3_klein_bf16_mi2i.json du depot black-forest-labs/flux-3-image-klein-comfy (sous-graphe Multiple image to image, sans l'agrandisseur de prompt), converti au format API",
+           "workflow": {
+            "unet": {
+             "class_type": "UNETLoader",
+             "inputs": {
+              "unet_name": "flux3-image-klein-bf16.safetensors",
+              "weight_dtype": "default"
+             }
+            },
+            "clip": {
+             "class_type": "CLIPLoader",
+             "inputs": {
+              "clip_name": "qwen3vl_4b_bf16.safetensors",
+              "type": "flux3",
+              "device": "default"
+             }
+            },
+            "vae": {
+             "class_type": "VAELoader",
+             "inputs": {
+              "vae_name": "flux2-vae.safetensors"
+             }
+            },
+            "pos": {
+             "class_type": "CLIPTextEncode",
+             "inputs": {
+              "text": "{prompt}",
+              "clip": [
+               "clip",
+               0
+              ]
+             }
+            },
+            "neg": {
+             "class_type": "CLIPTextEncode",
+             "inputs": {
+              "text": "",
+              "clip": [
+               "clip",
+               0
+              ]
+             }
+            },
+            "shift": {
+             "class_type": "ModelSamplingFlux",
+             "inputs": {
+              "model": [
+               "unet",
+               0
+              ],
+              "max_shift": 2.77259,
+              "base_shift": 2.77259,
+              "width": 1024,
+              "height": 1024
+             }
+            },
+            "refs": {
+             "class_type": "ReferenceMultiLatent",
+             "inputs": {
+              "positive": [
+               "pos",
+               0
+              ],
+              "negative": [
+               "neg",
+               0
+              ],
+              "vae": [
+               "vae",
+               0
+              ],
+              "resolution": "resize",
+              "resolution.megapixels": "{ref_megapixels}"
+             }
+            },
+            "latent": {
+             "class_type": "EmptyFlux2LatentImage",
+             "inputs": {
+              "width": "{width}",
+              "height": "{height}",
+              "batch_size": 1
+             }
+            },
+            "sampler": {
+             "class_type": "KSampler",
+             "inputs": {
+              "seed": "{seed}",
+              "steps": "{steps}",
+              "cfg": 1.0,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "denoise": 1.0,
+              "model": [
+               "shift",
+               0
+              ],
+              "positive": [
+               "refs",
+               0
+              ],
+              "negative": [
+               "refs",
+               1
+              ],
+              "latent_image": [
+               "latent",
+               0
+              ]
+             }
+            },
+            "decode": {
+             "class_type": "VAEDecode",
+             "inputs": {
+              "samples": [
+               "sampler",
+               0
+              ],
+              "vae": [
+               "vae",
+               0
+              ]
+             }
+            },
+            "save": {
+             "class_type": "SaveImage",
+             "inputs": {
+              "filename_prefix": "job",
+              "images": [
+               "decode",
+               0
+              ]
+             }
+            }
+           },
+           "workflow_references": {
+            "node": "refs",
+            "input": "images.image{n}"
+           },
+           "timeout_s": 1800
+          }
       }
     },
     "3d": {

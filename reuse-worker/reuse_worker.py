@@ -1021,7 +1021,9 @@ class Gpu:
         self.config = config
         self.engine = engine   # cartes vues par le moteur RE-USE (mémoire vidéo), None pour l'essai --gpu-test
         self.system = 'windows' if IS_WINDOWS else 'linux'
+        self.app = app
         self.catalog = read_json(app / GPU_CATALOG, {}) or {}
+        self.comfy = None        # ComfyUI résident pour les modèles qui passent par lui (FLUX 3 Klein) : poignée de comfy_start
         self.pidfile = self.root / 'engine.pid'
         self.status = {}   # type -> état lisible (« prêt », « pas installé », « échec : … »)
         self.last_trace = None   # EngineTrace du dernier lancement de moteur
@@ -1059,6 +1061,97 @@ class Gpu:
                 continue
             out.append(t)
         return out
+
+    def models(self):
+        """Modèles joués par ComfyUI que cette machine propose (annoncés au hub, info.gpu_models) : leur type est proposé, la
+        carte est assez grande et l'environnement ComfyUI est déjà installé et prouvé par le banc d'essai (essai comfyui)."""
+        spec = (self.catalog.get('benchmarks') or {}).get('comfyui')
+        if not spec or not IS_WINDOWS and not self.config.get('comfyui_any_os') or self.config.get('comfyui') is False:
+            return []
+        lay = comfy_layout(self.root.parent, spec)
+        if not all(comfy_done(lay, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')):
+            return []
+        vram = self.vram()
+        out = []
+        for t in self.types():
+            for mid, m in sorted(((self.catalog['types'][t].get('models') or {}).items())):
+                if m.get('engine') != 'comfyui':
+                    continue
+                need = float(m.get('min_vram_gb') or 0)
+                if need and vram is not None and vram < need * 1e9:
+                    continue
+                out.append(mid)
+        return out
+
+    def stop_comfy(self, why=''):
+        h, self.comfy = self.comfy, None
+        if h:
+            comfy_stop(h['h'])
+            if why:
+                log.info('ComfyUI résident arrêté (%s) : carte libérée.', why)
+
+    def run_comfy(self, job, workdir, stop, progress):
+        """Un travail joué par ComfyUI (modèle du catalogue à "engine": "comfyui") : poids posés au besoin, ComfyUI gardé
+        chargé entre deux travaux, workflow du catalogue, images de référence par le mécanisme natif du modèle."""
+        kind, model_id = job['kind'], job['model']
+        model = self.catalog['types'][kind]['models'][model_id]
+        spec = (self.catalog.get('benchmarks') or {}).get('comfyui')
+        if not spec or model_id not in self.models():
+            raise RuntimeError('modèle %s non proposé par cette machine (ComfyUI pas installé ici ?)' % model_id)
+        self.stop_server('ComfyUI demandé')   # une seule pile de poids sur la carte
+        t0 = time.time()
+        meta = {}
+        lay, env = comfy_install(self.root.parent, spec, self, stop, lambda f, st: progress(0.3 * f, st), meta, files=model['files'])
+        meta.pop('install_s', None)
+        if self.comfy and self.comfy['h']['proc'].poll() is not None:
+            self.stop_comfy('il s\'était arrêté')
+        if self.comfy is None:
+            progress(0.3, 'démarrage de ComfyUI')
+            comfy_pick_device(lay, env, spec, self, stop, meta)
+            self.comfy = {'h': comfy_start(lay, env, spec, self, stop, progress)}
+            meta['server_start_s'] = self.comfy['h']['start_s']
+        else:
+            meta['server_reused'] = True
+        h = self.comfy['h']
+        self.last_trace = h['box']['all']
+        values = dict(job.get('params') or {})
+        for name, ps in (model.get('params') or {}).items():
+            if name not in values and ps.get('default') not in (None, 'random'):
+                values[name] = ps['default']
+        values.setdefault('seed', 0)
+        values.update(prompt=job.get('prompt') or '', ref_megapixels=float((model.get('references') or {}).get('megapixels') or 1.0))
+        wf = comfy_workflow(model, values)
+        inputs = lay['data'] / 'input'
+        inputs.mkdir(parents=True, exist_ok=True)
+        placed = []
+        how = model.get('workflow_references') or {}
+        for n, ref in enumerate(job.get('ref_paths') or []):
+            name = 'job%d-ref%d%s' % (int(job['id']), n, Path(ref).suffix)
+            shutil.copyfile(ref, inputs / name)
+            placed.append(inputs / name)
+            wf['ref%d' % n] = {'class_type': 'LoadImage', 'inputs': {'image': name}}
+            wf[how.get('node', 'refs')]['inputs'][how.get('input', 'images.image{n}').replace('{n}', str(n))] = ['ref%d' % n, 0]
+        meta['references'] = len(placed)
+        out = workdir / 'out.png'
+        out.unlink(missing_ok=True)
+        try:
+            path, run = comfy_prompt(h, wf, values['steps'], stop, lambda f, st: progress(0.35 + 0.6 * f, st),
+                                     float(model.get('timeout_s') or 1800), 'génération')
+            shutil.copyfile(path, out)
+            path.unlink(missing_ok=True)   # rien ne reste dans ComfyUI : la sortie part au hub
+        except JobLost:
+            self.stop_comfy('travail annulé')   # ComfyUI calcule encore : la carte est rendue tout de suite
+            raise
+        finally:
+            for p in placed:
+                p.unlink(missing_ok=True)
+        meta.update(run)
+        meta['backend'] = 'rocm'
+        meta.pop('torch_devices', None)
+        if isinstance(meta.get('torch_device'), dict):
+            meta['device'] = meta.pop('torch_device').get('name')
+        self.check_output('png', out, values)
+        return out, time.time() - t0, {k: v for k, v in meta.items() if isinstance(v, (str, int, float, bool))}
 
     def installed(self, kind):
         spec = (self.catalog.get('types') or {}).get(kind) or {}
@@ -1178,6 +1271,9 @@ class Gpu:
         kind, model_id = job['kind'], job['model']
         spec = self.catalog['types'][kind]
         model = spec['models'][model_id]
+        if model.get('engine') == 'comfyui':
+            return self.run_comfy(job, workdir, stop, progress)
+        self.stop_comfy('autre moteur demandé')
         exe, paths, mdir, env_extra = self.ensure(kind, model_id, stop, lambda frac, stage: progress(0.3 * frac, stage))
         ext = spec.get('output', 'png')
         out = workdir / ('out.' + ext)
@@ -1367,7 +1463,9 @@ class Gpu:
             log.info('Moteur image résident arrêté (%s) : carte libérée.', why)
 
     def idle(self):
-        """Appelé par la boucle du worker : décharge le moteur résident après gpu_keep_loaded_s sans travail."""
+        """Appelé par la boucle du worker : décharge les moteurs résidents après gpu_keep_loaded_s sans travail."""
+        if self.comfy and (self.comfy['h']['proc'].poll() is not None or time.time() - self.comfy['h']['last_used'] > self.keep_loaded_s()):
+            self.stop_comfy('%s sans travail' % fmt_duration(self.keep_loaded_s()))
         if self.server and (self.server['proc'].poll() is not None or time.time() - self.server['last_used'] > self.keep_loaded_s()):
             self.stop_server('%s sans travail' % fmt_duration(self.keep_loaded_s()) if self.server['proc'].poll() is None else 'il s\'était arrêté')
 
@@ -1503,6 +1601,7 @@ class Worker:
             'update_ack': (read_json(self.base / 'update-ack.json', {}) or {}).get('order'),
             'gpu': ','.join(self.gpu.types()),        # types de génération proposés (le hub n'en donne pas d'autres)
             'gpu_state': self.gpu.describe() or None,
+            'gpu_models': ','.join(self.gpu.models()) or None,   # modèles qui demandent plus que le moteur du type (ComfyUI)
             'tests': ','.join(GPU_TEST_KINDS),         # essais GPU que cette version sait faire sur ordre du hub
         }
 
@@ -1779,6 +1878,24 @@ class Worker:
                             if sha256_file(src) != job['input']['sha256']:
                                 raise OSError('image reçue abîmée')
                         self.hub.retrying('Téléchargement de l\'image d\'entrée', fetch)
+                refs = []
+                for ref in job.get('references') or []:   # images de référence (FLUX 3 Klein), vérifiées comme l'entrée
+                    fmt, n = ref.get('format'), int(ref.get('n', len(refs)))
+                    if fmt not in ('png', 'jpg'):
+                        raise RuntimeError('format de référence inattendu : %r' % fmt)
+                    dest = jobdir / ('ref%d.%s' % (n, fmt))
+                    if not (dest.exists() and sha256_file(dest) == ref['sha256']):
+                        def fetch_ref(dest=dest, n=n, ref=ref):
+                            status, body = self.hub.request('GET', '%s%d/references/%d' % (route, jid, n), dest=dest, timeout=300)
+                            if status in (404, 409):
+                                raise JobLost((body or {}).get('error', 'job repris'))
+                            if status != 200:
+                                raise Refused(status, (body or {}).get('error', 'téléchargement refusé'))
+                            if sha256_file(dest) != ref['sha256']:
+                                raise OSError('référence reçue abîmée')
+                        self.hub.retrying('Téléchargement de la référence %d' % n, fetch_ref)
+                    refs.append(str(dest))
+                job['ref_paths'] = refs
                 log.info('Job %s : %s', label, (job.get('prompt') or '')[:120])
                 try:
                     out, compute_s, meta = self.gpu.run(job, src, jobdir, stop, progress)
@@ -1896,7 +2013,7 @@ class Worker:
             self.report()
             return EXIT_NOT_READY
         kill_orphan(self.gpu.pidfile, (b'sd-cli', b'trellis-cli'))
-        kill_orphan(self.gpu.server_pidfile, (b'sd-server',))
+        kill_orphan(self.gpu.server_pidfile, (b'sd-server',))   # ComfyUI resté en marche : arrêté juste après
         try:
             comfy_kill_orphan(comfy_layout(self.base, comfy_spec(self.app)))   # essai ComfyUI coupé par un arrêt du worker
         except (RuntimeError, KeyError):
@@ -1915,6 +2032,7 @@ class Worker:
             self.gpu.idle()
             if (self.base / 'STOP').exists():
                 self.gpu.stop_server('arrêt du worker')
+                self.gpu.stop_comfy('arrêt du worker')
                 log.info('Fichier STOP présent : arrêt. Le supprimer pour relancer.')
                 return EXIT_STOP
             if job:
@@ -2029,6 +2147,7 @@ class Worker:
         log.info('Essai GPU %d (%s) demandé par le hub : %s', tid, kind, json.dumps(test.get('params') or {}))
         self.set_state('essai %s' % kind, 'essai %d' % tid)
         self.gpu.stop_server('essai GPU demandé')   # la carte entière pour l'essai
+        self.gpu.stop_comfy('essai GPU demandé')
 
         def progress(frac, stage):
             now.update(progress=round(max(0.0, min(1.0, frac)), 3), stage=str(stage)[:200])
@@ -2171,10 +2290,10 @@ def comfy_done(lay, spec, step):
         return False
 
 
-def comfy_need_bytes(lay, spec):
-    """Octets encore à poser sur le disque pour l'essai (poids manquants, environnement Python s'il n'est pas prêt)."""
+def comfy_need_bytes(lay, spec, files=None):
+    """Octets encore à poser sur le disque (poids manquants, environnement Python s'il n'est pas prêt)."""
     need = 0
-    for f in spec.get('files') or []:
+    for f in (spec.get('files') or []) if files is None else files:
         dest = lay['data'] / 'models' / f['dir'] / f['name']
         if not Path(str(dest) + '.ok').exists():
             part = Path(str(dest) + '.part')
@@ -2306,12 +2425,14 @@ def comfy_env(lay, spec):
     return env
 
 
-def comfy_install(base, spec, gpu, stop, progress, report):
-    """Installe ce qui manque, étape par étape (témoins .ok-<étape>), après contrôle du plafond et de la place libre."""
+def comfy_install(base, spec, gpu, stop, progress, report, files=None):
+    """Installe ce qui manque, étape par étape (témoins .ok-<étape>), après contrôle du plafond et de la place libre.
+    files : poids à poser (défaut : ceux du banc ; un modèle de travail donne les siens)."""
     lay = comfy_layout(base, spec)
     root = lay['root']
     root.mkdir(parents=True, exist_ok=True)
-    need = comfy_need_bytes(lay, spec)
+    files = (spec.get('files') or []) if files is None else files
+    need = comfy_need_bytes(lay, spec, files)
     used = folder_bytes(gpu.root) if gpu.root.exists() else 0
     free = shutil.disk_usage(str(root)).free
     report['disk'] = {'need_gb': round(need / 1e9, 1), 'gpu_folder_gb': round(used / 1e9, 1), 'cap_gb': round(gpu.max_bytes() / 1e9, 1),
@@ -2387,7 +2508,6 @@ def comfy_install(base, spec, gpu, stop, progress, report):
     step('source', 0.03, 'téléchargement de ComfyUI', source)
     step('torch', 0.05, 'installation de PyTorch ROCm (environ 1,5 Go)', torch)
     step('requirements', 0.15, 'installation des dépendances de ComfyUI', requirements)
-    files = spec.get('files') or []
     total = float(sum(int(f['size']) for f in files)) or 1.0
     done = 0.0
     for f in files:
@@ -2449,9 +2569,8 @@ def comfy_local(port, method, path, body=None, timeout=30):
             return e.code, {'error': text[:300].decode('utf-8', 'replace')}
 
 
-def comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report):
-    """ComfyUI lancé sur 127.0.0.1 sans interface, le workflow de référence joué runs fois (graine différente à chaque fois,
-    sinon ComfyUI ressert son cache), mesures par passage, puis arrêt : la carte est rendue."""
+def comfy_start(lay, env, spec, gpu, stop, progress):
+    """ComfyUI lancé sur 127.0.0.1, sans interface, journal dans gpu/logs/comfyui.log. -> poignée {proc, port, box, th, stats}."""
     probe = socket.socket()
     probe.bind(('127.0.0.1', 0))
     port = probe.getsockname()[1]
@@ -2460,28 +2579,31 @@ def comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report):
     args = [str(lay['exe']), '-s', str(lay['src'] / 'main.py')] + build_command(spec['args'], {'port': port, 'base': str(lay['data'])})
     flags, kwargs = gpu.spawn_options()
     logs = gpu.root / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
     out_log = open(logs / 'comfyui.log', 'wb')
     t0 = time.time()
     proc = subprocess.Popen(args, cwd=str(lay['src']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                             env=env, creationflags=flags, **kwargs)
     lay['pid'].write_text(str(proc.pid))
-    box = {'trace': ComfyTrace(int(values['steps'])), 'all': ComfyTrace()}
+    box = {'trace': ComfyTrace(), 'all': ComfyTrace(), 'written': 0}
 
     def reader():
         for block in iter(lambda: proc.stdout.read1(4096) if hasattr(proc.stdout, 'read1') else proc.stdout.read(4096), b''):
-            out_log.write(block)
-            out_log.flush()
+            if box['written'] < (50 << 20):   # résident : journal borné
+                out_log.write(block)
+                out_log.flush()
+                box['written'] += len(block)
             box['trace'].feed(block)
             box['all'].feed(block)
         out_log.close()
     th = threading.Thread(target=reader, daemon=True)
     th.start()
-    gpu.last_trace = box['all']
+    h = {'proc': proc, 'port': port, 'box': box, 'th': th, 'lay': lay, 'last_used': time.time()}
     try:
         start_timeout = float(spec.get('start_timeout_s') or 900)
         while True:
             if stop is not None and stop.is_set():
-                raise JobLost('essai interrompu')
+                raise JobLost('interrompu au démarrage de ComfyUI')
             if proc.poll() is not None:
                 raise RuntimeError('ComfyUI s\'est arrêté au démarrage (code %s) : %s' % (proc.returncode, ' | '.join(box['all'].lines[-4:])[-400:]))
             if time.time() - t0 > start_timeout:
@@ -2492,47 +2614,87 @@ def comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report):
                     break
             except OSError:
                 pass
-            progress(0.5, 'démarrage de ComfyUI')
+            progress(0.3, 'démarrage de ComfyUI')
             time.sleep(2)
-        report['start_s'] = round(time.time() - t0, 1)
-        dev = ((stats or {}).get('devices') or [{}])[0]
-        report['comfyui_system'] = {k: (stats or {}).get('system', {}).get(k) for k in ('comfyui_version', 'pytorch_version', 'python_version', 'os')}
+    except BaseException:
+        comfy_stop(h)
+        raise
+    h['start_s'] = round(time.time() - t0, 1)
+    h['stats'] = stats or {}
+    return h
+
+
+def comfy_stop(h):
+    if not h:
+        return
+    if h['proc'].poll() is None:
+        h['proc'].kill()
+        try:
+            h['proc'].wait(30)
+        except subprocess.TimeoutExpired:
+            pass
+    h['th'].join(5)
+    if h['proc'].stdout:
+        h['proc'].stdout.close()
+    h['lay']['pid'].unlink(missing_ok=True)
+
+
+def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
+    """Un workflow joué par ComfyUI. -> (chemin de la première image, mesures). progress(fraction 0..1 du calcul, étape)."""
+    trace = ComfyTrace(int(steps))
+    h['box']['trace'] = trace
+    port, proc = h['port'], h['proc']
+    t1 = time.time()
+    status, answer = comfy_local(port, 'POST', '/prompt', {'prompt': wf, 'client_id': 'reuse-worker'}, timeout=60)
+    pid = (answer or {}).get('prompt_id')
+    if status != 200 or not pid:
+        raise RuntimeError('ComfyUI refuse le workflow (HTTP %s) : %s' % (status, json.dumps(answer, ensure_ascii=False)[:400]))
+    entry = None
+    while entry is None:
+        if stop is not None and stop.is_set():
+            raise JobLost('calcul interrompu')
+        if proc.poll() is not None:
+            raise RuntimeError('ComfyUI s\'est arrêté pendant le calcul (code %s) : %s' % (proc.returncode, ' | '.join(h['box']['all'].lines[-4:])[-400:]))
+        if time.time() - t1 > timeout:
+            raise RuntimeError('%s trop long (plus de %s)' % (label, fmt_duration(timeout)))
+        progress(max(0.0, min(1.0, (trace.progress - 0.35) / 0.55)), '%s : %s' % (label, trace.stage()))
+        time.sleep(1)
+        status, hist = comfy_local(port, 'GET', '/history/%s' % pid, timeout=30)
+        if status == 200 and isinstance(hist, dict) and pid in hist:
+            entry = hist[pid]
+    h['last_used'] = time.time()
+    st = entry.get('status') or {}
+    meta = dict(trace.summary(), wall_s=round(time.time() - t1, 1))
+    if st.get('status_str') != 'success':
+        msgs = [m for m in st.get('messages') or [] if m and m[0] == 'execution_error']
+        e = (msgs[0][1] if msgs else {}) or {}
+        raise RuntimeError('%s raté : %s %s' % (label, e.get('exception_type', ''), str(e.get('exception_message', st))[:300]))
+    images = [im for node in (entry.get('outputs') or {}).values() for im in node.get('images') or []]
+    if not images:
+        raise RuntimeError('%s : aucune image produite' % label)
+    im = images[0]
+    return h['lay']['data'] / 'output' / (im.get('subfolder') or '') / im['filename'], meta
+
+
+def comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report):
+    """Le workflow de référence joué runs fois (graine différente à chaque fois, sinon ComfyUI ressert son cache), mesures par
+    passage, puis arrêt : la carte est rendue."""
+    h = comfy_start(lay, env, spec, gpu, stop, lambda f, st: progress(0.5, st))
+    gpu.last_trace = h['box']['all']
+    try:
+        report['start_s'] = h['start_s']
+        stats = h['stats']
+        dev = (stats.get('devices') or [{}])[0]
+        report['comfyui_system'] = {k: (stats.get('system') or {}).get(k) for k in ('comfyui_version', 'pytorch_version', 'python_version', 'os')}
         report['device'] = {k: dev.get(k) for k in ('name', 'type', 'vram_total', 'vram_free')}
         timeout = float(spec.get('timeout_s') or 3600)
         out_runs = []
         for i in range(runs):
-            trace = ComfyTrace(int(values['steps']))
-            box['trace'] = trace
             wf = comfy_workflow(spec, dict(values, seed=int(values['seed']) + i))
-            t1 = time.time()
-            status, answer = comfy_local(port, 'POST', '/prompt', {'prompt': wf, 'client_id': 'reuse-bench'}, timeout=60)
-            pid = (answer or {}).get('prompt_id')
-            if status != 200 or not pid:
-                raise RuntimeError('ComfyUI refuse le workflow (HTTP %s) : %s' % (status, json.dumps(answer, ensure_ascii=False)[:400]))
-            entry = None
-            while entry is None:
-                if stop is not None and stop.is_set():
-                    raise JobLost('essai interrompu')
-                if proc.poll() is not None:
-                    raise RuntimeError('ComfyUI s\'est arrêté pendant le calcul (code %s) : %s' % (proc.returncode, ' | '.join(box['all'].lines[-4:])[-400:]))
-                if time.time() - t1 > timeout:
-                    raise RuntimeError('passage %d trop long (plus de %s)' % (i + 1, fmt_duration(timeout)))
-                progress(0.55 + 0.4 * (i + max(0.0, min(1.0, (trace.progress - 0.35) / 0.55))) / runs, 'passage %d/%d : %s' % (i + 1, runs, trace.stage()))
-                time.sleep(1)
-                status, hist = comfy_local(port, 'GET', '/history/%s' % pid, timeout=30)
-                if status == 200 and isinstance(hist, dict) and pid in hist:
-                    entry = hist[pid]
-            st = entry.get('status') or {}
-            run = {'run': i + 1, 'seed': int(values['seed']) + i, 'wall_s': round(time.time() - t1, 1), **trace.summary()}
-            if st.get('status_str') != 'success':
-                msgs = [m for m in st.get('messages') or [] if m and m[0] == 'execution_error']
-                err = (msgs[0][1] if msgs else {}) or {}
-                raise RuntimeError('passage %d raté : %s %s' % (i + 1, err.get('exception_type', ''), str(err.get('exception_message', st))[:300]))
-            images = [im for node in (entry.get('outputs') or {}).values() for im in node.get('images') or []]
-            if not images:
-                raise RuntimeError('passage %d : aucune image produite' % (i + 1))
-            im = images[0]
-            path = lay['data'] / 'output' / (im.get('subfolder') or '') / im['filename']
+            path, meta = comfy_prompt(h, wf, values['steps'], stop,
+                                      lambda f, st, i=i: progress(0.55 + 0.4 * (i + f) / runs, 'passage %d/%d : %s' % (i + 1, runs, st.split(' : ', 1)[-1])),
+                                      timeout, 'passage %d' % (i + 1))
+            run = {'run': i + 1, 'seed': int(values['seed']) + i, **meta}
             size = png_size(path) if path.exists() else None
             if tuple(size or ()) != (int(values['width']), int(values['height'])):
                 raise RuntimeError('passage %d : image %s au lieu de %dx%d' % (i + 1, size, values['width'], values['height']))
@@ -2542,20 +2704,34 @@ def comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report):
             report['output'] = str(kept)
             out_runs.append(run)
         report['runs'] = out_runs
-        _, stats = comfy_local(port, 'GET', '/system_stats', timeout=10)
+        _, stats = comfy_local(h['port'], 'GET', '/system_stats', timeout=10)
         dev = ((stats or {}).get('devices') or [{}])[0]
         report['device']['vram_free_after'] = dev.get('vram_free')
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            try:
-                proc.wait(30)
-            except subprocess.TimeoutExpired:
-                pass
-        th.join(5)
-        proc.stdout.close()
-        lay['pid'].unlink(missing_ok=True)
+        comfy_stop(h)
     return out_runs
+
+
+def comfy_pick_device(lay, env, spec, gpu, stop, report):
+    """Version, cartes et architectures vues par PyTorch ; pose HIP_VISIBLE_DEVICES dans env si ROCm voit plusieurs cartes."""
+    out = run_logged([lay['exe'], '-s', '-c', spec['torch']['check']], gpu.root / 'logs' / 'comfyui-install.log', env, 300, stop,
+                     what='contrôle de PyTorch')
+    line = ([l for l in out.splitlines() if l.startswith('TORCH ')] or [''])[-1].split(' ', 1)[-1]
+    report['torch'] = line[:300]
+    devices = []
+    for l in out.splitlines():
+        m = re.match(r'DEV (\d+) (\S+) (\d+) (.*)', l.strip())
+        if m:
+            devices.append({'index': int(m.group(1)), 'arch': m.group(2), 'memory_gb': round(int(m.group(3)) / 1e9, 1), 'name': m.group(4)[:80]})
+    report['torch_devices'] = devices
+    if ' True ' not in ' %s ' % line or not devices:
+        raise RuntimeError('PyTorch ROCm ne voit pas la carte : %s' % (line or out.strip()[-300:]))
+    # Un processeur AMD à graphique intégré est aussi vu par ROCm : ComfyUI calcule sur la carte qui a le plus de mémoire
+    card = max(devices, key=lambda d: d['memory_gb'])
+    if len(devices) > 1:
+        env['HIP_VISIBLE_DEVICES'] = str(card['index'])
+    report['torch_device'] = card
+    return card
 
 
 def comfy_test_report(base, config, kind, params, stop, progress, report):
@@ -2580,24 +2756,7 @@ def comfy_test_report(base, config, kind, params, stop, progress, report):
         report['engine'] = spec.get('label')
         t0 = time.time()
         lay, env = comfy_install(base, spec, gpu, stop, progress, report)
-        # Contrôle à chaque essai (10 à 20 s) : version, carte et architecture vues par PyTorch
-        out = run_logged([lay['exe'], '-s', '-c', spec['torch']['check']], gpu.root / 'logs' / 'comfyui-install.log', env, 300, stop,
-                         what='contrôle de PyTorch')
-        line = ([l for l in out.splitlines() if l.startswith('TORCH ')] or [''])[-1].split(' ', 1)[-1]
-        report['torch'] = line[:300]
-        devices = []
-        for l in out.splitlines():
-            m = re.match(r'DEV (\d+) (\S+) (\d+) (.*)', l.strip())
-            if m:
-                devices.append({'index': int(m.group(1)), 'arch': m.group(2), 'memory_gb': round(int(m.group(3)) / 1e9, 1), 'name': m.group(4)[:80]})
-        report['torch_devices'] = devices
-        if ' True ' not in ' %s ' % line or not devices:
-            raise RuntimeError('PyTorch ROCm ne voit pas la carte : %s' % (line or out.strip()[-300:]))
-        # Un processeur AMD à graphique intégré est aussi vu par ROCm : ComfyUI calcule sur la carte qui a le plus de mémoire
-        card = max(devices, key=lambda d: d['memory_gb'])
-        if len(devices) > 1:
-            env['HIP_VISIBLE_DEVICES'] = str(card['index'])
-        report['torch_device'] = card
+        comfy_pick_device(lay, env, spec, gpu, stop, report)   # contrôle à chaque essai (10 à 20 s)
         report['install_total_s'] = round(time.time() - t0, 1)
         runs_out = comfy_bench(lay, env, spec, gpu, values, runs, stop, progress, report)
         warm = runs_out[-1]

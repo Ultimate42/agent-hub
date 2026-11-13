@@ -305,8 +305,13 @@ class GpuTest(unittest.TestCase):
         for kind, spec in self.catalog['types'].items():
             for mid, m in spec['models'].items():
                 values = {k: (v['default'] if v.get('default') != 'random' else 1) for k, v in m['params'].items()}
-                values.update(prompt='x', output='o', models_dir='d', input='i', **{'file:' + f['role']: 'f' for f in m['files']})
-                w.build_command(m['command'] + m.get('command_input', []), values)   # aucune valeur manquante
+                if m.get('engine') == 'comfyui':   # modèle joué par ComfyUI : un workflow au lieu d'une ligne de commande
+                    wf = w.comfy_workflow(m, dict(values, prompt='x', ref_megapixels=1.0))
+                    self.assertTrue(all(isinstance(n.get('class_type'), str) for n in wf.values()))
+                    self.assertNotRegex(json.dumps(wf), r'"\{\w+\}"', 'toutes les valeurs posées')
+                else:
+                    values.update(prompt='x', output='o', models_dir='d', input='i', **{'file:' + f['role']: 'f' for f in m['files']})
+                    w.build_command(m['command'] + m.get('command_input', []), values)   # aucune valeur manquante
                 if m.get('server'):
                     args = w.build_command(m['server']['command'], dict(values, port=1234))
                     self.assertIn('127.0.0.1', args, 'le moteur résident n\'écoute que la machine elle-même')
@@ -716,12 +721,18 @@ def png(path, w, h):
     c = lambda k, d: struct.pack('>I', len(d)) + k + d + struct.pack('>I', zlib.crc32(k + d))
     open(path, 'wb').write(b'\x89PNG\r\n\x1a\n' + c(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 0, 0, 0, 0)) + c(b'IDAT', zlib.compress(rows)) + c(b'IEND', b''))
 def run(pid, wf):
-    steps = wf['57:3']['inputs']['steps']
+    with open(os.path.join(base, 'last-workflow.json'), 'w') as f:
+        json.dump(wf, f)
+    node = lambda kind: [n for n in wf.values() if n['class_type'] == kind][0]
+    for n in wf.values():
+        if n['class_type'] == 'LoadImage':
+            assert os.path.exists(os.path.join(base, 'input', n['inputs']['image'])), 'reference placed in ComfyUI input'
+    steps = node('KSampler')['inputs']['steps']
     for i in range(1, steps + 1):
         print(' %3d%%|###   | %d/%d [00:01<00:02,  0.05s/it]' % (100 * i // steps, i, steps), end='\r', flush=True)
         time.sleep(0.05)
     print('\nPrompt executed in 0.42 seconds', flush=True)
-    lat = wf['57:13']['inputs']
+    lat = [n for n in wf.values() if n['class_type'].startswith('Empty')][0]['inputs']
     os.makedirs(os.path.join(base, 'output'), exist_ok=True)
     name = 'bench_%05d_.png' % (len(history) + 1)
     png(os.path.join(base, 'output', name), lat['width'], lat['height'])
@@ -749,6 +760,69 @@ time.sleep(0.5)
 print('Starting server', flush=True)
 http.server.ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
 '''
+
+
+class KleinJobTest(unittest.TestCase):
+    """Un travail FLUX 3 Klein contre un faux ComfyUI : références posées par le mécanisme du modèle, ComfyUI gardé entre
+    deux travaux, sortie vérifiée, rien ne reste dans le dossier de ComfyUI."""
+    def test_klein_job_with_references_then_a_second_job_reuses_comfyui(self):
+        base = Path(tempfile.mkdtemp())
+        (base / 'logs').mkdir()
+        gpu = w.Gpu(base, {'comfyui_any_os': True, 'gpu_keep_free_gb': 0, 'gpu_max_gb': 1000}, Path(w.__file__).resolve().parent)
+        gpu.catalog['engines']['sdcpp']['linux'] = dict(gpu.catalog['engines']['sdcpp']['windows'])   # type image proposé ici
+        spec = gpu.catalog['benchmarks']['comfyui']
+        spec['torch']['check'] = "print('TORCH 2.13.0+rocm10.0.0 7.1 True 1'); print('DEV 0 gfx1030 17163091968 AMD Radeon RX 6950 XT')"
+        lay = w.comfy_layout(base, spec)
+        self.assertEqual(gpu.types(), ['image'])
+        self.assertEqual(gpu.models(), [], 'ComfyUI not installed: the model is not announced')
+        lay['exe'].parent.mkdir(parents=True)
+        os.symlink(sys.executable, lay['exe'])
+        lay['src'].mkdir(parents=True)
+        (lay['src'] / 'main.py').write_text(FAKE_COMFY)
+        for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+            (lay['root'] / ('.ok-' + step)).write_text(w.comfy_marker(spec, step))
+        self.assertEqual(gpu.models(), ['flux3-klein'])
+        model = gpu.catalog['types']['image']['models']['flux3-klein']
+        for f in model['files']:
+            dest = lay['data'] / 'models' / f['dir'] / f['name']
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b'fake')
+            st = dest.stat()
+            Path(str(dest) + '.ok').write_text('%s %d %d' % (f['sha256'], st.st_size, st.st_mtime_ns))
+        work = base / 'work'
+        work.mkdir()
+        refs = []
+        for n in range(2):
+            make_png(work / ('ref%d.png' % n), 32, 24)
+            refs.append(str(work / ('ref%d.png' % n)))
+        job = {'id': 7, 'kind': 'image', 'model': 'flux3-klein', 'prompt': 'the cat from the first image on the sofa from the second image',
+               'params': {'width': 320, 'height': 256, 'steps': 4, 'seed': 5}, 'ref_paths': refs}
+        stages = []
+        try:
+            out, secs, meta = gpu.run(job, None, work, None, lambda f, st: stages.append(st))
+            self.assertEqual(w.png_size(out), (320, 256))
+            self.assertEqual(meta['references'], 2)
+            self.assertEqual(meta['backend'], 'rocm')
+            self.assertEqual(meta['s_per_step'], 0.05)
+            self.assertIn('server_start_s', meta)
+            wf = json.loads((lay['data'] / 'last-workflow.json').read_text())
+            self.assertEqual(wf['refs']['inputs']['images.image0'], ['ref0', 0])
+            self.assertEqual(wf['refs']['inputs']['images.image1'], ['ref1', 0])
+            self.assertEqual(wf['refs']['inputs']['resolution.megapixels'], 1.0)
+            self.assertEqual(wf['pos']['inputs']['text'], job['prompt'])
+            self.assertEqual(wf['latent']['inputs'], {'width': 320, 'height': 256, 'batch_size': 1})
+            self.assertEqual(wf['sampler']['inputs']['steps'], 4)
+            self.assertEqual(list((lay['data'] / 'input').iterdir()), [], 'references removed from ComfyUI')
+            self.assertEqual(list((lay['data'] / 'output').glob('*.png')), [], 'output removed from ComfyUI')
+            pid = gpu.comfy['h']['proc'].pid
+            # Second travail, sans référence : ComfyUI déjà chargé est réutilisé
+            out2, _, meta2 = gpu.run(dict(job, id=8, ref_paths=[]), None, work, None, lambda f, st: None)
+            self.assertTrue(meta2.get('server_reused'))
+            self.assertEqual(gpu.comfy['h']['proc'].pid, pid)
+            self.assertNotIn('images.image0', json.loads((lay['data'] / 'last-workflow.json').read_text())['refs']['inputs'])
+        finally:
+            gpu.stop_comfy()
+        self.assertFalse(lay['pid'].exists(), 'card given back')
 
 
 class ComfyBenchTest(unittest.TestCase):
