@@ -1,6 +1,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -178,6 +179,30 @@ describe('RE-USE worker remote control', () => {
     assert.strictEqual(list[0].id, id);
     const history = (await call('/api/reuse/workers/gpu-box/settings', { token: ADMIN })).data.history.map(e => e.what);
     assert.deepStrictEqual(history.slice(0, 3), ['test_finished', 'test_started', 'test_requested']);
+  });
+
+  test('tests: the file a test made is checked, kept, and served to the admin only', async () => {
+    const id = (await ask('gpu-box', { kind: 'image' })).data.test.id;
+    await report(id, { status: 'running' });
+    const pngBytes = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('fake image')]);
+    const hash = crypto.createHash('sha256').update(pngBytes).digest('hex');
+    const up = (body, ext, sha, token = AMD) => call(`/api/reuse/worker/tests/${id}/output?ext=${ext}`, {
+      method: 'POST', token, rawBody: body, headers: { 'X-Sha256': sha, 'Content-Type': 'application/octet-stream' }
+    });
+    assert.strictEqual((await up(pngBytes, 'exe', hash)).status, 400);
+    assert.strictEqual((await up(pngBytes, 'png', 'bad')).status, 400);
+    assert.strictEqual((await up(Buffer.from('not a png'), 'png', crypto.createHash('sha256').update('not a png').digest('hex'))).status, 422);
+    assert.strictEqual((await up(pngBytes, 'png', hash, NV)).status, 404, 'not this worker\'s test');
+    assert.strictEqual((await up(pngBytes, 'png', hash, ADMIN)).status, 403);
+    assert.strictEqual((await up(pngBytes, 'png', hash)).status, 200);
+    await report(id, { status: 'done', report: { ok: true, compute_s: 3 } });
+    const t = await readTest(id);
+    assert.deepStrictEqual({ ...t.output, url: undefined }, { ext: 'png', size: pngBytes.length, sha256: hash, url: undefined });
+    const res = await fetch(BASE_URL + t.output.url, { headers: { Authorization: `Bearer ${ADMIN}` } });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('content-type'), 'image/png');
+    assert.ok(Buffer.from(await res.arrayBuffer()).equals(pngBytes));
+    assert.strictEqual((await fetch(BASE_URL + t.output.url, { headers: { Authorization: `Bearer ${AMD}` } })).status, 403);
   });
 
   test('tests: a failure keeps its reason and the end of the engine log; a huge report is cut, not refused', async () => {

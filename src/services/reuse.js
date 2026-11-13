@@ -9,7 +9,8 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { workerWindow, workerInWindow, setWorkerSchedule, clearWorkerSchedule } from './reuse-schedule.js';
 import {
-  workerSettings, patchWorkerSettings, workerEvents, pendingTest, createTest, listTests, getTest, cancelTest, reportTest
+  workerSettings, patchWorkerSettings, workerEvents, pendingTest, createTest, listTests, getTest, cancelTest, reportTest,
+  noteTestOutput, testOutput, TEST_OUTPUT_EXT
 } from './worker-control.js';
 
 // ---------------------------------------------------------------------------
@@ -562,8 +563,39 @@ export const requestWorkerTest = (name, body) => onWorker(name, () => {
 export const listWorkerTests = (name, limit) => onWorker(name, () => ({ ok: true, worker: name, tests: listTests(name, limit) }));
 export const getWorkerTest = (name, id) => onWorker(name, () => getTest(name, id));
 export const cancelWorkerTest = (name, id) => onWorker(name, () => cancelTest(name, id));
+const testOutputPath = (id, ext) => path.join(config.reuseDir, 'tests', `${Number(id)}.${ext}`);
+
+/** Worker side: the file a test made (PNG or GLB), checked like a GPU result, kept for the admin (last 10 per worker). */
+export function storeTestOutput(name, id, { data, sha256: announced, ext } = {}) {
+  if (!TEST_OUTPUT_EXT.test(ext || '')) return err(400, 'ext must be png or glb');
+  if (!Buffer.isBuffer(data) || data.length === 0) return err(400, 'Empty body');
+  if (data.length > config.gpuMaxOutputSize) return err(413, 'File too large');
+  const hash = sha256(data);
+  if (!announced || String(announced).toLowerCase() !== hash) return err(400, 'X-Sha256 does not match the body');
+  const magic = ext === 'png' ? data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    : data.length >= 12 && data.toString('latin1', 0, 4) === 'glTF' && data.readUInt32LE(8) === data.length;
+  if (!magic) return err(422, `Body is not a ${ext.toUpperCase()} file`);
+  const noted = noteTestOutput(name, id, { ext, size: data.length, sha256: hash });
+  if (!noted.ok) return noted;
+  writeAtomic(testOutputPath(id, ext), data);
+  for (const d of noted.drop) rmSync(testOutputPath(d.id, d.ext || 'bin'), { force: true });
+  return { ok: true, size: data.length };
+}
+
+/** Admin: {file, ext, sha256} of a test's file, or an error. */
+export function workerTestOutput(name, id) {
+  return onWorker(name, () => {
+    const out = testOutput(name, id);
+    if (!out) return err(404, 'This test has no file');
+    const file = testOutputPath(id, out.ext);
+    if (!existsSync(file)) return err(404, 'File is missing on the hub');
+    return { ok: true, file, ...out };
+  });
+}
+
 /** Worker side: progress and final report of a test it was given; answers {cancel} and its orders. */
 export function reportWorkerTest(name, id, body) {
+  if (body?.info && typeof body.info === 'object') noteReusePoll(name, body.info); // busy with a test is still online
   const r = reportTest(name, id, body || {});
   return r.ok ? { ...r, orders: workerOrders(name) } : r;
 }

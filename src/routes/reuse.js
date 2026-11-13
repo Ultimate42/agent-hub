@@ -6,7 +6,8 @@ import {
   reuseEnabled, identifyReuseCaller, submitJob, listJobs, getJob, jobView, retryJob, cancelJob, deleteBatch,
   noteReusePoll, claimJob, claimView, canReadInput, heartbeat, failJob, completeJob,
   listWorkers, orderWorker, getSchedule, setSchedule, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost,
-  getWorkerSettings, setWorkerSettings, requestWorkerTest, listWorkerTests, getWorkerTest, cancelWorkerTest, reportWorkerTest
+  getWorkerSettings, setWorkerSettings, requestWorkerTest, listWorkerTests, getWorkerTest, cancelWorkerTest, reportWorkerTest,
+  storeTestOutput, workerTestOutput
 } from '../services/reuse.js';
 import { gpuClaimHooks, gpuClaimView } from '../services/gpu-jobs.js';
 
@@ -175,6 +176,16 @@ router.get('/api/reuse/workers/:name/tests/:id', guard('admin'), (req, res) => {
 router.post('/api/reuse/workers/:name/tests/:id/cancel', guard('admin'), (req, res) => {
   answer(res, cancelWorkerTest(req.params.name, req.params.id));
 });
+/** GET /api/reuse/workers/:name/tests/:id/output - The PNG or GLB the test made (last 10 tests of each worker). */
+router.get('/api/reuse/workers/:name/tests/:id/output', guard('admin'), (req, res) => {
+  const out = workerTestOutput(req.params.name, req.params.id);
+  if (!out.ok) return res.status(out.status).json({ error: out.error });
+  res.set({
+    'Content-Type': out.ext === 'png' ? 'image/png' : 'model/gltf-binary', 'X-Sha256': out.sha256, 'Cache-Control': 'no-store',
+    'Content-Disposition': `attachment; filename="${req.params.name}-test-${Number(req.params.id)}.${out.ext}"`
+  });
+  res.sendFile(path.resolve(out.file), { cacheControl: false, dotfiles: 'allow' }, (e) => { if (e && !res.headersSent) res.status(e.status || 500).end(); });
+});
 
 // ----- Worker ----------------------------------------------------------------
 
@@ -219,6 +230,13 @@ router.post('/api/reuse/worker/status', guard('worker'), json, (req, res) => {
  */
 router.post('/api/reuse/worker/tests/:id', guard('worker'), jsonReport, (req, res) => {
   answer(res, reportWorkerTest(req.reuseCaller.name, req.params.id, req.body));
+});
+
+/** POST /api/reuse/worker/tests/:id/output?ext=png|glb - Raw file made by the test, header X-Sha256 (before the final report). */
+router.post('/api/reuse/worker/tests/:id/output', guard('worker'), express.raw({ type: () => true, limit: config.gpuMaxOutputSize }), (req, res) => {
+  answer(res, storeTestOutput(req.reuseCaller.name, req.params.id, {
+    data: Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0), sha256: req.get('X-Sha256'), ext: one(req.query.ext)
+  }));
 });
 
 /** GET /api/reuse/jobs/:id/input - Source FLAC (the worker holding the job, or admin). */

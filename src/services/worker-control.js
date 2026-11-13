@@ -63,7 +63,8 @@ db.exec(`
     requested_at INTEGER NOT NULL,
     started_at INTEGER,
     updated_at INTEGER,
-    finished_at INTEGER
+    finished_at INTEGER,
+    output TEXT                                -- {ext, size, sha256} of the file the test made (PNG, GLB), kept on the hub
   );
   CREATE INDEX IF NOT EXISTS idx_reuse_worker_tests ON reuse_worker_tests (worker, status, id);
 `);
@@ -87,6 +88,8 @@ const q = {
                       updated_at = ?, finished_at = ? WHERE id = ?`),
   silent: db.prepare(`SELECT id, worker FROM reuse_worker_tests WHERE status = 'running' AND updated_at < ?`),
   stale: db.prepare(`SELECT id, worker FROM reuse_worker_tests WHERE status = 'pending' AND requested_at < ?`),
+  setOutput: db.prepare('UPDATE reuse_worker_tests SET output = ? WHERE id = ?'),
+  withOutput: db.prepare(`SELECT id, output FROM reuse_worker_tests WHERE worker = ? AND output IS NOT NULL ORDER BY id DESC`),
   close: db.prepare(`UPDATE reuse_worker_tests SET status = ?, error = ?, stage = NULL, finished_at = ?
                      WHERE id = ? AND status IN ('pending', 'running')`)
 };
@@ -196,6 +199,7 @@ export function testView(t) {
     id: t.id, worker: t.worker, kind: t.kind, params: parse(t.params) || {}, status: t.status,
     ...(t.stage ? { stage: t.stage } : {}), ...(t.progress != null ? { progress: t.progress } : {}),
     ok: t.ok == null ? null : Boolean(t.ok), error: t.error || null, result: parse(t.result),
+    ...(t.output ? { output: { ...parse(t.output), url: `/api/reuse/workers/${t.worker}/tests/${t.id}/output` } } : {}),
     requested_at: iso(t.requested_at), started_at: iso(t.started_at), finished_at: iso(t.finished_at),
     ...(t.started_at ? { elapsed_s: Math.round(((t.finished_at || Date.now()) - t.started_at) / 1000) } : {})
   };
@@ -289,4 +293,29 @@ export function reportTest(name, id, { status, stage, progress, report } = {}, n
   q.finish.run(ok ? 'done' : 'failed', ok ? 1 : 0, clip(report || {}, RESULT_MAX), error, ok ? 1 : prog, now, now, t.id);
   journal(name, 'test_finished', { test: t.id, kind: t.kind, ok, compute_s: report?.compute_s ?? null, ...(error ? { error: error.slice(0, 200) } : {}) }, now);
   return { ok: true, cancel: false };
+}
+
+// ---------------------------------------------------------------------------
+// File made by a test (image, GLB): what shows the result is right, beyond the figures
+// ---------------------------------------------------------------------------
+export const TEST_OUTPUT_EXT = /^(png|glb)$/;
+export const TEST_OUTPUTS_KEPT = 10;   // per worker; older files are removed, their reports stay
+
+/** Record the file of a test the worker is running or has just finished. -> {ok, drop: [ids whose file to delete]}. */
+export function noteTestOutput(name, id, { ext, size, sha256 }) {
+  const t = q.test.get(Number(id));
+  if (!t || t.worker !== name) return err(404, 'Unknown test');
+  if (t.status === 'cancelled') return err(409, 'Test is cancelled');
+  if (t.finished_at && Date.now() - t.finished_at > 10 * 60 * 1000) return err(409, 'Test finished more than 10 min ago');
+  q.setOutput.run(JSON.stringify({ ext, size, sha256 }), t.id);
+  const drop = q.withOutput.all(name).slice(TEST_OUTPUTS_KEPT).map(r => ({ id: r.id, ext: parse(r.output)?.ext }));
+  for (const d of drop) q.setOutput.run(null, d.id);
+  return { ok: true, drop };
+}
+
+/** {ext, size, sha256} of a test's file, or null. */
+export function testOutput(name, id) {
+  const t = q.test.get(Number(id));
+  if (!t || t.worker !== name || !t.output) return null;
+  return parse(t.output);
 }
