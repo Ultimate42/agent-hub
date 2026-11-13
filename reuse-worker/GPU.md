@@ -169,7 +169,10 @@ Le catalogue garde donc le contournement `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`
 C'est pourquoi une machine ne propose la 3D que si `enable_3d` est vrai, dans sa config ou posé par le hub.
 
 L'essai 3D le vérifie.
-- Il fait d'abord une image 512 s'il n'a pas d'image d'entrée.
+- Demandé par le hub, il part de `gpu-test-object.png`, livrée avec le worker : une tasse rouge sur fond blanc,
+  rendue maison par `scripts/render-gpu-test-object.py`, donc sans licence tierce. Il ne dépend donc pas du moteur
+  image, et deux essais se comparent sur la même entrée.
+- En local, sans `--gpu-input`, il prend l'image du dernier essai image, ou en fait une en 512 d'abord.
 - Le rapport donne :
   - `glb` : sommets, triangles, textures et boîte englobante. Un GLB sans triangle est un échec ;
   - `nan_lines` : les lignes du journal qui parlent de NaN ;
