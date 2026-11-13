@@ -88,6 +88,7 @@ const q = {
                       updated_at = ?, finished_at = ? WHERE id = ?`),
   silent: db.prepare(`SELECT id, worker FROM reuse_worker_tests WHERE status = 'running' AND updated_at < ?`),
   stale: db.prepare(`SELECT id, worker FROM reuse_worker_tests WHERE status = 'pending' AND requested_at < ?`),
+  keepReport: db.prepare('UPDATE reuse_worker_tests SET result = ?, stage = NULL, finished_at = COALESCE(finished_at, ?) WHERE id = ?'),
   setOutput: db.prepare('UPDATE reuse_worker_tests SET output = ? WHERE id = ?'),
   withOutput: db.prepare(`SELECT id, output FROM reuse_worker_tests WHERE worker = ? AND output IS NOT NULL ORDER BY id DESC`),
   close: db.prepare(`UPDATE reuse_worker_tests SET status = ?, error = ?, stage = NULL, finished_at = ?
@@ -260,28 +261,41 @@ export function pendingTest(name, now = Date.now()) {
   return { id: t.id, kind: t.kind, params: parse(t.params) || {} };
 }
 
-function clip(value, max) {
+/** JSON of a report, at most max characters, always valid: the scalar fields and the end of the log (why it failed) first. */
+export function clip(value, max) {
   const s = JSON.stringify(value ?? null);
   if (s.length <= max) return s;
-  // Too big: keep the scalar fields and the end of the log, which says why it failed
-  const small = {};
+  const small = { truncated: true };
   for (const [k, v] of Object.entries(value || {})) if (v === null || typeof v !== 'object') small[k] = typeof v === 'string' ? v.slice(0, 2000) : v;
-  if (Array.isArray(value?.log)) small.log = value.log.slice(-40).map(l => String(l).slice(0, 300));
-  small.truncated = true;
-  return JSON.stringify(small).slice(0, max);
+  const log = Array.isArray(value?.log) ? value.log.slice(-40).map(l => String(l).slice(0, 300)) : [];
+  for (let n = log.length; n >= 0; n = n > 4 ? Math.floor(n / 2) : n - 1) {
+    const out = JSON.stringify(n ? { ...small, log: log.slice(-n) } : small);
+    if (out.length <= max) return out;
+  }
+  return JSON.stringify({ truncated: true, ok: value?.ok ?? null, error: String(value?.error ?? '').slice(0, Math.max(0, max - 100)) });
 }
 
 /**
  * Worker report on a test it was given: {status: 'running', stage, progress} while it runs, then
  * {status: 'done'|'failed', report: {ok, compute_s, error, log, ...}}. -> {ok, cancel} (cancel: stop now).
  */
-export function reportTest(name, id, { status, stage, progress, report } = {}, now = Date.now()) {
+export function reportTest(name, id, { status, stage, progress, report } = {}, now = Date.now(), stopReason = null) {
   const t = q.test.get(Number(id));
   if (!t || t.worker !== name) return err(404, 'Unknown test');
-  if (t.status === 'cancelled') return { ok: true, cancel: true };
+  if (t.status === 'cancelled') {
+    // Stopped (admin, pause, end of the schedule): the worker still sends what it got, kept with the test
+    if ((status === 'done' || status === 'failed') && report && typeof report === 'object') q.keepReport.run(clip(report, RESULT_MAX), now, t.id);
+    return { ok: true, cancel: true, reason: t.error };
+  }
   if (!['pending', 'running'].includes(t.status)) return err(409, `Test is ${t.status}`);
   const p = Number(progress);
   const prog = Number.isFinite(p) ? Math.min(Math.max(p, 0), 1) : null;
+  if (status === 'running' && stopReason) {
+    // The machine is no longer free (window closed, paused): stop now; what is installed or downloaded stays for the next test
+    q.close.run('cancelled', `stopped: ${stopReason}`, now, t.id);
+    journal(name, 'test_stopped', { test: t.id, kind: t.kind, reason: stopReason }, now);
+    return { ok: true, cancel: true, reason: `stopped: ${stopReason}` };
+  }
   if (status === 'running') {
     if (t.status === 'pending') journal(name, 'test_started', { test: t.id, kind: t.kind }, now);
     q.start.run(now, now, stage ? String(stage).slice(0, 200) : null, prog, t.id);
@@ -305,7 +319,6 @@ export const TEST_OUTPUTS_KEPT = 10;   // per worker; older files are removed, t
 export function noteTestOutput(name, id, { ext, size, sha256 }) {
   const t = q.test.get(Number(id));
   if (!t || t.worker !== name) return err(404, 'Unknown test');
-  if (t.status === 'cancelled') return err(409, 'Test is cancelled');
   if (t.finished_at && Date.now() - t.finished_at > 10 * 60 * 1000) return err(409, 'Test finished more than 10 min ago');
   q.setOutput.run(JSON.stringify({ ext, size, sha256 }), t.id);
   const drop = q.withOutput.all(name).slice(TEST_OUTPUTS_KEPT).map(r => ({ id: r.id, ext: parse(r.output)?.ext }));

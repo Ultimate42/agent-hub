@@ -372,7 +372,9 @@ export function claimJob(name, now = Date.now(), other = null) {
     if (otherHeld) return otherHeld;
     if (!workerInWindow(name, now)) return null;
     // A remote GPU test is waiting (workerOrders hands it out): no new job, so the machine is free to run it
-    if (pendingTest(name, now)) return null;
+    // Only when the machine runs that kind of test: an older worker (or one rolled back) would never take it and get nothing
+    const waiting = pendingTest(name, now);
+    if (waiting && announcesTest(name, waiting.kind)) return null;
     const otherNext = other?.next(now);
     if (otherNext) return otherNext;
     for (;;) {
@@ -545,23 +547,40 @@ export const setWorkerSettings = (name, patch) => onWorker(name, () => {
   const r = patchWorkerSettings(name, patch);
   return r.ok ? { ...r, worker: name } : r;
 });
-/** Queue a remote GPU test. warning: why it may not start soon (version without remote tests, out of schedule, paused). */
-export const requestWorkerTest = (name, body) => onWorker(name, () => {
-  const r = createTest(name, body || {});
-  if (!r.ok) return r;
+/** Does this worker say (info.tests, at its last poll) it runs this kind of remote test? */
+function announcesTest(name, kind) {
+  return String(parseParams(q.worker.get(name)?.info).tests || '').split(',').includes(kind);
+}
+
+/** Why a pending test may not start soon (version without remote tests, out of schedule, paused), or undefined. */
+function testWarning(name, kind) {
   const w = q.worker.get(name);
-  const info = parseParams(w?.info);
   const warnings = [];
-  if (!String(info.tests || '').split(',').includes(r.test.kind)) {
-    warnings.push(`${name} (version ${info.version || '?'}) has not announced "${r.test.kind}" tests yet: it runs the test once updated ({update: true})`);
+  if (!announcesTest(name, kind)) {
+    const version = parseParams(w?.info).version || '?';
+    warnings.push(`${name} (version ${version}) has not announced "${kind}" tests: it keeps getting jobs and runs the test once updated ({update: true})`);
   }
   const window = workerWindow(name);
   if (!window.in_window) warnings.push(`out of its schedule: starts at ${window.next_window_start || 'its next window'}`);
   if (w?.paused) warnings.push('paused: starts once resumed ({pause: false})');
-  return warnings.length ? { ...r, warning: warnings.join('; ') } : r;
+  return warnings.length ? warnings.join('; ') : undefined;
+}
+const withWarning = (name, t) => (t?.status === 'pending' ? { ...t, warning: testWarning(name, t.kind) } : t);
+
+/** Queue a remote GPU test. warning: why it may not start soon (also on GET while it waits). */
+export const requestWorkerTest = (name, body) => onWorker(name, () => {
+  const r = createTest(name, body || {});
+  if (!r.ok) return r;
+  const warning = testWarning(name, r.test.kind);
+  return warning ? { ...r, warning } : r;
 });
-export const listWorkerTests = (name, limit) => onWorker(name, () => ({ ok: true, worker: name, tests: listTests(name, limit) }));
-export const getWorkerTest = (name, id) => onWorker(name, () => getTest(name, id));
+export const listWorkerTests = (name, limit) => onWorker(name, () => ({
+  ok: true, worker: name, tests: listTests(name, limit).map(t => withWarning(name, t))
+}));
+export const getWorkerTest = (name, id) => onWorker(name, () => {
+  const r = getTest(name, id);
+  return r.ok ? { ...r, test: withWarning(name, r.test) } : r;
+});
 export const cancelWorkerTest = (name, id) => onWorker(name, () => cancelTest(name, id));
 const testOutputPath = (id, ext) => path.join(config.reuseDir, 'tests', `${Number(id)}.${ext}`);
 
@@ -596,8 +615,11 @@ export function workerTestOutput(name, id) {
 /** Worker side: progress and final report of a test it was given; answers {cancel} and its orders. */
 export function reportWorkerTest(name, id, body) {
   if (body?.info && typeof body.info === 'object') noteReusePoll(name, body.info); // busy with a test is still online
-  const r = reportTest(name, id, body || {});
-  return r.ok ? { ...r, orders: workerOrders(name) } : r;
+  // A test runs only while the machine is free: paused or past its window, the worker is told to stop (within 20 s)
+  const now = Date.now();
+  const stop = q.worker.get(name)?.paused ? 'paused by the admin' : (!workerInWindow(name, now) ? 'end of the schedule of this machine' : null);
+  const r = reportTest(name, id, body || {}, now, stop);
+  return r.ok ? { ...r, orders: workerOrders(name, now) } : r;
 }
 
 /** Schedule of one worker and where it stands now. */

@@ -229,6 +229,46 @@ describe('RE-USE worker remote control', () => {
     assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${id}/cancel`, { method: 'POST', token: ADMIN })).status, 409);
   });
 
+  test('tests: a worker that does not run that kind of test keeps getting jobs; the reason is readable while it waits', async () => {
+    const id = (await ask('dev-box', { kind: '3d' })).data.test.id;
+    await call('/api/reuse/workers/dev-box/order', { method: 'POST', token: ADMIN, body: { pause: false } });
+    const done = (j) => call(`/api/reuse/jobs/${j.id}/result?compute_s=1`, { method: 'POST', token: NV, rawBody: fakeFlac(`${j.name}-clean`),
+      headers: { 'X-Sha256': crypto.createHash('sha256').update(fakeFlac(`${j.name}-clean`)).digest('hex') } });
+    const held = (await next(NV, { version: 'v1' })).data.job;   // the job dev-box took earlier: finished first
+    if (held) assert.strictEqual((await done(held)).status, 200);
+    await call('/api/reuse/jobs?batch=t&name=t_old.flac', { method: 'POST', token: ADMIN, rawBody: fakeFlac('old') });
+    const got = await next(NV, { version: 'v1' });            // old version, no info.tests: never blocked
+    assert.strictEqual(got.data.job?.name, 't_old.flac');
+    assert.strictEqual(got.data.orders.gpu_test.id, id, 'still offered: an updated worker will take it');
+    const t = await readTest(id, 'dev-box');
+    assert.strictEqual(t.status, 'pending');
+    assert.match(t.warning, /has not announced "3d" tests: it keeps getting jobs/);
+    const listed = (await call('/api/reuse/workers/dev-box/tests', { token: ADMIN })).data.tests.find(x => x.id === id);
+    assert.match(listed.warning, /has not announced/);
+    // A version that announces other kinds only is not blocked either
+    assert.strictEqual((await done(got.data.job)).status, 200);
+    await call('/api/reuse/jobs?batch=t&name=t_old2.flac', { method: 'POST', token: ADMIN, rawBody: fakeFlac('old2') });
+    assert.strictEqual((await next(NV, { version: 'v2', tests: 'image' })).data.job?.name, 't_old2.flac');
+    assert.strictEqual((await call(`/api/reuse/workers/dev-box/tests/${id}/cancel`, { method: 'POST', token: ADMIN })).status, 200);
+  });
+
+  test('tests: paused while running, the worker is told to stop; the report it still sends is kept', async () => {
+    const id = (await ask('gpu-box', { kind: 'comfyui' })).data.test.id;
+    assert.strictEqual((await next(AMD, NEW_WORKER)).data.orders.gpu_test.id, id);
+    assert.strictEqual((await report(id, { status: 'running', stage: 'pip' })).data.cancel, false);
+    await call('/api/reuse/workers/gpu-box/order', { method: 'POST', token: ADMIN, body: { pause: true } });
+    const told = await report(id, { status: 'running', stage: 'téléchargement' });
+    assert.strictEqual(told.data.cancel, true);
+    assert.match(told.data.reason, /paused/);
+    const last = await report(id, { status: 'failed', report: { ok: false, error: 'annulé : téléchargement interrompu', disk: { need_gb: 20.7 } } });
+    assert.strictEqual(last.status, 200);
+    const t = await readTest(id);
+    assert.strictEqual(t.status, 'cancelled');
+    assert.match(t.error, /stopped: paused by the admin/);
+    assert.strictEqual(t.result.disk.need_gb, 20.7, 'what it got before stopping is kept');
+    await call('/api/reuse/workers/gpu-box/order', { method: 'POST', token: ADMIN, body: { pause: false } });
+  });
+
   test('tests: never handed out while paused or out of the schedule; then the queue resumes', async () => {
     const id = (await ask('gpu-box', { kind: 'image' })).data.test.id;
     await call('/api/reuse/workers/gpu-box/order', { method: 'POST', token: ADMIN, body: { pause: true } });
@@ -272,6 +312,17 @@ describe('worker-control: expiry (clock passed in)', () => {
     assert.match(wc.getTest('pc-x', b, t0 + wc.TEST_PENDING_MS + 1).test.error, /not started within 24 h/);
     const events = wc.workerEvents('pc-x').map(e => e.what);
     assert.ok(events.includes('test_lost') && events.includes('test_expired'));
+  });
+
+  test('a cut report is always valid JSON, whatever is too big', () => {
+    const huge = { ok: false, error: 'e'.repeat(5000), note: 'n'.repeat(40000), log: Array.from({ length: 100 }, () => 'l'.repeat(300)) };
+    for (const max of [32768, 4000, 600, 200]) {
+      const out = wc.clip(huge, max);
+      assert.ok(out.length <= max, `${out.length} > ${max}`);
+      const parsed = JSON.parse(out);
+      assert.strictEqual(parsed.truncated, true);
+      assert.strictEqual(parsed.ok, false);
+    }
   });
 
   test('a setting of 0 is kept (not mistaken for absent); an unknown test id is a 404', () => {
