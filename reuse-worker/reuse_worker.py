@@ -2697,6 +2697,7 @@ COMFY_OPTIONS = {
     'no_async_offload': (['--disable-async-offload'], [], {}),
     'no_smart_memory': (['--disable-smart-memory'], [], {}),           # modèle inutilisé déchargé tout de suite (l'encodeur avant le DiT)
     'reserve_vram_2': (['--reserve-vram', '2'], [], {}),
+    'no_comfy_compiler': (['--disable-comfy-compiler'], [], {}),
     # Allocateur de PyTorch : au-delà de la mémoire physique, Windows prête de la mémoire partagée (lente) au lieu d'échouer
     'alloc_expandable': ([], [], {'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True', 'PYTORCH_ALLOC_CONF': 'expandable_segments:True'}),
     'alloc_gc': ([], [], {'PYTORCH_HIP_ALLOC_CONF': 'garbage_collection_threshold:0.7,max_split_size_mb:256',

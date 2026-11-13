@@ -99,6 +99,21 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
   - `text_encoder` : gpu par défaut, 60 à 95 s avant le DiT (contre 422 s sur le processeur, job 54). Ancien défaut :
     cpu. L'encodeur, 8,9 Go en fp16, calcule sur le processeur, et le DiT reste seul sur la
     carte d'un travail à l'autre. Avec gpu, l'encodeur passe sur la carte, puis il est déchargé avant le DiT.
+- **Mesures de la nuit du 13/11** (gpu-box, 1024, poids bf16 calculés en fp32, attention quad sauf mention) :
+
+  | Job | Références | Temps par étape | Image |
+  |---|---|---|---|
+  | 56 | aucune | 4,73 s, 16 étapes | juste (en fp16 : noire) |
+  | 60 | 1 à 0,5 Mpx | environ 50 s | juste |
+  | 58 | 1 à 1 Mpx | environ 125 s | juste |
+  | 59 | 1 à 1 Mpx, attention split | environ 86 s | juste |
+  | 61 | 1 à 1 Mpx, encodeur sur le processeur | plus de 110 s | annulé |
+
+  - La première étape est rapide (6 à 16 s), les suivantes lentes.
+  - Le temps grandit bien plus vite que le nombre de jetons (4 100, 6 100, 8 200).
+  - Ce n'est ni la précision, ni l'encodeur resté sur la carte, ni la forme d'attention seule.
+  - Piste en cours : l'état mémoire après la première étape (allocateur, mémoire partagée de Windows). Les jetons
+    `alloc_expandable`, `alloc_gc`, `kitchen_hip_off`, `no_comfy_compiler` et `reserve_vram_2` servent à la vérifier.
 - **Diagnostic dans `engine` du job** :
   - `weight_dtype` et `compute_dtype`, la précision réelle ;
   - `dit_load` et `te_load`, les lignes de chargement du DiT et de l'encodeur (complet ou partiel). `load` est la
