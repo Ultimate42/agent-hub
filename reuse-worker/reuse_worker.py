@@ -1171,7 +1171,7 @@ class Gpu:
         if unknown:
             meta['comfyui_options_ignored'] = ','.join(unknown)[:120]
         env = dict(env)
-        for k in [k for k in env if k.startswith('COMFY_KITCHEN_')]:
+        for k in [k for k in env if k.startswith(('COMFY_KITCHEN_', 'PYTORCH_HIP_ALLOC', 'PYTORCH_ALLOC'))]:
             env.pop(k)
         env.update(opt_env)
         if self.hip_device:
@@ -2351,6 +2351,9 @@ class ComfyTrace(EngineTrace):
 
     def line(self, line):
         super().line(line)
+        m = re.search(r'Prompt executed in (\d+):(\d\d):(\d\d)', line)   # au-delà d'une minute : « 00:10:21 »
+        if m:
+            self.meta['executed_s'] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
         # Ce qui explique une lenteur : précision réelle, mode mémoire, chargement complet ou partiel des poids
         m = re.search(r'model weight dtype (?:torch\.)?(\w+), manual cast: (?:torch\.)?(\w+)', line)
         if m:
@@ -2692,7 +2695,12 @@ COMFY_OPTIONS = {
     'fp16_accumulation': (['--fast', 'fp16_accumulation'], [], {}),
     'pinned_memory': ([], ['--disable-pinned-memory'], {}),
     'no_async_offload': (['--disable-async-offload'], [], {}),
-    'no_smart_memory': (['--disable-smart-memory'], [], {}),
+    'no_smart_memory': (['--disable-smart-memory'], [], {}),           # modèle inutilisé déchargé tout de suite (l'encodeur avant le DiT)
+    'reserve_vram_2': (['--reserve-vram', '2'], [], {}),
+    # Allocateur de PyTorch : au-delà de la mémoire physique, Windows prête de la mémoire partagée (lente) au lieu d'échouer
+    'alloc_expandable': ([], [], {'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True', 'PYTORCH_ALLOC_CONF': 'expandable_segments:True'}),
+    'alloc_gc': ([], [], {'PYTORCH_HIP_ALLOC_CONF': 'garbage_collection_threshold:0.7,max_split_size_mb:256',
+                          'PYTORCH_ALLOC_CONF': 'garbage_collection_threshold:0.7,max_split_size_mb:256'}),
 }
 
 

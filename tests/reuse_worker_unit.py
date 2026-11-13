@@ -707,6 +707,8 @@ class ComfyTest(unittest.TestCase):
         self.assertEqual(t.summary()['s_per_step'], 13.31)
         self.assertEqual(t.summary()['executed_s'], 131.5)
         self.assertTrue(any('loaded partially' in l for l in t.lines))
+        t.feed(b'Prompt executed in 00:10:21\n')
+        self.assertEqual(t.summary()['executed_s'], 621)
 
     def test_disk_cap_refuses_before_any_download(self):
         base = self.dir
