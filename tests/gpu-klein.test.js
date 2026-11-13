@@ -116,7 +116,7 @@ describe('FLUX 3 Klein: references and model announcement', () => {
     }
     assert.strictEqual(got.id, id);
     assert.strictEqual(got.model, 'flux3-klein');
-    assert.deepStrictEqual(got.params, { width: 1024, height: 1024, steps: 12, seed: 9, unet_dtype: 'default', attention: 'quad', dynamic_vram: false, ref_megapixels: 1, vram_mode: 'high', text_encoder: 'gpu', comfyui_options: '' });
+    assert.deepStrictEqual(got.params, { width: 1024, height: 1024, steps: 12, seed: 9, unet_dtype: 'default', attention: 'quad', dynamic_vram: false, ref_megapixels: 1, vram_mode: 'high', text_encoder: 'gpu', comfyui_options: 'alloc_expandable,no_comfy_compiler' });
     assert.deepStrictEqual(got.references.map(x => [x.n, x.format, x.size, x.sha256]), refs.map((b, n) => [n, n % 2 ? 'jpg' : 'png', b.length, sha(b)]));
     for (const [n, b] of refs.entries()) {
       const dl = await call(`/api/gpu/jobs/${id}/references/${n}`, { token: AMD });

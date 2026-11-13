@@ -108,12 +108,15 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
   | 58 | 1 à 1 Mpx | environ 125 s | juste |
   | 59 | 1 à 1 Mpx, attention split | environ 86 s | juste |
   | 61 | 1 à 1 Mpx, encodeur sur le processeur | plus de 110 s | annulé |
+  | 63 | 1 à 1 Mpx, `alloc_expandable` | 39,3 s, 16 étapes, 777 s en tout | juste |
+  | 62 | 1 à 1 Mpx, `alloc_expandable,no_comfy_compiler` | **18,0 s** | juste |
 
   - La première étape est rapide (6 à 16 s), les suivantes lentes.
   - Le temps grandit bien plus vite que le nombre de jetons (4 100, 6 100, 8 200).
   - Ce n'est ni la précision, ni l'encodeur resté sur la carte, ni la forme d'attention seule.
-  - Piste en cours : l'état mémoire après la première étape (allocateur, mémoire partagée de Windows). Les jetons
-    `alloc_expandable`, `alloc_gc`, `kitchen_hip_off`, `no_comfy_compiler` et `reserve_vram_2` servent à la vérifier.
+  - Cause : l'allocateur de PyTorch par segments fixes, et le compilateur de modèle de ComfyUI. Les deux sont réglés par
+    défaut depuis le 14/11 (`comfyui_options` : `alloc_expandable,no_comfy_compiler`), soit 18,0 s par étape avec une
+    référence à 1 Mpx.
 - **Diagnostic dans `engine` du job** :
   - `weight_dtype` et `compute_dtype`, la précision réelle ;
   - `dit_load` et `te_load`, les lignes de chargement du DiT et de l'encodeur (complet ou partiel). `load` est la

@@ -290,9 +290,9 @@
             "comfyui_options": {
              "type": "string",
              "max": 200,
-             "default": "",
+             "default": "alloc_expandable,no_comfy_compiler",
              "admin": true,
-             "notes": "Essais sans redéploiement, jetons séparés par des virgules : kitchen_hip_off, upcast_attention, no_upcast_attention, fp16_accumulation, pinned_memory, no_async_offload, no_smart_memory (modèle inutilisé déchargé tout de suite), reserve_vram_2, alloc_expandable et alloc_gc (allocateur de PyTorch), no_fallback. Un jeton inconnu est ignoré (engine.comfyui_options_ignored)."
+             "notes": "Défaut : alloc_expandable,no_comfy_compiler. Mesuré la nuit du 13/11 avec 1 référence à 1 Mpx en 1024 : 125 s par étape sans (job 58), 39,3 s avec alloc_expandable seul (job 63), 18,0 s avec les deux (job 62), image juste. Autres jetons, sans redéploiement : jetons séparés par des virgules : kitchen_hip_off, upcast_attention, no_upcast_attention, fp16_accumulation, pinned_memory, no_async_offload, no_smart_memory (modèle inutilisé déchargé tout de suite), reserve_vram_2, alloc_expandable et alloc_gc (allocateur de PyTorch), no_fallback. Un jeton inconnu est ignoré (engine.comfyui_options_ignored)."
             }
            },
            "workflow_source": "workflows/flux3_klein_bf16_mi2i.json du depot black-forest-labs/flux-3-image-klein-comfy (sous-graphe Multiple image to image, sans l'agrandisseur de prompt), converti au format API",
