@@ -575,6 +575,25 @@ class GpuTestHelpersTest(unittest.TestCase):
         self.assertTrue(any('[5/7]' in l for l in t.lines))
 
 
+class SteadyRateTest(unittest.TestCase):
+    def test_one_slow_step_does_not_stop_a_fast_run(self):
+        now = [0.0]
+        t = w.ComfyTrace(16, clock=lambda: now[0])
+        for i, at in enumerate([8, 228, 234, 240, 246], 1):   # jobs 54/57 : une étape lente, puis le vrai rythme ?
+            now[0] = at
+            t.feed((' %d/16 [00:00<00:00, 115.80s/it]\r' % i).encode().replace(b' %d/16' % i, b'|##| %d/16' % i))
+        self.assertEqual(t.step_durations(), [220, 6, 6, 6])
+        self.assertEqual(t.steady_rate(), 6)
+        self.assertEqual(t.summary()['s_per_step'], 6)
+        self.assertEqual(t.summary()['tqdm_s_per_step'], 115.8)
+        self.assertEqual(t.summary()['step_times'], '220.0,6.0,6.0,6.0')
+        slow = w.ComfyTrace(16, clock=lambda: now[0])
+        for i, at in enumerate([8, 120, 232, 344], 1):
+            now[0] = at
+            slow.feed(('|##| %d/16 [00:00<00:00, 112.00s/it]\r' % i).encode())
+        self.assertEqual(slow.steady_rate(), 112)
+
+
 class ComfyTest(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
@@ -807,7 +826,7 @@ class KleinJobTest(unittest.TestCase):
             make_png(work / ('ref%d.png' % n), 32, 24)
             refs.append(str(work / ('ref%d.png' % n)))
         job = {'id': 7, 'kind': 'image', 'model': 'flux3-klein', 'prompt': 'the cat from the first image on the sofa from the second image',
-               'params': {'width': 320, 'height': 256, 'steps': 4, 'seed': 5}, 'ref_paths': refs}
+               'params': {'width': 320, 'height': 256, 'steps': 4, 'seed': 5, 'unet_dtype': 'fp16'}, 'ref_paths': refs}
         stages = []
         try:
             out, secs, meta = gpu.run(job, None, work, None, lambda f, st: stages.append(st))
@@ -821,7 +840,7 @@ class KleinJobTest(unittest.TestCase):
             self.assertEqual(wf['refs']['inputs']['images.image1'], ['ref1', 0])
             self.assertEqual(wf['refs']['inputs']['resolution.megapixels'], 1.0)
             self.assertEqual(wf['pos']['inputs']['text'], job['prompt'])
-            self.assertEqual(wf['clip']['inputs']['device'], 'cpu', 'text encoder on the processor by default')
+            self.assertEqual(wf['clip']['inputs']['device'], 'default', 'text encoder on the card by default (422 s on the processor, job 54)')
             self.assertEqual(wf['latent']['inputs'], {'width': 320, 'height': 256, 'batch_size': 1})
             self.assertEqual(wf['sampler']['inputs']['steps'], 4)
             self.assertEqual(list((lay['data'] / 'input').iterdir()), [], 'references removed from ComfyUI')
@@ -844,7 +863,7 @@ class KleinJobTest(unittest.TestCase):
             self.assertGreaterEqual(meta['before_dit_s'], 0.3)
             self.assertIn('vram_free_min_mib', meta)
             self.assertIn('--highvram', cmd)
-            self.assertEqual(meta['text_encoder'], 'cpu')
+            self.assertEqual(meta['text_encoder'], 'gpu')
             self.assertEqual(meta['vram_state'], 'NORMAL_VRAM')
             self.assertEqual(meta['unet_dtype'], 'fp16')
             self.assertIn('vram_free_before_mib', meta)
@@ -854,17 +873,30 @@ class KleinJobTest(unittest.TestCase):
             (lay['data'] / 'flat-fp16').write_text('')
             out3, _, meta3 = gpu.run(dict(job, id=9, ref_paths=[]), None, work, None, lambda f, st: None)
             self.assertTrue(meta3['half_fallback'])
+            self.assertRegex(meta3['try_first'], r'^fp16 quad : 0\.05 s/étape, [\d.]+ s, écart 0\.0$')
+            self.assertRegex(meta3['try_second'], r'^default quad : ')
             self.assertEqual(meta3['compute_dtype'], 'float32')
             self.assertGreater(w.png_stats(out3)['std'], 2)
             self.assertNotIn('--fp16-unet', (base / 'gpu' / 'logs' / 'comfyui.log').read_text().splitlines()[0])
             (lay['data'] / 'flat-fp16').unlink()
 
+            # Options d'essai : jetons connus seulement, environnement et ligne de commande
+            gpu.stop_comfy()
+            out4, _, meta4 = gpu.run(dict(job, id=11, ref_paths=[], params=dict(job['params'], comfyui_options='kitchen_hip_off, pinned_memory,rm -rf,no_fallback')),
+                                     None, work, None, lambda f, st: None)
+            cmd4 = (base / 'gpu' / 'logs' / 'comfyui.log').read_text().splitlines()[0]
+            self.assertNotIn('--disable-pinned-memory', cmd4)
+            self.assertIn('COMFY_KITCHEN_DISABLE_HIP=1', meta4['comfyui_flags'])
+            self.assertEqual(meta4['comfyui_options_ignored'], 'rm -rf')
+            self.assertEqual(w.comfy_options('upcast_attention,fp16_accumulation')[0], ['--force-upcast-attention', '--fast', 'fp16_accumulation'])
+
             # Trop lent pour le plafond : arrêt dès la deuxième étape mesurée, échec définitif avec la raison
             gpu.stop_comfy()
             (lay['data'] / 'slow').write_text('')
+            model['timeout_s'] = 1.5   # 16 étapes de 0,2 s ne tiennent pas : arrêt sur le rythme mesuré, pas sur l'affichage de tqdm
             with self.assertRaises(w.Final) as e:
                 gpu.run(dict(job, id=10, ref_paths=[], params=dict(job['params'], steps=16)), None, work, None, lambda f, st: None)
-            self.assertIn('trop lent : 500.0 s par étape', str(e.exception))
+            self.assertRegex(str(e.exception), r'trop lent : 0\.2 s par étape \(étapes : 0,0,0')
             self.assertIn('float16', str(e.exception))
             self.assertIsNone(gpu.comfy, 'ComfyUI stopped, card given back')
         finally:

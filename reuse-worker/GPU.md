@@ -84,7 +84,9 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
 - **Lenteur du job 52 (13/11), 232 s par étape.** ComfyUI n'autorise pas le fp16 pour Flux3 : sur RDNA2, qui n'a pas de
   bf16, il calculait donc en fp32 (« manual cast »). Le DiT ne tenait plus en mémoire vidéo, et le chargement dynamique
   relisait les poids à chaque étape. Réglages admin du modèle (ils relancent ComfyUI) :
-  - `unet_dtype` : fp16 par défaut (`--fp16-unet`). Si l'image sort unie (NaN), le même job est refait en `default` ;
+  - `unet_dtype` : default par défaut, soit des poids bf16 calculés en fp32. Sans référence, c'est 4,73 s par étape et
+    une image juste (job 56). En fp16, l'image sort noire (NaN, job 56). Si on impose fp16 et que l'image sort unie, le
+    job est refait en default, sauf avec le jeton `no_fallback` ;
   - `dynamic_vram` : false par défaut (`--disable-dynamic-vram`) ;
   - `attention` : quad par défaut, ou split ou pytorch ;
   - `ref_megapixels` : 1,0 par défaut, 0,25 au plus petit ;
@@ -93,7 +95,9 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
       prudente. Avec l'attention quad, c'est environ 9 Go à 1024 avec une référence.
     - Il ne chargeait donc que 6,2 Go du DiT de 11,1 Go, et faisait passer le reste à chaque étape.
     - En high, le DiT est chargé en entier.
-  - `text_encoder` : cpu par défaut. L'encodeur, 8,9 Go en fp16, calcule sur le processeur, et le DiT reste seul sur la
+  - `comfyui_options` : des jetons d'essai pris dans une liste fermée, sans redéployer (voir le catalogue) ;
+  - `text_encoder` : gpu par défaut, 60 à 95 s avant le DiT (contre 422 s sur le processeur, job 54). Ancien défaut :
+    cpu. L'encodeur, 8,9 Go en fp16, calcule sur le processeur, et le DiT reste seul sur la
     carte d'un travail à l'autre. Avec gpu, l'encodeur passe sur la carte, puis il est déchargé avant le DiT.
 - **Diagnostic dans `engine` du job** :
   - `weight_dtype` et `compute_dtype`, la précision réelle ;
@@ -104,7 +108,9 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
   - `vram_state` ;
   - `vram_free_before_mib` et `vram_free_after_mib` ;
   - `comfyui_flags` ;
-  - `s_per_step` ;
+  - `s_per_step`, la médiane des étapes après la première ; `step_times` donne chaque étape, `tqdm_s_per_step` la
+    moyenne lissée de tqdm ;
+  - `try_first` et `try_second` : ce qu'a donné chaque passage quand un repli a eu lieu ;
   - `log`, un extrait du journal de ComfyUI.
 - **Trop lent pour le plafond (30 min)** : dès deux étapes mesurées, le worker arrête le job s'il ne peut pas finir à
   temps. Le message donne la raison chiffrée. L'échec est définitif (`final`) : le hub ne relance pas un calcul qui

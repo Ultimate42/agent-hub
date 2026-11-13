@@ -986,6 +986,8 @@ class EngineTrace:
             self.phase = 'chargement des poids'
             self.progress = max(self.progress, 0.05 + 0.25 * a / b) if self.step is None else self.progress
         elif self.steps and b == self.steps:
+            if a > (self.step or 0):   # durée de chaque étape (la barre se redessine aussi sans avancer)
+                self.step_ends = getattr(self, 'step_ends', []) + [now]
             self.step = a
             self.step_rate = (rate if unit == 's/it' else (1.0 / rate if rate else None))
             if self.first_step_at is None:
@@ -1003,10 +1005,22 @@ class EngineTrace:
             return '%s (%.1f s par étape)' % (self.phase, self.step_rate)
         return self.phase
 
+    def step_durations(self):
+        ends = getattr(self, 'step_ends', [])
+        return [b - a for a, b in zip(ends, ends[1:])]   # la première étape n'a pas de début mesuré : écartée
+
+    def steady_rate(self):
+        """Secondes par étape, médiane des étapes après la première (au moins trois), ou None. Une étape lente isolée (frais
+        d'une fois) ne fait plus arrêter le calcul ; un calcul lent d'un bout à l'autre, si."""
+        d = sorted(self.step_durations())
+        return d[len(d) // 2] if len(d) >= 3 else None
+
     def summary(self):
         meta = dict(self.meta)
         if self.step_rate:
             meta['s_per_step'] = round(self.step_rate, 2)
+        if self.step_durations():
+            meta['step_times'] = ','.join('%.1f' % x for x in self.step_durations()[:24])[:190]
         if self.first_step_at is not None:
             meta.setdefault('before_steps_s', round(self.first_step_at - self.t0, 1))
         return meta
@@ -1027,6 +1041,7 @@ class Gpu:
         self.system = 'windows' if IS_WINDOWS else 'linux'
         self.app = app
         self.catalog = read_json(app / GPU_CATALOG, {}) or {}
+        self.hip_device = None   # carte ROCm choisie pour ComfyUI (None : pas encore regardé, '' : une seule carte)
         self.comfy = None        # ComfyUI résident pour les modèles qui passent par lui (FLUX 3 Klein) : poignée de comfy_start
         self.pidfile = self.root / 'engine.pid'
         self.status = {}   # type -> état lisible (« prêt », « pas installé », « échec : … »)
@@ -1117,12 +1132,19 @@ class Gpu:
             values[key] = how['map'].get(str(values.get(how['from'])).lower(), how.get('default'))
         values.update(prompt=job.get('prompt') or '')
         tries = [values]
-        if values.get('unet_dtype') == 'fp16' and model.get('fp16_fallback'):
+        no_fallback = 'no_fallback' in str(values.get('comfyui_options') or '').lower()
+        if values.get('unet_dtype') == 'fp16' and model.get('fp16_fallback') and not no_fallback:
             tries.append(dict(values, unet_dtype=model['fp16_fallback']))   # image unie en fp16 (NaN) : refait dans la précision sûre
         for n, vals in enumerate(tries):
             out, run = self.comfy_generate(job, model, spec, lay, env, vals, workdir, stop, progress, meta)
             stats = png_stats(out) or {}
             meta['image_std'] = stats.get('std')
+            # Chaque passage laisse sa trace : un repli ne cache plus ce qu'a donné le premier (job 55)
+            name = ('try_first', 'try_second')[min(n, 1)]
+            meta[name] = '%s %s : %s s/étape, %s s, écart %s' % (vals.get('unet_dtype'), vals.get('attention'), run.get('s_per_step'),
+                                                               run.get('wall_s'), stats.get('std'))
+            if self.comfy:
+                self.comfy['h']['box']['all'].meta[name] = meta[name]
             if stats.get('std', 99) >= 2:
                 break
             if n + 1 < len(tries):
@@ -1144,22 +1166,32 @@ class Gpu:
         extra = []
         for name, flags in (model.get('comfyui_flags') or {}).items():   # réglages admin -> options de ComfyUI
             extra += flags.get(str(values.get(name)).lower(), [])
-        key = json.dumps([extra, env.get('HIP_VISIBLE_DEVICES')])
+        add, drop, opt_env, unknown = comfy_options(values.get('comfyui_options'))
+        extra += add + ['!' + d for d in drop]
+        if unknown:
+            meta['comfyui_options_ignored'] = ','.join(unknown)[:120]
+        env = dict(env)
+        for k in [k for k in env if k.startswith('COMFY_KITCHEN_')]:
+            env.pop(k)
+        env.update(opt_env)
+        if self.hip_device:
+            env['HIP_VISIBLE_DEVICES'] = self.hip_device   # carte choisie au premier démarrage
+        key = json.dumps([extra, sorted(opt_env.items())])
         if self.comfy and (self.comfy['h']['proc'].poll() is not None or self.comfy.get('key') != key):
             self.stop_comfy('il s\'était arrêté' if self.comfy['h']['proc'].poll() is not None else 'réglages changés')
         if self.comfy is None:
             progress(0.3, 'démarrage de ComfyUI')
-            if 'torch_device' not in meta:
+            if self.hip_device is None:
                 comfy_pick_device(lay, env, spec, self, stop, meta)
-            self.comfy = {'h': comfy_start(lay, env, spec, self, stop, progress, extra),
-                          'key': json.dumps([extra, env.get('HIP_VISIBLE_DEVICES')])}   # carte choisie : clé à jour
+                self.hip_device = env.get('HIP_VISIBLE_DEVICES', '')
+            self.comfy = {'h': comfy_start(lay, env, spec, self, stop, progress, extra), 'key': key}
             meta['server_start_s'] = self.comfy['h']['start_s']
         else:
             meta['server_reused'] = True
         h = self.comfy['h']
         self.last_trace = h['box']['all']
         h['on_trace'] = lambda t: setattr(self, 'last_trace', t)   # avancement, précision et extrait du journal au hub pendant le calcul
-        meta['comfyui_flags'] = ' '.join(extra) or 'aucune'
+        meta['comfyui_flags'] = (' '.join(extra) + ''.join(' %s=%s' % kv for kv in sorted(opt_env.items()))).strip() or 'aucune'
         meta.update({k: values[k] for k in ('unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels', 'vram_mode', 'text_encoder') if k in values})
         free = (((comfy_local(h['port'], 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
         if free.get('vram_free') is not None:
@@ -2309,6 +2341,14 @@ class ComfyTrace(EngineTrace):
     BAR = re.compile(r'\|\s*(\d+)/(\d+)\s*\[[^\]]*?,\s*([\d.]+)(s/it|it/s)\]')
     TAKING = (('executed_s', r'Prompt executed in ([\d.]+) seconds'),)
 
+    def summary(self):
+        meta = super().summary()
+        steady = self.steady_rate()
+        if steady:   # tqdm donne une moyenne lissée qui mêle la première étape au rythme établi : la médiane mesurée ici
+            meta['s_per_step'] = round(steady, 2)
+            meta['tqdm_s_per_step'] = round(self.step_rate, 2) if self.step_rate else None
+        return meta
+
     def line(self, line):
         super().line(line)
         # Ce qui explique une lenteur : précision réelle, mode mémoire, chargement complet ou partiel des poids
@@ -2643,6 +2683,33 @@ def comfy_local(port, method, path, body=None, timeout=30):
 
 
 ATTENTION_FLAGS = ('--use-quad-cross-attention', '--use-split-cross-attention', '--use-pytorch-cross-attention')
+# Options d'essai de ComfyUI qu'un admin peut ajouter à un job (paramètre comfyui_options, liste séparée par des virgules) :
+# jeton -> (options en plus, options retirées, variables d'environnement). Rien d'autre n'atteint la ligne de commande.
+COMFY_OPTIONS = {
+    'kitchen_hip_off': ([], [], {'COMFY_KITCHEN_DISABLE_HIP': '1'}),      # noyaux HIP de comfy-kitchen coupés (eager)
+    'upcast_attention': (['--force-upcast-attention'], [], {}),           # attention en fp32 dans un modèle fp16
+    'no_upcast_attention': (['--dont-upcast-attention'], [], {}),
+    'fp16_accumulation': (['--fast', 'fp16_accumulation'], [], {}),
+    'pinned_memory': ([], ['--disable-pinned-memory'], {}),
+    'no_async_offload': (['--disable-async-offload'], [], {}),
+    'no_smart_memory': (['--disable-smart-memory'], [], {}),
+}
+
+
+def comfy_options(text):
+    """-> (options en plus, options retirées, environnement, jetons inconnus) pour le paramètre comfyui_options."""
+    add, drop, env, unknown = [], [], {}, []
+    for tok in [t.strip().lower() for t in str(text or '').split(',') if t.strip()]:
+        if tok == 'no_fallback':
+            continue   # lu par run_comfy
+        if tok not in COMFY_OPTIONS:
+            unknown.append(tok)
+            continue
+        a, d, e = COMFY_OPTIONS[tok]
+        add += [x for x in a if x not in add]
+        drop += d
+        env.update(e)
+    return add, drop, env, unknown
 
 
 def comfy_args(spec, port, base, extra=()):
@@ -2651,7 +2718,8 @@ def comfy_args(spec, port, base, extra=()):
     args = build_command(spec['args'], {'port': port, 'base': base})
     if any(a in ATTENTION_FLAGS for a in extra):
         args = [a for a in args if a not in ATTENTION_FLAGS]
-    return args + [a for a in extra if a not in args]
+    drop = [a[1:] for a in extra if a.startswith('!')]   # « !--option » : retirée de la ligne du catalogue
+    return [a for a in args if a not in drop] + [a for a in extra if not a.startswith('!') and a not in args]
 
 
 def comfy_start(lay, env, spec, gpu, stop, progress, extra=()):
@@ -2749,11 +2817,14 @@ def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
             raise RuntimeError('ComfyUI s\'est arrêté pendant le calcul (code %s) : %s' % (proc.returncode, ' | '.join(h['box']['all'].lines[-4:])[-400:]))
         if time.time() - t1 > timeout:
             raise Final('%s trop long (plus de %s)' % (label, fmt_duration(timeout)))
-        # Dès deux étapes mesurées : si la suite ne tient pas dans le plafond, on s'arrête tout de suite, avec la raison
-        if trace.step and trace.step >= 2 and trace.step_rate and time.time() - t1 + trace.step_rate * (int(steps) - trace.step) > timeout:
-            raise Final('%s trop lent : %.1f s par étape, %d étapes, plafond %s (précision %s/%s, chargement : %s)' % (
-                label, trace.step_rate, int(steps), fmt_duration(timeout), trace.meta.get('weight_dtype', '?'),
-                trace.meta.get('compute_dtype', '?'), trace.meta.get('load', '?')))
+        # Dès trois étapes : si le rythme établi (la première étape mise à part, elle porte les frais d'une fois) ne tient pas
+        # dans le plafond, on s'arrête tout de suite, avec la raison. Jobs 54 et 57 : arrêtés sur la moyenne de tqdm à deux
+        # étapes (115,8 s), qui mêlait la première étape au rythme réel.
+        steady = trace.steady_rate()
+        if steady and time.time() - t1 + steady * (int(steps) - trace.step) > timeout:
+            raise Final('%s trop lent : %.1f s par étape (étapes : %s), %d étapes, plafond %s (précision %s/%s, chargement : %s)' % (
+                label, steady, ','.join('%.0f' % x for x in trace.step_durations()), int(steps), fmt_duration(timeout),
+                trace.meta.get('weight_dtype', '?'), trace.meta.get('compute_dtype', '?'), trace.meta.get('load', '?')))
         progress(max(0.0, min(1.0, (trace.progress - 0.35) / 0.55)), '%s : %s' % (label, trace.stage()))
         if trace.step and int(time.time() - t1) % 5 == 0:   # mémoire vidéo libre pendant l'échantillonnage (le plus bas vu)
             try:

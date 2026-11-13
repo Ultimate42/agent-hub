@@ -237,9 +237,9 @@
               "bf16",
               "default"
              ],
-             "default": "fp16",
+             "default": "default",
              "admin": true,
-             "notes": "Précision du DiT dans ComfyUI. default : ce que ComfyUI choisit pour Flux3 sur RDNA2, poids bf16 calculés en fp32 (manual cast) : job 52 du 13/11, 232 s par étape, poids qui ne tiennent plus en mémoire vidéo. fp16 (défaut) : poids 11,1 Go et calcul en demi-précision, deux fois plus rapide sur RDNA2 ; ComfyUI ne le propose pas d'office pour Flux3 (risque de NaN), d'où le repli automatique en default si l'image sort unie. bf16 : sans support matériel sur gfx1030."
+             "notes": "Précision du DiT. default (défaut) : ce que ComfyUI choisit pour Flux3 sur RDNA2, poids bf16 calculés en fp32 ; mesuré le 13/11 (job 56, sans référence) : 4,73 s par étape, image juste. fp16 : image noire (NaN), même job 56 ; ComfyUI l'exclut pour Flux3 à raison. bf16 : sans support matériel sur gfx1030."
             },
             "attention": {
              "type": "enum",
@@ -283,9 +283,16 @@
               "cpu",
               "gpu"
              ],
-             "default": "cpu",
+             "default": "gpu",
              "admin": true,
-             "notes": "Où calculer l'encodeur Qwen3-VL-4B (8,9 Go en fp16), une fois par image. cpu (défaut) : le DiT reste seul sur la carte d'un travail à l'autre, au prix de quelques secondes de processeur et de 9 Go de RAM (temps dans engine.before_dit_s). gpu : chargé sur la carte, puis déchargé avant le DiT."
+             "notes": "Où calculer l'encodeur Qwen3-VL-4B (8,9 Go). gpu (défaut) : chargé sur la carte puis déchargé avant le DiT, 60 à 95 s avant le DiT (jobs 56, 57). cpu : 422 s (job 54)."
+            },
+            "comfyui_options": {
+             "type": "string",
+             "max": 200,
+             "default": "",
+             "admin": true,
+             "notes": "Essais sans redéploiement, jetons séparés par des virgules : kitchen_hip_off (noyaux HIP de comfy-kitchen coupés), upcast_attention, no_upcast_attention, fp16_accumulation, pinned_memory, no_async_offload, no_smart_memory, no_fallback (pas de nouvel essai en default si l'image fp16 sort unie). Un jeton inconnu est ignoré (engine.comfyui_options_ignored)."
             }
            },
            "workflow_source": "workflows/flux3_klein_bf16_mi2i.json du depot black-forest-labs/flux-3-image-klein-comfy (sous-graphe Multiple image to image, sans l'agrandisseur de prompt), converti au format API",
