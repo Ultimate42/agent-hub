@@ -595,6 +595,66 @@ class ComfyTest(unittest.TestCase):
         w.write_pth(py, self.dir / 'ComfyUI-0.46.0')   # nouvelle version du catalogue : l'ancien dossier disparaît
         self.assertEqual((py / 'python313._pth').read_text().split('\n')[:4], ['python313.zip', '.', os.path.join('..', 'ComfyUI-0.46.0'), 'import site'])
 
+    def test_every_pip_call_has_a_form_pip_accepts_on_windows(self):
+        """pip refuse de se modifier sous Windows si argv[0] s'appelle pip (essai n°3 sur gpu-box) : amorçage par -c, le reste par -m pip."""
+        calls = []
+        base = self.dir
+        (base / 'logs').mkdir()
+        spec = json.loads(json.dumps(self.spec))
+        lay = w.comfy_layout(base, spec)
+
+        def fake_download(url, dest, sha, what, headers=None):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_bytes(b'x')
+            return Path(dest)
+
+        def fake_extract(archive, dest):
+            if 'python' in str(archive):
+                Path(dest).mkdir(parents=True, exist_ok=True)
+                (Path(dest) / 'python313._pth').write_text('python313.zip\n.\n#import site\n')
+            else:
+                (lay['src']).mkdir(parents=True, exist_ok=True)
+                (lay['src'] / 'main.py').write_text('')
+                (lay['src'] / 'requirements.txt').write_text('torch\n')
+        saved = {k: getattr(w, k) for k in ('IS_WINDOWS', 'download', 'safe_extract', 'run_logged', 'download_resume')}
+        saved_usage = w.shutil.disk_usage
+        try:
+            w.IS_WINDOWS = True
+            w.download, w.safe_extract = fake_download, fake_extract
+            w.run_logged = lambda args, *a, **k: calls.append([str(x) for x in args]) or ''
+            w.download_resume = lambda url, dest, *a, **k: Path(dest)
+            w.shutil.disk_usage = lambda p: __import__('collections').namedtuple('U', 'total used free')(10 ** 13, 0, 10 ** 13)
+            gpu = w.Gpu(base, {'gpu_max_gb': 200, 'gpu_keep_free_gb': 0}, Path(w.__file__).parent)
+            w.comfy_install(base, spec, gpu, None, lambda f, st: None, {})
+        finally:
+            for k, v in saved.items():
+                setattr(w, k, v)
+            w.shutil.disk_usage = saved_usage
+        self.assertEqual(len(calls), 3, calls)
+        boot = calls[0]
+        self.assertEqual(boot[1:4], ['-s', '-c', w.PIP_BOOTSTRAP])
+        self.assertTrue(boot[4].endswith('pip-26.3-py3-none-any.whl'))
+        self.assertEqual(boot[5:8], ['install', '--no-index', '--no-warn-script-location'])
+        self.assertTrue(boot[8].endswith('pip-26.3-py3-none-any.whl') and boot[9].endswith('setuptools-84.2.1-py3-none-any.whl'))
+        self.assertFalse(any(os.path.basename(a.rstrip('/\\')) in ('pip', 'pip3', 'pip.exe') for a in boot), 'argv[0] is never pip')
+        for c in calls[1:]:
+            self.assertEqual(c[1:5], ['-s', '-m', 'pip', 'install'], c)
+        self.assertIn('--no-build-isolation', calls[1])
+        self.assertIn('-c', calls[2])
+
+    def test_pip_bootstrap_installs_from_the_wheel(self):
+        """Le vrai amorçage, contre une vraie roue de pip si le pip du système en fournit une (sinon : sauté)."""
+        import subprocess as sp, glob
+        wheels = glob.glob('/usr/share/python-wheels/pip-*.whl')
+        if not wheels:
+            self.skipTest('pas de roue de pip locale')
+        target = self.dir / 'target'
+        args = w.pip_bootstrap_command(sys.executable, wheels[0], [wheels[0]])
+        args[1:2] = ['-I']   # pas de site-packages utilisateur dans le test
+        r = sp.run(args[:-1] + ['--target', str(target), args[-1]], stdout=sp.PIPE, stderr=sp.STDOUT, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout.decode()[-800:])
+        self.assertTrue((target / 'pip').is_dir())
+
     def test_markers_follow_python_and_comfyui_versions(self):
         spec = json.loads(json.dumps(self.spec))
         before = {s: w.comfy_marker(spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')}

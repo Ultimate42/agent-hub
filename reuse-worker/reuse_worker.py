@@ -2281,6 +2281,16 @@ def run_logged(args, log_path, env, timeout, stop=None, cwd=None, what='commande
     return text
 
 
+# Amorçage de pip depuis sa roue, comme get-pip.py : la roue mise en tête de sys.path à l'exécution (le Python embarqué ignore
+# PYTHONPATH, son ._pth fixe sys.path), puis pip lancé par son point d'entrée. Pas « python pip.whl/pip » : sous Windows,
+# pip refuse de se modifier quand argv[0] s'appelle « pip » (« To modify pip, please run python -m pip ... »).
+PIP_BOOTSTRAP = 'import sys; sys.path.insert(0, sys.argv[1]); from pip._internal.cli.main import main; sys.exit(main(sys.argv[2:]))'
+
+
+def pip_bootstrap_command(py, wheel, wheels):
+    return [py, '-s', '-c', PIP_BOOTSTRAP, str(wheel), 'install', '--no-index', '--no-warn-script-location'] + [str(w) for w in wheels]
+
+
 def comfy_env(lay, spec):
     """Environnement du Python de l'essai : tout fichier temporaire ou cache reste sous gpu/comfyui."""
     env = dict(os.environ)
@@ -2347,8 +2357,7 @@ def comfy_install(base, spec, gpu, stop, progress, report):
         wheels = [wheel]
         if spec.get('setuptools'):
             wheels.append(download(spec['setuptools']['url'], lay['downloads'] / Path(spec['setuptools']['url']).name, spec['setuptools']['sha256'], 'setuptools'))
-        run_logged([py, str(wheel) + '/pip', 'install', '--no-index', '--no-warn-script-location'] + [str(w) for w in wheels], ilog, env, 600, stop,
-                   what='installation de pip')
+        run_logged(pip_bootstrap_command(py, wheel, wheels), ilog, env, 600, stop, what='installation de pip')
 
     def source():
         archive = download(spec['source']['url'], lay['downloads'] / ('comfyui-' + spec['source']['sha256'][:12] + '.zip'), spec['source']['sha256'], 'ComfyUI')
