@@ -101,10 +101,15 @@ db.exec(`
 `);
 // What the engine said during the current attempt (device, memory plan, timings, useful lines), sent with heartbeats
 if (!db.prepare('PRAGMA table_info(gpu_jobs)').all().some(c => c.name === 'engine')) db.exec('ALTER TABLE gpu_jobs ADD COLUMN engine TEXT');
+// Reference images of a job (FLUX 3 Klein): [{sha256, size, ext}], files <id>.ref<n>.<ext>; refs_size counts in the storage cap
+if (!db.prepare('PRAGMA table_info(gpu_jobs)').all().some(c => c.name === 'refs')) {
+  db.exec('ALTER TABLE gpu_jobs ADD COLUMN refs TEXT');
+  db.exec('ALTER TABLE gpu_jobs ADD COLUMN refs_size INTEGER');
+}
 
 const q = {
-  insert: db.prepare(`INSERT INTO gpu_jobs (type, model, owner, owner_label, priority, params, in_sha256, in_size, in_ext, created_at)
-                      VALUES (@type, @model, @owner, @label, @priority, @params, @in_sha256, @in_size, @in_ext, @now)`),
+  insert: db.prepare(`INSERT INTO gpu_jobs (type, model, owner, owner_label, priority, params, in_sha256, in_size, in_ext, refs, refs_size, created_at)
+                      VALUES (@type, @model, @owner, @label, @priority, @params, @in_sha256, @in_size, @in_ext, @refs, @refs_size, @now)`),
   byId: db.prepare('SELECT * FROM gpu_jobs WHERE id = ?'),
   list: db.prepare(`SELECT * FROM gpu_jobs WHERE (@owner IS NULL OR owner = @owner) AND (@status IS NULL OR status = @status)
                     ORDER BY id DESC LIMIT @limit`),
@@ -127,7 +132,7 @@ const q = {
   stale: db.prepare(`SELECT id FROM gpu_jobs WHERE status = 'pending' AND created_at < ?`),
   expired: db.prepare(`SELECT id FROM gpu_jobs WHERE status IN ('done', 'failed', 'cancelled') AND COALESCE(done_at, created_at) < ?`),
   ids: db.prepare('SELECT id, status FROM gpu_jobs'),
-  stored: db.prepare('SELECT COALESCE(SUM(COALESCE(in_size, 0) + COALESCE(out_size, 0)), 0) AS bytes FROM gpu_jobs'),
+  stored: db.prepare('SELECT COALESCE(SUM(COALESCE(in_size, 0) + COALESCE(refs_size, 0) + COALESCE(out_size, 0)), 0) AS bytes FROM gpu_jobs'),
   counts: db.prepare(`SELECT type, status, COUNT(*) AS n FROM gpu_jobs WHERE status IN ('pending', 'claimed') GROUP BY type, status`)
 };
 
@@ -136,6 +141,9 @@ const inPath = (id, ext) => path.join(config.gpuDir, `${Number(id)}.in.${EXT.tes
 const outPath = (id, ext) => path.join(config.gpuDir, `${Number(id)}.out.${EXT.test(ext) ? ext : 'bin'}`);
 export const gpuInputPath = (j) => (j.in_ext ? inPath(j.id, j.in_ext) : null);
 export const gpuOutputPath = (j) => (j.out_ext ? outPath(j.id, j.out_ext) : null);
+const refPath = (id, n, ext) => path.join(config.gpuDir, `${Number(id)}.ref${Number(n)}.${EXT.test(ext) ? ext : 'bin'}`);
+const refsOf = (j) => { try { return JSON.parse(j.refs || '[]') || []; } catch { return []; } };
+export const gpuRefPaths = (j) => refsOf(j).map((r, n) => refPath(j.id, n, r.ext));
 
 function writeAtomic(file, data) {
   mkdirSync(path.dirname(file), { recursive: true });
@@ -150,7 +158,7 @@ function writeAtomic(file, data) {
 }
 
 function removeFiles(j) {
-  for (const f of [gpuInputPath(j), gpuOutputPath(j)]) if (f) rmSync(f, { force: true });
+  for (const f of [gpuInputPath(j), gpuOutputPath(j), ...gpuRefPaths(j)]) if (f) rmSync(f, { force: true });
 }
 
 /** Image formats accepted as input, by magic number (never by the name or the Content-Type). */
@@ -179,7 +187,7 @@ export function isGlb(buf) {
 // ---------------------------------------------------------------------------
 const ALIASES = { w: 'width', h: 'height', n_steps: 'steps', num_steps: 'steps', cfg: 'cfg_scale', guidance: 'cfg_scale',
   negative: 'negative_prompt', neg_prompt: 'negative_prompt', input_image: 'image', image_base64: 'image', init_image: 'image' };
-const TOP = new Set(['type', 'model', 'prompt', 'image', 'priority', 'size', 'params']);
+const TOP = new Set(['type', 'model', 'prompt', 'image', 'references', 'priority', 'size', 'params']);
 
 /** Decode an image given as base64 or a data: URL. -> {buf, ext} | {error} */
 function decodeImage(value) {
@@ -275,6 +283,23 @@ export function normalizeRequest(body, catalog = gpuCatalog(), { admin = false }
     input = img;
   } else if (spec.input === 'required') return err(400, `image (base64 PNG, JPEG or WebP) is required for ${type}`);
 
+  // Reference images (FLUX 3 Klein): the model's native multi-reference input, not image to image
+  const refSpec = m.references;
+  const references = [];
+  if (refSpec && input) return err(400, `${modelId} takes "references" (a list of images), not "image"`);
+  if (given.references !== undefined && given.references !== null) {
+    if (!refSpec) return err(400, `${type} (${modelId}) takes no references`);
+    if (!Array.isArray(given.references)) return err(400, 'references must be a list of base64 images (PNG or JPEG)');
+    if (given.references.length > refSpec.max) return err(400, `at most ${refSpec.max} references for ${modelId}`);
+    for (const [i, raw] of given.references.entries()) {
+      const img = decodeImage(raw);
+      if (img.error) return err(img.status || 400, `references[${i}]: ${img.error}`);
+      if (!refSpec.formats.includes(img.ext)) return err(400, `references[${i}]: ${refSpec.formats.map(f => f.toUpperCase()).join(' or ')} only, not ${img.ext.toUpperCase()}`);
+      if (img.buf.length > refSpec.max_bytes) return err(413, `references[${i}]: larger than ${Math.round(refSpec.max_bytes / 1048576)} MB`);
+      references.push(img);
+    }
+  }
+
   if (typeof given.size === 'string') {
     const s = /^\s*(\d{2,5})\s*[x×*]\s*(\d{2,5})\s*$/i.exec(given.size);
     if (!s) return err(400, 'size must look like "1024x768"');
@@ -318,17 +343,22 @@ export function normalizeRequest(body, catalog = gpuCatalog(), { admin = false }
     if (p.error) return err(400, p.error);
     priority = p.value;
   }
-  return { ok: true, type, model: modelId, prompt, params, input, priority, adjusted, ignored };
+  return { ok: true, type, model: modelId, prompt, params, input, references, priority, adjusted, ignored };
 }
 
 // ---------------------------------------------------------------------------
 // Which workers offer what (they say it in every poll: info.gpu = "image,3d")
 // ---------------------------------------------------------------------------
 const typesOf = (info) => String(info?.gpu || '').split(',').map(s => s.trim()).filter(t => TYPE.test(t));
+// Models that need more than the type's engine (FLUX 3 Klein: ComfyUI installed on the machine), announced one by one
+const modelsOf = (info) => String(info?.gpu_models || '').split(',').map(s => s.trim()).filter(t => MODEL.test(t));
+const needsAnnounce = (type, model) => Boolean(gpuCatalog()?.types?.[type]?.models?.[model]?.engine);
+const canRun = (types, models, type, model) => types.has(type) && (!needsAnnounce(type, model) || models.has(model));
 
-/** Workers (with a token) that announced this type at least once, online or not. */
-function offeredBy(type, workers) {
-  return workers.filter(w => w.has_token && typesOf(w.info).includes(type)).map(w => w.name);
+/** Workers (with a token) that announced this type (and this model when it needs it) at least once, online or not. */
+function offeredBy(type, workers, model = null) {
+  return workers.filter(w => w.has_token && typesOf(w.info).includes(type)
+    && (!model || !needsAnnounce(type, model) || modelsOf(w.info).includes(model))).map(w => w.name);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +377,7 @@ export function gpuJobView(j, now = Date.now()) {
     id: j.id, type: j.type, model: j.model, status, priority: j.priority,
     prompt: params.prompt, params: params.values || {},
     ...(j.in_sha256 ? { input: { sha256: j.in_sha256, size: j.in_size, format: j.in_ext } } : {}),
+    ...(j.refs ? { references: refsOf(j).map(r => ({ sha256: r.sha256, size: r.size, format: r.ext })) } : {}),
     owner: j.owner_label, worker: j.worker, attempts: j.attempts,
     ...(j.error ? { error: j.error } : {}),
     ...(status === 'claimed' ? { progress: j.progress ?? 0, ...(j.stage ? { stage: j.stage } : {}) } : {}),
@@ -380,20 +411,27 @@ export function submitGpuJob(caller, body, now = Date.now()) {
   if (!offeredBy(r.type, workers).length) {
     return err(409, `No worker offers "${r.type}" yet${gpuCatalog().types[r.type].experimental ? ' (experimental type, enabled machine by machine)' : ''}: see GET /api/gpu/capabilities`);
   }
+  if (!offeredBy(r.type, workers, r.model).length) {
+    return err(409, `No worker offers the model "${r.model}" yet (it needs ComfyUI on the machine): see GET /api/gpu/capabilities`);
+  }
   if (caller.role !== 'admin' && q.waitingOf.get(caller.owner).n >= config.gpuMaxWaitingPerOwner) {
     return err(429, `Already ${config.gpuMaxWaitingPerOwner} jobs waiting for you: wait for them or cancel some`);
   }
-  if (r.input && q.stored.get().bytes + r.input.buf.length > config.gpuMaxStorage) {
+  const refsSize = r.references.reduce((n, x) => n + x.buf.length, 0);
+  if ((r.input || refsSize) && q.stored.get().bytes + (r.input?.buf.length || 0) + refsSize > config.gpuMaxStorage) {
     return err(507, 'GPU storage is full on the hub: delete finished jobs (DELETE /api/gpu/jobs/:id)');
   }
   const row = {
     type: r.type, model: r.model, owner: caller.owner, label: caller.label, priority: r.priority,
     params: JSON.stringify({ prompt: r.prompt, values: r.params }),
-    in_sha256: r.input ? sha256(r.input.buf) : null, in_size: r.input ? r.input.buf.length : null, in_ext: r.input?.ext || null, now
+    in_sha256: r.input ? sha256(r.input.buf) : null, in_size: r.input ? r.input.buf.length : null, in_ext: r.input?.ext || null,
+    refs: r.references.length ? JSON.stringify(r.references.map(x => ({ sha256: sha256(x.buf), size: x.buf.length, ext: x.ext }))) : null,
+    refs_size: refsSize || null, now
   };
   const id = db.transaction(() => {
     const rowId = Number(q.insert.run(row).lastInsertRowid);
     if (r.input) writeAtomic(inPath(rowId, r.input.ext), r.input.buf);
+    r.references.forEach((x, n) => writeAtomic(refPath(rowId, n, x.ext), x.buf));
     return rowId;
   })();
   logger.info('GPU job queued', { id, type: r.type, model: r.model, owner: caller.label });
@@ -458,7 +496,9 @@ export function gpuCapabilities(now = Date.now()) {
       label: spec.label, experimental: Boolean(spec.experimental), prompt: spec.prompt || 'required', input_image: spec.input || 'none',
       output: spec.output, default_model: spec.default_model,
       models: Object.entries(spec.models || {}).map(([id, m]) => ({
-        id, label: m.label, license: m.license, source: m.source, ...(m.notes ? { notes: m.notes } : {}), params: m.params || {}
+        id, label: m.label, license: m.license, source: m.source, ...(m.notes ? { notes: m.notes } : {}), params: m.params || {},
+        ...(m.references ? { references: { max: m.references.max, max_bytes: m.references.max_bytes, formats: m.references.formats } } : {}),
+        ...(m.engine ? { offered_by: offeredBy(type, workers, id) } : {})
       })),
       offered_by: offer.map(m => m.name), ready_now: offer.some(m => m.ready_now), waiting_jobs: waiting[type] || 0,
       next_start_at: starts.length ? new Date(Math.max(now, Math.min(...starts))).toISOString() : null
@@ -477,16 +517,17 @@ export function gpuCapabilities(now = Date.now()) {
 // Worker side (claimed through POST /api/reuse/next: see reuse.js claimJob)
 // ---------------------------------------------------------------------------
 /** Hooks for claimJob: the GPU job this worker holds, then a new one of a type it announced (caps). */
-export function gpuClaimHooks(name, caps) {
+export function gpuClaimHooks(name, caps, modelCaps = '') {
   const types = new Set((Array.isArray(caps) ? caps : typesOf({ gpu: caps })));
+  const models = new Set(Array.isArray(modelCaps) ? modelCaps : modelsOf({ gpu_models: modelCaps }));
   return {
     held(now) {
       const mine = q.held.get(name, now);
       if (!mine) return null;
       // A machine that no longer announces this type (worker rolled back to a version without GPU jobs, "gpu":
       // false, 3D switched off) would take the job for a RE-USE one: it is given back to the queue instead.
-      if (!types.has(mine.type)) {
-        recordFailure(mine, name, `no longer offers "${mine.type}"`, now);
+      if (!canRun(types, models, mine.type, mine.model)) {
+        recordFailure(mine, name, `no longer offers "${mine.type}" (${mine.model})`, now);
         return null;
       }
       q.renew.run(now + config.gpuLeaseMs, null, null, mine.id);
@@ -495,7 +536,7 @@ export function gpuClaimHooks(name, caps) {
     next(now) {
       if (!types.size || !gpuCatalog()) return null;
       for (const j of q.candidates.all(now)) {
-        if (!types.has(j.type)) continue;
+        if (!canRun(types, models, j.type, j.model)) continue;
         if (j.attempts >= config.gpuMaxAttempts) {
           q.fail.run('failed', j.error || `${j.worker || '?'}: lease expired without result`, now, j.id);
           logger.error('GPU job failed permanently', { id: j.id, attempts: j.attempts, worker: j.worker });
@@ -514,6 +555,7 @@ export function gpuClaimView(j) {
   return {
     kind: j.type, id: j.id, model: j.model, attempt: j.attempts, prompt: p.prompt || '', params: p.values || {},
     ...(j.in_sha256 ? { input: { sha256: j.in_sha256, size: j.in_size, format: j.in_ext } } : {}),
+    ...(j.refs ? { references: refsOf(j).map((r, n) => ({ n, sha256: r.sha256, size: r.size, format: r.ext })) } : {}),
     lease_s: Math.round(config.gpuLeaseMs / 1000)
   };
 }
@@ -532,6 +574,16 @@ export function gpuInputFor(caller, id) {
   const file = gpuInputPath(r.job);
   if (!file) return err(404, 'This job has no input image');
   return { ok: true, job: r.job, file };
+}
+
+/** Reference image n of a job: the worker holding it, its owner, or admin. */
+export function gpuRefFor(caller, id, n) {
+  const r = caller.role === 'worker' ? heldBy(id, caller.name) : ownJob(caller, id);
+  if (!r.ok) return r;
+  const refs = refsOf(r.job);
+  const i = Number(n);
+  if (!Number.isInteger(i) || i < 0 || i >= refs.length) return err(404, 'No such reference image');
+  return { ok: true, job: r.job, file: refPath(r.job.id, i, refs[i].ext), ref: refs[i] };
 }
 
 /** Small flat object from a worker: lower-case keys, strings, numbers, booleans only. */
@@ -635,16 +687,16 @@ export function sweepGpuStorage() {
   try { names = readdirSync(config.gpuDir); } catch { return 0; }
   let removed = 0;
   for (const n of names) {
-    const m = /^(\d+)\.(in|out)\.[a-z]{2,4}(\.\d+\.tmp)?$/.exec(n);
+    const m = /^(\d+)\.(in|out|ref\d)\.[a-z]{2,4}(\.\d+\.tmp)?$/.exec(n);
     if (!m) continue;
     const status = rows.get(Number(m[1]));
-    if (!m[3] && (m[2] === 'in' ? status !== undefined : status === 'done')) continue;
+    if (!m[3] && (m[2] !== 'out' ? status !== undefined : status === 'done')) continue;
     try { rmSync(path.join(config.gpuDir, n), { force: true }); removed++; } catch { /* next start */ }
   }
   if (removed) logger.warn('GPU storage: orphan files removed', { count: removed });
   for (const [id, status] of rows) {
     const j = q.byId.get(id);
-    if ((status === 'pending' || status === 'claimed') && j.in_ext && !existsSync(gpuInputPath(j))) {
+    if ((status === 'pending' || status === 'claimed') && ((j.in_ext && !existsSync(gpuInputPath(j))) || gpuRefPaths(j).some(f => !existsSync(f)))) {
       q.fail.run('failed', 'input image is missing on the hub', Date.now(), id);
     }
   }

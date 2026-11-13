@@ -207,7 +207,7 @@ router.post('/api/reuse/next', guard('worker'), json, (req, res) => {
     const orders = workerOrders(caller.name);
     // GPU jobs (image, 3D) only for a worker that announces the types it can run (info.gpu); a GPU job it holds is
     // always given back to it, like a RE-USE one. Older workers announce nothing and never see a GPU job.
-    const job = claimJob(caller.name, Date.now(), gpuClaimHooks(caller.name, body.info?.gpu));
+    const job = claimJob(caller.name, Date.now(), gpuClaimHooks(caller.name, body.info?.gpu, body.info?.gpu_models));
     if (job) return res.json({ job: job.gpu ? gpuClaimView(job.gpu) : claimView(job), orders });
     const changed = orders.paused !== first.paused || orders.update !== first.update || orders.worker_version !== first.worker_version
       || JSON.stringify(orders.settings) !== JSON.stringify(first.settings);

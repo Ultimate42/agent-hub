@@ -338,7 +338,7 @@ export function workerOrders(name, now = Date.now()) {
 /** Record a poll (last seen + what the worker says about itself) and return its standing orders. */
 export function noteReusePoll(name, info = {}) {
   const kept = {};
-  for (const k of ['version', 'backend', 'device', 'os', 'state', 'job', 'rolled_back_from', 'last_error', 'host', 'update_ack', 'gpu', 'gpu_state', 'tests']) {
+  for (const k of ['version', 'backend', 'device', 'os', 'state', 'job', 'rolled_back_from', 'last_error', 'host', 'update_ack', 'gpu', 'gpu_state', 'tests', 'gpu_models']) {
     if (info && info[k] != null) kept[k] = String(info[k]).slice(0, 200);
   }
   if (info && typeof info === 'object') q.touch.run(name, Date.now(), JSON.stringify(kept));

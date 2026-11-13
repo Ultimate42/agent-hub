@@ -4,7 +4,7 @@ import path from 'path';
 import { config } from '../config.js';
 import {
   gpuEnabled, identifyGpuCaller, submitGpuJob, listGpuJobs, ownJob, gpuJobView, cancelGpuJob, deleteGpuJob, gpuCapabilities,
-  gpuInputFor, heartbeatGpu, failGpu, completeGpu, gpuOutputPath
+  gpuInputFor, gpuRefFor, heartbeatGpu, failGpu, completeGpu, gpuOutputPath
 } from '../services/gpu-jobs.js';
 
 // ---------------------------------------------------------------------------
@@ -15,7 +15,8 @@ import {
 const router = Router();
 const MIME = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp', glb: 'model/gltf-binary' };
 // A base64 image is a third bigger than the file, plus the prompt and parameters
-const submitJson = express.json({ limit: Math.ceil(config.gpuMaxInputSize * 4 / 3) + 64 * 1024 });
+// An input image, or up to 4 references of 4 MB (FLUX 3 Klein), in base64; read only after the token is checked
+const submitJson = express.json({ limit: Math.ceil(Math.max(config.gpuMaxInputSize, 16 * 1024 * 1024) * 4 / 3) + 64 * 1024 });
 const json = express.json({ limit: '64kb' });
 const raw = express.raw({ type: () => true, limit: config.gpuMaxOutputSize });
 
@@ -57,7 +58,8 @@ router.get('/api/gpu/capabilities', guard('client'), (req, res) => {
 
 /**
  * POST /api/gpu/jobs {type: "image"|"3d", prompt, model?, width?, height?, size?: "1024x768", steps?, seed?, cfg_scale?,
- * negative_prompt?, image?: base64 (3D input, or image to image), priority?} -> 201 {job, adjusted?, ignored?}
+ * negative_prompt?, image?: base64 (3D input, or image to image), references?: [base64 PNG/JPEG] (flux3-klein, up to 4 of 4 MB),
+ * priority?} -> 201 {job, adjusted?, ignored?}
  */
 router.post('/api/gpu/jobs', guard('client'), submitJson, (req, res) => {
   answer(res, submitGpuJob(req.gpuCaller, req.body), 201);
@@ -115,6 +117,14 @@ router.get('/api/gpu/jobs/:id/input', guard('any'), (req, res) => {
   if (!r.ok) return answer(res, r);
   res.set('X-Sha256', r.job.in_sha256);
   sendFile(res, r.file, `gpu-${r.job.id}-input.${r.job.in_ext}`, r.job.in_ext);
+});
+
+/** GET /api/gpu/jobs/:id/references/:n - reference image n (0-based): owner, admin, or the worker holding the job. */
+router.get('/api/gpu/jobs/:id/references/:n', guard('any'), (req, res) => {
+  const r = gpuRefFor(req.gpuCaller, req.params.id, req.params.n);
+  if (!r.ok) return answer(res, r);
+  res.set('X-Sha256', r.ref.sha256);
+  sendFile(res, r.file, `gpu-${r.job.id}-ref${Number(req.params.n)}.${r.ref.ext}`, r.ref.ext);
 });
 
 // ----- Workers -----------------------------------------------------------------
