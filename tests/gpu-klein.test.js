@@ -116,7 +116,7 @@ describe('FLUX 3 Klein: references and model announcement', () => {
     }
     assert.strictEqual(got.id, id);
     assert.strictEqual(got.model, 'flux3-klein');
-    assert.deepStrictEqual(got.params, { width: 1024, height: 1024, steps: 12, seed: 9 });
+    assert.deepStrictEqual(got.params, { width: 1024, height: 1024, steps: 12, seed: 9, unet_dtype: 'fp16', attention: 'quad', dynamic_vram: false, ref_megapixels: 1 });
     assert.deepStrictEqual(got.references.map(x => [x.n, x.format, x.size, x.sha256]), refs.map((b, n) => [n, n % 2 ? 'jpg' : 'png', b.length, sha(b)]));
     for (const [n, b] of refs.entries()) {
       const dl = await call(`/api/gpu/jobs/${id}/references/${n}`, { token: AMD });
@@ -144,6 +144,32 @@ describe('FLUX 3 Klein: references and model announcement', () => {
     assert.strictEqual((await call(`/api/gpu/jobs/${id}`, { method: 'DELETE', token: ADMIN })).status, 200);
     const left = fs.readdirSync(path.join(TMP_DIR, 'reuse', 'gpu')).filter(n => n.startsWith(`${id}.`));
     assert.deepStrictEqual(left, [], 'references deleted with the job');
+  });
+
+  test('a failure the worker marks final is not retried; an ordinary one is', async () => {
+    const a = (await submit(klein({ seed: 1 }))).data.job.id;
+    const got = (await poll(AMD, { gpu: 'image', gpu_models: 'flux3-klein' })).data.job;
+    assert.strictEqual(got.id, a);
+    const f = await call(`/api/gpu/jobs/${a}/fail`, { method: 'POST', token: AMD, body: { error: 'génération trop lent : 232.0 s par étape', final: true } });
+    assert.strictEqual(f.data.retry, false);
+    const v = (await call(`/api/gpu/jobs/${a}`, { token: ADMIN })).data;
+    assert.strictEqual(v.status, 'failed');
+    assert.match(v.error, /232\.0 s par étape/);
+    const b = (await submit(klein({ seed: 2 }))).data.job.id;
+    assert.strictEqual((await poll(AMD, { gpu: 'image', gpu_models: 'flux3-klein' })).data.job.id, b);
+    assert.strictEqual((await call(`/api/gpu/jobs/${b}/fail`, { method: 'POST', token: AMD, body: { error: 'hub injoignable' } })).data.retry, true);
+    assert.strictEqual((await call(`/api/gpu/jobs/${b}`, { token: ADMIN })).data.status, 'pending');
+    await call(`/api/gpu/jobs/${b}/cancel`, { method: 'POST', token: ADMIN });
+  });
+
+  test('admin tuning of the ComfyUI flags; a member cannot change them', async () => {
+    const r = await submit(klein({ unet_dtype: 'default', attention: 'split', dynamic_vram: true, ref_megapixels: 0.5 }));
+    assert.strictEqual(r.status, 201);
+    assert.deepStrictEqual([r.data.job.params.unet_dtype, r.data.job.params.attention, r.data.job.params.dynamic_vram, r.data.job.params.ref_megapixels],
+      ['default', 'split', true, 0.5]);
+    const d = await submit(klein());
+    assert.deepStrictEqual([d.data.job.params.unet_dtype, d.data.job.params.dynamic_vram], ['fp16', false], 'defaults');
+    for (const id of [r.data.job.id, d.data.job.id]) await call(`/api/gpu/jobs/${id}/cancel`, { method: 'POST', token: ADMIN });
   });
 
   test('capabilities list the references limits and who offers the model', async () => {

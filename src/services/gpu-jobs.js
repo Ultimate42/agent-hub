@@ -611,18 +611,19 @@ export function heartbeatGpu(id, name, { progress, stage, info, log, meta } = {}
   return { ok: true, lease_s: Math.round(config.gpuLeaseMs / 1000), orders: workerOrders(name) };
 }
 
-function recordFailure(j, name, reason, now) {
-  const retry = j.attempts < config.gpuMaxAttempts;
+function recordFailure(j, name, reason, now, final = false) {
+  const retry = !final && j.attempts < config.gpuMaxAttempts;
   q.fail.run(retry ? 'pending' : 'failed', `${name}: ${String(reason).slice(0, 300)}`, retry ? null : now, j.id);
   if (retry) logger.warn('GPU job failed, will retry', { id: j.id, worker: name, error: reason });
   else logger.error('GPU job failed permanently', { id: j.id, worker: name, attempts: j.attempts, error: reason });
   return retry;
 }
 
-export function failGpu(id, name, { error } = {}, now = Date.now()) {
+/** final: the worker says the same job would fail the same way (too slow for the cap, image broken twice): no retry. */
+export function failGpu(id, name, { error, final } = {}, now = Date.now()) {
   const r = heldBy(id, name);
   if (!r.ok) return r;
-  return { ok: true, retry: recordFailure(r.job, name, error || 'no reason given', now) };
+  return { ok: true, retry: recordFailure(r.job, name, error || 'no reason given', now, final === true) };
 }
 
 /**
