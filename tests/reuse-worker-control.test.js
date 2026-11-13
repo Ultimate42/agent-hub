@@ -1,0 +1,257 @@
+import { test, describe, before, after } from 'node:test';
+import assert from 'node:assert';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs';
+
+// Remote control of a worker machine from the hub: settings overrides (enable_3d...) and GPU tests
+// (remote --gpu-test, ComfyUI bench), driven by the admin token, run by the worker between two jobs.
+
+const PORT = '4198';
+const BASE_URL = `http://localhost:${PORT}`;
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wctl-'));
+const WORKER_DIR = path.join(TMP_DIR, 'worker-files');
+const ADMIN = 'reuse-admin-secret-wctl-0123456789';
+const AMD = 'gpu-box-worker-secret-wctl-0123456789';
+const NV = 'dev-box-worker-secret-wctl-0123456789';
+
+let hubProcess;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function call(p, { method = 'GET', token, body, rawBody, headers = {} } = {}) {
+  const res = await fetch(BASE_URL + p, {
+    method,
+    headers: { 'Content-Type': rawBody ? 'audio/flac' : 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
+    body: rawBody || (body === undefined ? undefined : JSON.stringify(body))
+  });
+  const buf = Buffer.from(await res.arrayBuffer());
+  let data = null;
+  try { data = JSON.parse(buf.toString()); } catch { /* binary */ }
+  return { status: res.status, data };
+}
+
+function fakeFlac(salt) {
+  const b = Buffer.alloc(42);
+  b.write('fLaC', 0, 'latin1');
+  b[4] = 0x80; b[7] = 34;
+  b.writeUInt32BE(((24000 << 12) | (23 << 4)) >>> 0, 18);
+  b.writeUInt32BE(240000, 22);
+  return Buffer.concat([b, Buffer.from(`audio-${salt}`)]);
+}
+
+const next = (token, info = {}) => call('/api/reuse/next', { method: 'POST', token, body: { wait: 0, info } });
+const settings = (name, body, token = ADMIN) => call(`/api/reuse/workers/${name}/settings`, { method: 'POST', token, body });
+const ask = (name, body, token = ADMIN) => call(`/api/reuse/workers/${name}/tests`, { method: 'POST', token, body });
+const report = (id, body, token = AMD) => call(`/api/reuse/worker/tests/${id}`, { method: 'POST', token, body });
+const readTest = async (id, name = 'gpu-box') => (await call(`/api/reuse/workers/${name}/tests/${id}`, { token: ADMIN })).data.test;
+const NEW_WORKER = { version: 'v2', tests: 'image,3d,comfyui,comfyui_remove' };
+
+describe('RE-USE worker remote control', () => {
+  before(async () => {
+    fs.mkdirSync(WORKER_DIR);
+    fs.writeFileSync(path.join(WORKER_DIR, 'reuse_worker.py'), 'print("v2")\n');
+    hubProcess = spawn('node', ['src/index.js'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env, PORT, PUBLIC_URL: BASE_URL, DB_PATH: path.join(TMP_DIR, 'hub.db'),
+        HUB_REUSE_ADMIN_TOKEN: ADMIN, HUB_REUSE_WORKER_TOKENS: `gpu-box:${AMD},dev-box:${NV}`, HUB_REUSE_WORKER_DIR: WORKER_DIR
+      },
+      stdio: 'ignore'
+    });
+    for (let i = 0; i < 75; i++) {
+      try { if ((await fetch(`${BASE_URL}/health`)).ok) break; } catch { /* starting */ }
+      await sleep(200);
+    }
+  });
+
+  after(() => {
+    hubProcess?.kill('SIGTERM');
+    fs.rmSync(TMP_DIR, { recursive: true, force: true });
+  });
+
+  test('settings: admin only, known keys and bounds only, all or nothing', async () => {
+    assert.strictEqual((await settings('gpu-box', { enable_3d: true }, AMD)).status, 403);
+    assert.strictEqual((await call('/api/reuse/workers/gpu-box/settings', { token: AMD })).status, 403);
+    assert.strictEqual((await settings('nobody', { enable_3d: true })).status, 404);
+    assert.strictEqual((await settings('gpu-box', {})).status, 400);
+    assert.strictEqual((await settings('gpu-box', { token: 'x' })).status, 400, 'never a key outside the list');
+    assert.strictEqual((await settings('gpu-box', { hub_url: 'https://evil' })).status, 400);
+    assert.strictEqual((await settings('gpu-box', { enable_3d: 'yes' })).status, 400);
+    assert.strictEqual((await settings('gpu-box', { gpu_max_gb: 500 })).status, 400);
+    assert.strictEqual((await settings('gpu-box', { gpu_keep_loaded_s: 1.5 })).status, 400);
+    const mixed = await settings('gpu-box', { enable_3d: true, gpu_max_gb: 1 });
+    assert.strictEqual(mixed.status, 400);
+    assert.deepStrictEqual((await call('/api/reuse/workers/gpu-box/settings', { token: ADMIN })).data.settings, {}, 'nothing applied from a refused patch');
+  });
+
+  test('settings: sent with every order, visible to the admin, journaled, removed by null', async () => {
+    const set = await settings('gpu-box', { enable_3d: true, gpu_max_gb: 45 });
+    assert.strictEqual(set.status, 200);
+    assert.deepStrictEqual(set.data.settings, { enable_3d: true, gpu_max_gb: 45 });
+    assert.deepStrictEqual(set.data.changed, [{ key: 'enable_3d', from: null, to: true }, { key: 'gpu_max_gb', from: null, to: 45 }]);
+
+    const polled = await next(AMD, NEW_WORKER);
+    assert.deepStrictEqual(polled.data.orders.settings, { enable_3d: true, gpu_max_gb: 45 });
+    assert.deepStrictEqual((await next(NV)).data.orders.settings, {}, 'per machine');
+    const listed = (await call('/api/reuse/workers', { token: ADMIN })).data.workers.find(w => w.name === 'gpu-box');
+    assert.deepStrictEqual(listed.settings, { enable_3d: true, gpu_max_gb: 45 });
+
+    // Same value again: nothing changes, nothing journaled
+    assert.deepStrictEqual((await settings('gpu-box', { enable_3d: true })).data.changed, []);
+    const back = await settings('gpu-box', { enable_3d: null, gpu_max_gb: null });
+    assert.deepStrictEqual(back.data.settings, {});
+    assert.deepStrictEqual((await next(AMD, NEW_WORKER)).data.orders.settings, {});
+
+    const { history } = (await call('/api/reuse/workers/gpu-box/settings', { token: ADMIN })).data;
+    assert.strictEqual(history.length, 2, 'one entry per effective change');
+    assert.strictEqual(history[0].what, 'settings');
+    assert.deepStrictEqual(history[0].changed, [{ key: 'enable_3d', from: true, to: null }, { key: 'gpu_max_gb', from: 45, to: null }]);
+    assert.ok(history[0].at);
+  });
+
+  test('tests: validated, one open per worker, a warning when the machine cannot run it yet', async () => {
+    assert.strictEqual((await ask('gpu-box', { kind: '3d' }, AMD)).status, 403);
+    assert.strictEqual((await ask('nobody', { kind: '3d' })).status, 404);
+    assert.strictEqual((await ask('gpu-box', { kind: 'shell' })).status, 400);
+    assert.strictEqual((await ask('gpu-box', { kind: '3d', params: { res: '2048' } })).status, 400);
+    assert.strictEqual((await ask('gpu-box', { kind: '3d', params: { command: 'x' } })).status, 400, 'unknown parameter refused');
+    assert.strictEqual((await ask('gpu-box', { kind: 'comfyui', params: { width: 1000 } })).status, 400, 'multiple of 64');
+    assert.strictEqual((await ask('gpu-box', { kind: 'comfyui', params: { steps: 8.5 } })).status, 400);
+
+    // dev-box never said it runs remote tests (old version): accepted, with the reason it will wait
+    await next(NV, { version: 'v1' });
+    const old = await ask('dev-box', { kind: 'image' });
+    assert.strictEqual(old.status, 201);
+    assert.match(old.data.warning, /has not announced "image" tests/);
+    assert.strictEqual((await ask('dev-box', { kind: 'image' })).status, 409, 'one open test per machine');
+    assert.strictEqual((await call(`/api/reuse/workers/dev-box/tests/${old.data.test.id}/cancel`, { method: 'POST', token: ADMIN })).status, 200);
+    assert.strictEqual((await readTest(old.data.test.id, 'dev-box')).status, 'cancelled');
+    assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${old.data.test.id}`, { token: ADMIN })).status, 404, 'tests are per worker');
+  });
+
+  test('tests: handed out at once, no new job meanwhile, progress then report readable by the admin', async () => {
+    const queued = await call('/api/reuse/jobs?batch=t&name=t_000.flac', { method: 'POST', token: ADMIN, rawBody: fakeFlac('a') });
+    assert.strictEqual(queued.status, 201);
+    const asked = await ask('gpu-box', { kind: '3d', params: { res: '512', steps: 12 } });
+    assert.strictEqual(asked.status, 201);
+    assert.strictEqual(asked.data.warning, undefined);
+    const id = asked.data.test.id;
+    assert.strictEqual(asked.data.test.status, 'pending');
+
+    // The long poll answers at once with the order, and no job: the machine stays free for the test
+    const t0 = Date.now();
+    const got = await call('/api/reuse/next', { method: 'POST', token: AMD, body: { wait: 20, info: NEW_WORKER } });
+    assert.ok(Date.now() - t0 < 5000, 'not held for the whole long poll');
+    assert.strictEqual(got.data.job, null);
+    assert.deepStrictEqual(got.data.orders.gpu_test, { id, kind: '3d', params: { res: '512', steps: 12 } });
+
+    // Another worker still gets the RE-USE job
+    assert.strictEqual((await next(NV)).data.job.name, 't_000.flac');
+
+    // Another worker cannot report on it
+    assert.strictEqual((await report(id, { status: 'running' }, NV)).status, 404);
+    const running = await report(id, { status: 'running', stage: 'téléchargement de ss_flow.gguf', progress: 0.2 });
+    assert.strictEqual(running.status, 200);
+    assert.strictEqual(running.data.cancel, false);
+    assert.strictEqual(running.data.orders.gpu_test, null, 'a running test is never handed out again (a restart does not loop)');
+    let t = await readTest(id);
+    assert.strictEqual(t.status, 'running');
+    assert.strictEqual(t.stage, 'téléchargement de ss_flow.gguf');
+    assert.strictEqual(t.progress, 0.2);
+    assert.ok(t.started_at);
+
+    const done = await report(id, {
+      status: 'done',
+      report: { ok: true, kind: '3d', compute_s: 412.5, device: 'AMD Radeon RX 6950 XT', size: 123456, log: ['[1/7] preprocess', '[7/7] glb written'] }
+    });
+    assert.strictEqual(done.status, 200);
+    t = await readTest(id);
+    assert.strictEqual(t.status, 'done');
+    assert.strictEqual(t.ok, true);
+    assert.strictEqual(t.result.compute_s, 412.5);
+    assert.deepStrictEqual(t.result.log, ['[1/7] preprocess', '[7/7] glb written']);
+    assert.ok(t.finished_at);
+    assert.strictEqual((await report(id, { status: 'running' })).status, 409, 'a finished test stays finished');
+
+    const list = (await call('/api/reuse/workers/gpu-box/tests', { token: ADMIN })).data.tests;
+    assert.strictEqual(list[0].id, id);
+    const history = (await call('/api/reuse/workers/gpu-box/settings', { token: ADMIN })).data.history.map(e => e.what);
+    assert.deepStrictEqual(history.slice(0, 3), ['test_finished', 'test_started', 'test_requested']);
+  });
+
+  test('tests: a failure keeps its reason and the end of the engine log; a huge report is cut, not refused', async () => {
+    const id = (await ask('gpu-box', { kind: 'comfyui', params: { width: 1024, height: 1024, steps: 8 } })).data.test.id;
+    const log = Array.from({ length: 3000 }, (_, i) => `ligne ${i} ${'x'.repeat(50)}`);
+    const r = await report(id, { status: 'failed', report: { ok: false, error: 'torch: HIP error: invalid device function', log } });
+    assert.strictEqual(r.status, 200);
+    const t = await readTest(id);
+    assert.strictEqual(t.status, 'failed');
+    assert.strictEqual(t.ok, false);
+    assert.strictEqual(t.error, 'torch: HIP error: invalid device function');
+    assert.strictEqual(t.result.truncated, true);
+    assert.strictEqual(t.result.log.at(-1).startsWith('ligne 2999'), true, 'the end of the log, which says why');
+  });
+
+  test('tests: cancelled while running, the worker is told to stop', async () => {
+    const id = (await ask('gpu-box', { kind: 'image' })).data.test.id;
+    assert.strictEqual((await next(AMD, NEW_WORKER)).data.orders.gpu_test.id, id);
+    await report(id, { status: 'running', stage: 'calcul', progress: 0.5 });
+    assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${id}/cancel`, { method: 'POST', token: ADMIN })).status, 200);
+    const r = await report(id, { status: 'running', progress: 0.6 });
+    assert.strictEqual(r.data.cancel, true);
+    assert.strictEqual((await readTest(id)).status, 'cancelled');
+    assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${id}/cancel`, { method: 'POST', token: ADMIN })).status, 409);
+  });
+
+  test('tests: never handed out while paused or out of the schedule; then the queue resumes', async () => {
+    const id = (await ask('gpu-box', { kind: 'image' })).data.test.id;
+    await call('/api/reuse/workers/gpu-box/order', { method: 'POST', token: ADMIN, body: { pause: true } });
+    assert.strictEqual((await next(AMD, NEW_WORKER)).data.orders.gpu_test, null);
+    await call('/api/reuse/workers/gpu-box/order', { method: 'POST', token: ADMIN, body: { pause: false } });
+
+    const never = await call('/api/reuse/workers/gpu-box/schedule', { method: 'PUT', token: ADMIN, body: { timezone: 'Europe/Paris', days: {} } });
+    assert.strictEqual(never.status, 200);
+    assert.strictEqual((await next(AMD, NEW_WORKER)).data.orders.gpu_test, null, 'Alice uses his PC: nothing starts');
+    await call('/api/reuse/workers/gpu-box/schedule', { method: 'DELETE', token: ADMIN });
+    assert.strictEqual((await next(AMD, NEW_WORKER)).data.orders.gpu_test.id, id);
+
+    await report(id, { status: 'done', report: { ok: true, compute_s: 30 } });
+    // Test over: the machine gets jobs again
+    await call('/api/reuse/jobs?batch=t&name=t_001.flac', { method: 'POST', token: ADMIN, rawBody: fakeFlac('b') });
+    assert.strictEqual((await next(AMD, NEW_WORKER)).data.job.name, 't_001.flac');
+  });
+});
+
+describe('worker-control: expiry (clock passed in)', () => {
+  let wc;
+  const DB_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wctl-db-'));
+  before(async () => {
+    process.env.DB_PATH = path.join(DB_DIR, 'hub.db');
+    wc = await import('../src/services/worker-control.js');
+  });
+  after(() => fs.rmSync(DB_DIR, { recursive: true, force: true }));
+
+  test('a running test the worker stopped reporting on fails after 15 min; a pending one after 24 h', () => {
+    const t0 = Date.parse('2026-11-13T18:00:00Z');
+    const a = wc.createTest('pc-x', { kind: '3d' }, t0).test.id;
+    wc.reportTest('pc-x', a, { status: 'running', stage: 'calcul' }, t0 + 1000);
+    assert.strictEqual(wc.getTest('pc-x', a, t0 + wc.TEST_SILENT_MS).test.status, 'running');
+    const lost = wc.getTest('pc-x', a, t0 + 1000 + wc.TEST_SILENT_MS + 1).test;
+    assert.strictEqual(lost.status, 'failed');
+    assert.match(lost.error, /stopped reporting/);
+
+    const b = wc.createTest('pc-x', { kind: 'image' }, t0).test.id;
+    assert.deepStrictEqual(wc.pendingTest('pc-x', t0 + 1000), { id: b, kind: 'image', params: {} });
+    assert.strictEqual(wc.pendingTest('pc-x', t0 + wc.TEST_PENDING_MS + 1), null);
+    assert.match(wc.getTest('pc-x', b, t0 + wc.TEST_PENDING_MS + 1).test.error, /not started within 24 h/);
+    const events = wc.workerEvents('pc-x').map(e => e.what);
+    assert.ok(events.includes('test_lost') && events.includes('test_expired'));
+  });
+
+  test('a setting of 0 is kept (not mistaken for absent); an unknown test id is a 404', () => {
+    assert.strictEqual(wc.patchWorkerSettings('pc-y', { gpu_keep_loaded_s: 0 }).ok, true);
+    assert.deepStrictEqual(wc.workerSettings('pc-y'), { gpu_keep_loaded_s: 0 });
+    assert.strictEqual(wc.reportTest('pc-y', 'abc', { status: 'running' }).status, 404);
+  });
+});

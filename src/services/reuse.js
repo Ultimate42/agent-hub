@@ -8,6 +8,9 @@ import { dbInstance as db } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { workerWindow, workerInWindow, setWorkerSchedule, clearWorkerSchedule } from './reuse-schedule.js';
+import {
+  workerSettings, patchWorkerSettings, workerEvents, pendingTest, createTest, listTests, getTest, cancelTest, reportTest
+} from './worker-control.js';
 
 // ---------------------------------------------------------------------------
 // RE-USE cleaning queue (speech enhancement done by remote GPU workers)
@@ -314,20 +317,27 @@ export function deleteBatch(batch, now = Date.now()) {
 // ---------------------------------------------------------------------------
 // Worker side
 // ---------------------------------------------------------------------------
-/** update: 0, or the id of a pending forced-update order (the worker echoes it back as update_ack once restarted). */
-export function workerOrders(name) {
+/**
+ * update: 0, or the id of a pending forced-update order (the worker echoes it back as update_ack once restarted).
+ * settings: config keys the hub overrides on this machine (worker-control.js). gpu_test: {id, kind, params} of a
+ * remote test to run between two jobs, or null; only handed out inside the schedule and when not paused.
+ */
+export function workerOrders(name, now = Date.now()) {
   const w = q.worker.get(name);
+  const paused = Boolean(w?.paused);
   return {
-    paused: Boolean(w?.paused),
+    paused,
     update: w?.update_requested || 0,
-    worker_version: workerManifest().version
+    worker_version: workerManifest().version,
+    settings: workerSettings(name),
+    gpu_test: !paused && workerInWindow(name, now) ? pendingTest(name, now) : null
   };
 }
 
 /** Record a poll (last seen + what the worker says about itself) and return its standing orders. */
 export function noteReusePoll(name, info = {}) {
   const kept = {};
-  for (const k of ['version', 'backend', 'device', 'os', 'state', 'job', 'rolled_back_from', 'last_error', 'host', 'update_ack', 'gpu', 'gpu_state']) {
+  for (const k of ['version', 'backend', 'device', 'os', 'state', 'job', 'rolled_back_from', 'last_error', 'host', 'update_ack', 'gpu', 'gpu_state', 'tests']) {
     if (info && info[k] != null) kept[k] = String(info[k]).slice(0, 200);
   }
   if (info && typeof info === 'object') q.touch.run(name, Date.now(), JSON.stringify(kept));
@@ -360,6 +370,8 @@ export function claimJob(name, now = Date.now(), other = null) {
     const otherHeld = other?.held(now);
     if (otherHeld) return otherHeld;
     if (!workerInWindow(name, now)) return null;
+    // A remote GPU test is waiting (workerOrders hands it out): no new job, so the machine is free to run it
+    if (pendingTest(name, now)) return null;
     const otherNext = other?.next(now);
     if (otherNext) return otherNext;
     for (;;) {
@@ -500,6 +512,7 @@ export function listWorkers(now = Date.now()) {
         audio_s: Math.round(w.audio_s || 0),
         compute_s: Math.round(w.compute_s || 0),
         ...(w.audio_s > 0 && w.compute_s > 0 ? { rtf: Math.round((w.compute_s / w.audio_s) * 1000) / 1000 } : {}),
+        settings: workerSettings(w.name),   // overrides set from the hub (GET /api/reuse/workers/:name/settings)
         info
       };
     })
@@ -519,6 +532,41 @@ export function orderWorker(name, { pause, update } = {}) {
 }
 
 const knownWorker = (name) => config.reuseWorkerTokens.some(w => w.name === name) || Boolean(q.worker.get(name));
+
+/** Admin entry points of worker-control.js, for a known worker only. */
+function onWorker(name, fn) {
+  if (!WORKER_NAME.test(name || '')) return err(400, 'Invalid worker name');
+  if (!knownWorker(name)) return err(404, 'Unknown worker');
+  return fn();
+}
+export const getWorkerSettings = (name) => onWorker(name, () => ({ ok: true, worker: name, settings: workerSettings(name), history: workerEvents(name) }));
+export const setWorkerSettings = (name, patch) => onWorker(name, () => {
+  const r = patchWorkerSettings(name, patch);
+  return r.ok ? { ...r, worker: name } : r;
+});
+/** Queue a remote GPU test. warning: why it may not start soon (version without remote tests, out of schedule, paused). */
+export const requestWorkerTest = (name, body) => onWorker(name, () => {
+  const r = createTest(name, body || {});
+  if (!r.ok) return r;
+  const w = q.worker.get(name);
+  const info = parseParams(w?.info);
+  const warnings = [];
+  if (!String(info.tests || '').split(',').includes(r.test.kind)) {
+    warnings.push(`${name} (version ${info.version || '?'}) has not announced "${r.test.kind}" tests yet: it runs the test once updated ({update: true})`);
+  }
+  const window = workerWindow(name);
+  if (!window.in_window) warnings.push(`out of its schedule: starts at ${window.next_window_start || 'its next window'}`);
+  if (w?.paused) warnings.push('paused: starts once resumed ({pause: false})');
+  return warnings.length ? { ...r, warning: warnings.join('; ') } : r;
+});
+export const listWorkerTests = (name, limit) => onWorker(name, () => ({ ok: true, worker: name, tests: listTests(name, limit) }));
+export const getWorkerTest = (name, id) => onWorker(name, () => getTest(name, id));
+export const cancelWorkerTest = (name, id) => onWorker(name, () => cancelTest(name, id));
+/** Worker side: progress and final report of a test it was given; answers {cancel} and its orders. */
+export function reportWorkerTest(name, id, body) {
+  const r = reportTest(name, id, body || {});
+  return r.ok ? { ...r, orders: workerOrders(name) } : r;
+}
 
 /** Schedule of one worker and where it stands now. */
 export function getSchedule(name) {

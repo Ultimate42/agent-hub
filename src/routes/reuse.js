@@ -5,7 +5,8 @@ import { config } from '../config.js';
 import {
   reuseEnabled, identifyReuseCaller, submitJob, listJobs, getJob, jobView, retryJob, cancelJob, deleteBatch,
   noteReusePoll, claimJob, claimView, canReadInput, heartbeat, failJob, completeJob,
-  listWorkers, orderWorker, getSchedule, setSchedule, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost
+  listWorkers, orderWorker, getSchedule, setSchedule, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost,
+  getWorkerSettings, setWorkerSettings, requestWorkerTest, listWorkerTests, getWorkerTest, cancelWorkerTest, reportWorkerTest
 } from '../services/reuse.js';
 import { gpuClaimHooks, gpuClaimView } from '../services/gpu-jobs.js';
 
@@ -15,6 +16,7 @@ import { gpuClaimHooks, gpuClaimView } from '../services/gpu-jobs.js';
 // ---------------------------------------------------------------------------
 const router = Router();
 const json = express.json({ limit: '64kb' });
+const jsonReport = express.json({ limit: '256kb' }); // final report of a GPU test: engine log included (the hub keeps 32 KB of it)
 const raw = express.raw({ type: () => true, limit: config.reuseMaxFileSize });
 
 /** Authenticated caller with the expected role ('admin', 'worker' or 'any'), or null after answering. */
@@ -141,6 +143,39 @@ router.delete('/api/reuse/workers/:name/schedule', guard('admin'), (req, res) =>
   answer(res, setSchedule(req.params.name, null));
 });
 
+/**
+ * GET /api/reuse/workers/:name/settings - {settings, history}: config keys the hub overrides on this machine, and the
+ * journal of changes and remote tests (most recent first) (admin).
+ * POST - body {enable_3d: true|false|null, gpu_max_gb: 5..200|null, gpu_keep_loaded_s: 0..7200|null}: merged; null
+ * removes the override (the machine's own reuse-worker.config.json applies again). Sent at its next poll.
+ */
+router.get('/api/reuse/workers/:name/settings', guard('admin'), (req, res) => {
+  answer(res, getWorkerSettings(req.params.name));
+});
+router.post('/api/reuse/workers/:name/settings', guard('admin'), json, (req, res) => {
+  answer(res, setWorkerSettings(req.params.name, req.body));
+});
+
+/**
+ * POST /api/reuse/workers/:name/tests {kind: "image"|"3d"|"comfyui"|"comfyui_remove", params} - Queue a GPU test, the
+ * remote form of `reuse_worker.py --gpu-test`. Run between two jobs, inside the schedule, one at a time. 201 {test[, warning]}.
+ * GET /api/reuse/workers/:name/tests[?limit=20] - Tests of this worker, most recent first.
+ * GET /api/reuse/workers/:name/tests/:id - {test: {status, stage, progress, ok, error, result: {compute_s, log, ...}}}.
+ * POST /api/reuse/workers/:name/tests/:id/cancel - A running test is stopped by the worker within 30 s.
+ */
+router.post('/api/reuse/workers/:name/tests', guard('admin'), json, (req, res) => {
+  answer(res, requestWorkerTest(req.params.name, req.body), 201);
+});
+router.get('/api/reuse/workers/:name/tests', guard('admin'), (req, res) => {
+  answer(res, listWorkerTests(req.params.name, one(req.query.limit)));
+});
+router.get('/api/reuse/workers/:name/tests/:id', guard('admin'), (req, res) => {
+  answer(res, getWorkerTest(req.params.name, req.params.id));
+});
+router.post('/api/reuse/workers/:name/tests/:id/cancel', guard('admin'), (req, res) => {
+  answer(res, cancelWorkerTest(req.params.name, req.params.id));
+});
+
 // ----- Worker ----------------------------------------------------------------
 
 /**
@@ -163,9 +198,10 @@ router.post('/api/reuse/next', guard('worker'), json, (req, res) => {
     // always given back to it, like a RE-USE one. Older workers announce nothing and never see a GPU job.
     const job = claimJob(caller.name, Date.now(), gpuClaimHooks(caller.name, body.info?.gpu));
     if (job) return res.json({ job: job.gpu ? gpuClaimView(job.gpu) : claimView(job), orders });
-    const changed = orders.paused !== first.paused || orders.update !== first.update || orders.worker_version !== first.worker_version;
-    // An order the worker must act on (update) is delivered at once; otherwise wait for a job
-    if (changed || orders.update || Date.now() >= deadline) return res.json({ job: null, orders });
+    const changed = orders.paused !== first.paused || orders.update !== first.update || orders.worker_version !== first.worker_version
+      || JSON.stringify(orders.settings) !== JSON.stringify(first.settings);
+    // An order the worker must act on (update, a GPU test) is delivered at once; otherwise wait for a job
+    if (changed || orders.update || orders.gpu_test || Date.now() >= deadline) return res.json({ job: null, orders });
     setTimeout(attempt, 1000);
   };
   attempt();
@@ -175,6 +211,14 @@ router.post('/api/reuse/next', guard('worker'), json, (req, res) => {
 router.post('/api/reuse/worker/status', guard('worker'), json, (req, res) => {
   const caller = req.reuseCaller;
   res.json({ orders: noteReusePoll(caller.name, (req.body || {}).info) });
+});
+
+/**
+ * POST /api/reuse/worker/tests/:id {status: "running", stage, progress} while a remote GPU test runs (every 30 s at most),
+ * then {status: "done"|"failed", report: {ok, compute_s, error, log, ...}}. -> {cancel: true|false, orders}.
+ */
+router.post('/api/reuse/worker/tests/:id', guard('worker'), jsonReport, (req, res) => {
+  answer(res, reportWorkerTest(req.reuseCaller.name, req.params.id, req.body));
 });
 
 /** GET /api/reuse/jobs/:id/input - Source FLAC (the worker holding the job, or admin). */
