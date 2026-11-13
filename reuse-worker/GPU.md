@@ -81,6 +81,24 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
   - `s_per_step` et `executed_s` (temps donné par ComfyUI) ;
   - `wall_s` ;
   - `server_start_s` au premier travail d'une série. ComfyUI reste chargé `gpu_keep_loaded_s`, 10 minutes par défaut.
+- **Lenteur du job 52 (13/11), 232 s par étape.** ComfyUI n'autorise pas le fp16 pour Flux3 : sur RDNA2, qui n'a pas de
+  bf16, il calculait donc en fp32 (« manual cast »). Le DiT ne tenait plus en mémoire vidéo, et le chargement dynamique
+  relisait les poids à chaque étape. Réglages admin du modèle (ils relancent ComfyUI) :
+  - `unet_dtype` : fp16 par défaut (`--fp16-unet`). Si l'image sort unie (NaN), le même job est refait en `default` ;
+  - `dynamic_vram` : false par défaut (`--disable-dynamic-vram`) ;
+  - `attention` : quad par défaut, ou split ou pytorch ;
+  - `ref_megapixels` : 1,0 par défaut, 0,25 au plus petit.
+- **Diagnostic dans `engine` du job** :
+  - `weight_dtype` et `compute_dtype`, la précision réelle ;
+  - `load`, la ligne de chargement de ComfyUI (complet, partiel, dynamique) ;
+  - `vram_state` ;
+  - `vram_free_before_mib` et `vram_free_after_mib` ;
+  - `comfyui_flags` ;
+  - `s_per_step` ;
+  - `log`, un extrait du journal de ComfyUI.
+- **Trop lent pour le plafond (30 min)** : dès deux étapes mesurées, le worker arrête le job s'il ne peut pas finir à
+  temps. Le message donne la raison chiffrée. L'échec est définitif (`final`) : le hub ne relance pas un calcul qui
+  referait la même chose.
 - Place : 20,3 Go de poids (modèle 11,1, encodeur 8,9, VAE 0,3). Avec le reste du dossier `gpu\`, il faut relever
   `gpu_max_gb` à 75.
 - Provenance des fichiers : le dépôt officiel de BFL (`black-forest-labs/flux-3-image-klein-comfy`) exige une connexion

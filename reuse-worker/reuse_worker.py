@@ -76,6 +76,10 @@ class JobLost(Exception):
     """Le hub a repris le job (bail perdu, job annulé) : on abandonne sans rien renvoyer."""
 
 
+class Final(RuntimeError):
+    """Échec qui se reproduirait à l'identique (trop lent pour le plafond, image ratée deux fois) : le hub ne relance pas."""
+
+
 class Refused(Exception):
     """Le hub a refusé définitivement une requête (4xx) : inutile de réessayer."""
     def __init__(self, status, message):
@@ -1103,23 +1107,64 @@ class Gpu:
         meta = {}
         lay, env = comfy_install(self.root.parent, spec, self, stop, lambda f, st: progress(0.3 * f, st), meta, files=model['files'])
         meta.pop('install_s', None)
-        if self.comfy and self.comfy['h']['proc'].poll() is not None:
-            self.stop_comfy('il s\'était arrêté')
-        if self.comfy is None:
-            progress(0.3, 'démarrage de ComfyUI')
-            comfy_pick_device(lay, env, spec, self, stop, meta)
-            self.comfy = {'h': comfy_start(lay, env, spec, self, stop, progress)}
-            meta['server_start_s'] = self.comfy['h']['start_s']
-        else:
-            meta['server_reused'] = True
-        h = self.comfy['h']
-        self.last_trace = h['box']['all']
         values = dict(job.get('params') or {})
         for name, ps in (model.get('params') or {}).items():
             if name not in values and ps.get('default') not in (None, 'random'):
                 values[name] = ps['default']
         values.setdefault('seed', 0)
-        values.update(prompt=job.get('prompt') or '', ref_megapixels=float((model.get('references') or {}).get('megapixels') or 1.0))
+        values.setdefault('ref_megapixels', float((model.get('references') or {}).get('megapixels') or 1.0))
+        values.update(prompt=job.get('prompt') or '')
+        tries = [values]
+        if values.get('unet_dtype') == 'fp16' and model.get('fp16_fallback'):
+            tries.append(dict(values, unet_dtype=model['fp16_fallback']))   # image unie en fp16 (NaN) : refait dans la précision sûre
+        for n, vals in enumerate(tries):
+            out, run = self.comfy_generate(job, model, spec, lay, env, vals, workdir, stop, progress, meta)
+            stats = png_stats(out) or {}
+            meta['image_std'] = stats.get('std')
+            if stats.get('std', 99) >= 2:
+                break
+            if n + 1 < len(tries):
+                log.warning('Image unie en %s (NaN probable) : nouvel essai en %s.', vals.get('unet_dtype'), tries[n + 1]['unet_dtype'])
+                meta['half_fallback'] = True
+            else:
+                raise Final('image unie (noire ?) en %s : calcul tombé en NaN probable' % vals.get('unet_dtype', 'default'))
+        meta.update(run)
+        meta['backend'] = 'rocm'
+        meta.pop('torch_devices', None)
+        meta.pop('torch', None)
+        if isinstance(meta.get('torch_device'), dict):
+            meta['device'] = meta.pop('torch_device').get('name')
+        self.check_output('png', out, values)
+        return out, time.time() - t0, {k: v for k, v in meta.items() if isinstance(v, (str, int, float, bool))}
+
+    def comfy_generate(self, job, model, spec, lay, env, values, workdir, stop, progress, meta):
+        """Un passage : ComfyUI (re)lancé si ses réglages changent, workflow joué. -> (out.png, mesures)."""
+        extra = []
+        for name, flags in (model.get('comfyui_flags') or {}).items():   # réglages admin -> options de ComfyUI
+            extra += flags.get(str(values.get(name)).lower(), [])
+        key = json.dumps([extra, env.get('HIP_VISIBLE_DEVICES')])
+        if self.comfy and (self.comfy['h']['proc'].poll() is not None or self.comfy.get('key') != key):
+            self.stop_comfy('il s\'était arrêté' if self.comfy['h']['proc'].poll() is not None else 'réglages changés')
+        if self.comfy is None:
+            progress(0.3, 'démarrage de ComfyUI')
+            if 'torch_device' not in meta:
+                comfy_pick_device(lay, env, spec, self, stop, meta)
+            self.comfy = {'h': comfy_start(lay, env, spec, self, stop, progress, extra),
+                          'key': json.dumps([extra, env.get('HIP_VISIBLE_DEVICES')])}   # carte choisie : clé à jour
+            meta['server_start_s'] = self.comfy['h']['start_s']
+        else:
+            meta['server_reused'] = True
+        h = self.comfy['h']
+        self.last_trace = h['box']['all']
+        h['on_trace'] = lambda t: setattr(self, 'last_trace', t)   # avancement, précision et extrait du journal au hub pendant le calcul
+        meta['comfyui_flags'] = ' '.join(extra) or 'aucune'
+        meta.update({k: values[k] for k in ('unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels') if k in values})
+        free = (((comfy_local(h['port'], 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
+        if free.get('vram_free') is not None:
+            meta['vram_free_before_mib'] = int(free['vram_free'] / 1048576)
+        # Repris dans le journal envoyé au hub pendant le calcul : un travail raté dit lui aussi avec quels réglages
+        h['box']['all'].meta.update({k: meta[k] for k in ('comfyui_flags', 'unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels',
+                                                         'vram_free_before_mib') if k in meta})
         wf = comfy_workflow(model, values)
         inputs = lay['data'] / 'input'
         inputs.mkdir(parents=True, exist_ok=True)
@@ -1137,21 +1182,22 @@ class Gpu:
         try:
             path, run = comfy_prompt(h, wf, values['steps'], stop, lambda f, st: progress(0.35 + 0.6 * f, st),
                                      float(model.get('timeout_s') or 1800), 'génération')
+            self.last_trace = h.get('trace') or self.last_trace
             shutil.copyfile(path, out)
             path.unlink(missing_ok=True)   # rien ne reste dans ComfyUI : la sortie part au hub
-        except JobLost:
-            self.stop_comfy('travail annulé')   # ComfyUI calcule encore : la carte est rendue tout de suite
+        except (JobLost, Final):
+            self.stop_comfy('travail arrêté')   # ComfyUI calcule encore : la carte est rendue tout de suite
             raise
         finally:
+            if h.get('trace') is not None:
+                meta.update({k: v for k, v in h['trace'].summary().items() if k in ('weight_dtype', 'compute_dtype', 'vram_state', 'load')})
             for p in placed:
                 p.unlink(missing_ok=True)
-        meta.update(run)
-        meta['backend'] = 'rocm'
-        meta.pop('torch_devices', None)
-        if isinstance(meta.get('torch_device'), dict):
-            meta['device'] = meta.pop('torch_device').get('name')
-        self.check_output('png', out, values)
-        return out, time.time() - t0, {k: v for k, v in meta.items() if isinstance(v, (str, int, float, bool))}
+        if self.comfy:
+            after = (((comfy_local(h['port'], 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
+            if after.get('vram_free') is not None:
+                meta['vram_free_after_mib'] = int(after['vram_free'] / 1048576)
+        return out, run
 
     def installed(self, kind):
         spec = (self.catalog.get('types') or {}).get(kind) or {}
@@ -1964,9 +2010,10 @@ class Worker:
             pass
 
     def give_back(self, jid, reason, route='/api/reuse/jobs/'):
-        """Rend le job au hub en comptant l'essai (au bout du dernier, le hub le déclare en échec)."""
+        """Rend le job au hub en comptant l'essai (au bout du dernier, le hub le déclare en échec). Un échec Final n'est pas
+        relancé : le même calcul referait la même chose."""
         try:
-            self.hub.request('POST', '%s%d/fail' % (route, jid), body={'error': str(reason)[:300]}, timeout=30)
+            self.hub.request('POST', '%s%d/fail' % (route, jid), body={'error': str(reason)[:300], 'final': isinstance(reason, Final)}, timeout=30)
         except OSError:
             pass
 
@@ -2255,9 +2302,24 @@ class ComfyTrace(EngineTrace):
     chargement (partiel = la mémoire vidéo ne suffit pas), erreurs HIP."""
     KEEP = re.compile(r'Total VRAM|pytorch version|Device:|Set vram state|attention|weight dtype|manual cast|loaded (completely|partially)|'
                       r'Requested to load|Prompt executed|out of memory|HIP|hipError|MIOpen|rocBLAS|Traceback|Error|\bWARN|Exception|'
-                      r'Starting server|To see the GUI|TORCH ', re.I)
+                      r'Starting server|To see the GUI|TORCH |dynamic|staged|offload|lowvram|unload|dtype', re.I)
     BAR = re.compile(r'\|\s*(\d+)/(\d+)\s*\[[^\]]*?,\s*([\d.]+)(s/it|it/s)\]')
     TAKING = (('executed_s', r'Prompt executed in ([\d.]+) seconds'),)
+
+    def line(self, line):
+        super().line(line)
+        # Ce qui explique une lenteur : précision réelle, mode mémoire, chargement complet ou partiel des poids
+        m = re.search(r'model weight dtype (?:torch\.)?(\w+), manual cast: (?:torch\.)?(\w+)', line)
+        if m:
+            self.meta.update(weight_dtype=m.group(1), compute_dtype=m.group(2) if m.group(2) != 'None' else m.group(1))
+        m = re.search(r'Set vram state to: (\w+)', line)
+        if m:
+            self.meta['vram_state'] = m.group(1)
+        m = re.search(r'(loaded (?:completely|partially)[^\r\n]{0,120})', line)
+        if m:
+            self.meta['load'] = m.group(1)[:160]
+        if re.search(r'dynamic vram|staged', line, re.I):
+            self.meta['load'] = line.strip()[:160]
 
 
 def comfy_spec(app=None):
@@ -2569,18 +2631,31 @@ def comfy_local(port, method, path, body=None, timeout=30):
             return e.code, {'error': text[:300].decode('utf-8', 'replace')}
 
 
-def comfy_start(lay, env, spec, gpu, stop, progress):
+ATTENTION_FLAGS = ('--use-quad-cross-attention', '--use-split-cross-attention', '--use-pytorch-cross-attention')
+
+
+def comfy_args(spec, port, base, extra=()):
+    """Ligne de commande de ComfyUI : celle du catalogue, et les réglages du modèle (précision, attention, mémoire) ; une
+    attention demandée remplace celle du catalogue (ComfyUI n'en prend qu'une)."""
+    args = build_command(spec['args'], {'port': port, 'base': base})
+    if any(a in ATTENTION_FLAGS for a in extra):
+        args = [a for a in args if a not in ATTENTION_FLAGS]
+    return args + [a for a in extra if a not in args]
+
+
+def comfy_start(lay, env, spec, gpu, stop, progress, extra=()):
     """ComfyUI lancé sur 127.0.0.1, sans interface, journal dans gpu/logs/comfyui.log. -> poignée {proc, port, box, th, stats}."""
     probe = socket.socket()
     probe.bind(('127.0.0.1', 0))
     port = probe.getsockname()[1]
     probe.close()
     lay['data'].mkdir(parents=True, exist_ok=True)
-    args = [str(lay['exe']), '-s', str(lay['src'] / 'main.py')] + build_command(spec['args'], {'port': port, 'base': str(lay['data'])})
+    args = [str(lay['exe']), '-s', str(lay['src'] / 'main.py')] + comfy_args(spec, port, str(lay['data']), extra)
     flags, kwargs = gpu.spawn_options()
     logs = gpu.root / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
     out_log = open(logs / 'comfyui.log', 'wb')
+    out_log.write(('# %s\n' % ' '.join(args[2:])).encode('utf-8', 'replace'))
     t0 = time.time()
     proc = subprocess.Popen(args, cwd=str(lay['src']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                             env=env, creationflags=flags, **kwargs)
@@ -2642,7 +2717,13 @@ def comfy_stop(h):
 def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
     """Un workflow joué par ComfyUI. -> (chemin de la première image, mesures). progress(fraction 0..1 du calcul, étape)."""
     trace = ComfyTrace(int(steps))
+    trace.meta.update(h['box']['all'].meta)       # précision, mode mémoire vus au démarrage ou au travail précédent
+    trace.lines = list(h['box']['all'].lines[-30:])
     h['box']['trace'] = trace
+    h['trace'] = trace
+    gpu_trace_hook = h.get('on_trace')
+    if gpu_trace_hook:
+        gpu_trace_hook(trace)
     port, proc = h['port'], h['proc']
     t1 = time.time()
     status, answer = comfy_local(port, 'POST', '/prompt', {'prompt': wf, 'client_id': 'reuse-worker'}, timeout=60)
@@ -2656,7 +2737,12 @@ def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
         if proc.poll() is not None:
             raise RuntimeError('ComfyUI s\'est arrêté pendant le calcul (code %s) : %s' % (proc.returncode, ' | '.join(h['box']['all'].lines[-4:])[-400:]))
         if time.time() - t1 > timeout:
-            raise RuntimeError('%s trop long (plus de %s)' % (label, fmt_duration(timeout)))
+            raise Final('%s trop long (plus de %s)' % (label, fmt_duration(timeout)))
+        # Dès deux étapes mesurées : si la suite ne tient pas dans le plafond, on s'arrête tout de suite, avec la raison
+        if trace.step and trace.step >= 2 and trace.step_rate and time.time() - t1 + trace.step_rate * (int(steps) - trace.step) > timeout:
+            raise Final('%s trop lent : %.1f s par étape, %d étapes, plafond %s (précision %s/%s, chargement : %s)' % (
+                label, trace.step_rate, int(steps), fmt_duration(timeout), trace.meta.get('weight_dtype', '?'),
+                trace.meta.get('compute_dtype', '?'), trace.meta.get('load', '?')))
         progress(max(0.0, min(1.0, (trace.progress - 0.35) / 0.55)), '%s : %s' % (label, trace.stage()))
         time.sleep(1)
         status, hist = comfy_local(port, 'GET', '/history/%s' % pid, timeout=30)

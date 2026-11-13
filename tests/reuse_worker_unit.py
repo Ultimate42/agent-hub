@@ -716,8 +716,12 @@ history = {}
 print('Total VRAM 16368 MB, total RAM 32000 MB', flush=True)
 print('pytorch version: 2.13.0+rocm10.0.0', flush=True)
 print('HIP_VISIBLE_DEVICES %s TEMP %s' % (os.environ.get('HIP_VISIBLE_DEVICES'), os.environ.get('TEMP')), flush=True)
+flat = lambda: '--fp16-unet' in a and os.path.exists(os.path.join(base, 'flat-fp16'))
+slow = os.path.exists(os.path.join(base, 'slow'))
+print('Set vram state to: NORMAL_VRAM', flush=True)
 def png(path, w, h):
-    rows = b''.join(b'\x00' + bytes((x * 7 + y * 13 + len(history)) % 256 for x in range(w)) for y in range(h))
+    is_flat = flat()
+    rows = b''.join(b'\x00' + bytes(0 if is_flat else (x * 7 + y * 13 + len(history)) % 256 for x in range(w)) for y in range(h))
     c = lambda k, d: struct.pack('>I', len(d)) + k + d + struct.pack('>I', zlib.crc32(k + d))
     open(path, 'wb').write(b'\x89PNG\r\n\x1a\n' + c(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 0, 0, 0, 0)) + c(b'IDAT', zlib.compress(rows)) + c(b'IEND', b''))
 def run(pid, wf):
@@ -728,9 +732,11 @@ def run(pid, wf):
         if n['class_type'] == 'LoadImage':
             assert os.path.exists(os.path.join(base, 'input', n['inputs']['image'])), 'reference placed in ComfyUI input'
     steps = node('KSampler')['inputs']['steps']
+    print('model weight dtype torch.%s, manual cast: %s' % ('float16' if '--fp16-unet' in a else 'bfloat16', 'None' if '--fp16-unet' in a else 'torch.float32'), flush=True)
+    print('loaded completely; 14000.00 MB usable, 11000.00 MB loaded, full load: True', flush=True)
     for i in range(1, steps + 1):
-        print(' %3d%%|###   | %d/%d [00:01<00:02,  0.05s/it]' % (100 * i // steps, i, steps), end='\r', flush=True)
-        time.sleep(0.05)
+        print(' %3d%%|###   | %d/%d [00:01<00:02,  %s]' % (100 * i // steps, i, steps, '500.00s/it' if slow else '0.05s/it'), end='\r', flush=True)
+        time.sleep(0.2 if slow else 0.05)
     print('\nPrompt executed in 0.42 seconds', flush=True)
     lat = [n for n in wf.values() if n['class_type'].startswith('Empty')][0]['inputs']
     os.makedirs(os.path.join(base, 'output'), exist_ok=True)
@@ -820,6 +826,35 @@ class KleinJobTest(unittest.TestCase):
             self.assertTrue(meta2.get('server_reused'))
             self.assertEqual(gpu.comfy['h']['proc'].pid, pid)
             self.assertNotIn('images.image0', json.loads((lay['data'] / 'last-workflow.json').read_text())['refs']['inputs'])
+            # Réglages par défaut : demi-précision, chargement estimé (pas dynamique), une seule attention ; et le diagnostic
+            cmd = (base / 'gpu' / 'logs' / 'comfyui.log').read_text().splitlines()[0]
+            self.assertIn('--fp16-unet', cmd)
+            self.assertIn('--disable-dynamic-vram', cmd)
+            self.assertEqual(sum(cmd.count(f) for f in w.ATTENTION_FLAGS), 1)
+            self.assertEqual((meta['weight_dtype'], meta['compute_dtype']), ('float16', 'float16'))
+            self.assertTrue(meta['load'].startswith('loaded completely'))
+            self.assertEqual(meta['vram_state'], 'NORMAL_VRAM')
+            self.assertEqual(meta['unet_dtype'], 'fp16')
+            self.assertIn('vram_free_before_mib', meta)
+            self.assertTrue(all(re.fullmatch(r'[a-z_]{1,32}', k) for k in meta), 'keys the hub keeps')
+
+            # Image unie en fp16 (NaN) : refaite dans la précision sûre, ComfyUI relancé sans --fp16-unet
+            (lay['data'] / 'flat-fp16').write_text('')
+            out3, _, meta3 = gpu.run(dict(job, id=9, ref_paths=[]), None, work, None, lambda f, st: None)
+            self.assertTrue(meta3['half_fallback'])
+            self.assertEqual(meta3['compute_dtype'], 'float32')
+            self.assertGreater(w.png_stats(out3)['std'], 2)
+            self.assertNotIn('--fp16-unet', (base / 'gpu' / 'logs' / 'comfyui.log').read_text().splitlines()[0])
+            (lay['data'] / 'flat-fp16').unlink()
+
+            # Trop lent pour le plafond : arrêt dès la deuxième étape mesurée, échec définitif avec la raison
+            gpu.stop_comfy()
+            (lay['data'] / 'slow').write_text('')
+            with self.assertRaises(w.Final) as e:
+                gpu.run(dict(job, id=10, ref_paths=[], params=dict(job['params'], steps=16)), None, work, None, lambda f, st: None)
+            self.assertIn('trop lent : 500.0 s par étape', str(e.exception))
+            self.assertIn('float16', str(e.exception))
+            self.assertIsNone(gpu.comfy, 'ComfyUI stopped, card given back')
         finally:
             gpu.stop_comfy()
         self.assertFalse(lay['pid'].exists(), 'card given back')

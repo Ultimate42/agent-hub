@@ -229,6 +229,42 @@
              "min": 0,
              "max": 2147483647,
              "default": "random"
+            },
+            "unet_dtype": {
+             "type": "enum",
+             "values": [
+              "fp16",
+              "bf16",
+              "default"
+             ],
+             "default": "fp16",
+             "admin": true,
+             "notes": "Précision du DiT dans ComfyUI. default : ce que ComfyUI choisit pour Flux3 sur RDNA2, poids bf16 calculés en fp32 (manual cast) : job 52 du 13/11, 232 s par étape, poids qui ne tiennent plus en mémoire vidéo. fp16 (défaut) : poids 11,1 Go et calcul en demi-précision, deux fois plus rapide sur RDNA2 ; ComfyUI ne le propose pas d'office pour Flux3 (risque de NaN), d'où le repli automatique en default si l'image sort unie. bf16 : sans support matériel sur gfx1030."
+            },
+            "attention": {
+             "type": "enum",
+             "values": [
+              "quad",
+              "split",
+              "pytorch"
+             ],
+             "default": "quad",
+             "admin": true,
+             "notes": "Attention de ComfyUI. quad (défaut, mesuré pour Z-Image : 8,68 s par étape). pytorch : SDPA, sans AOTriton sur gfx1030, donc le chemin math, gourmand en mémoire."
+            },
+            "dynamic_vram": {
+             "type": "bool",
+             "default": false,
+             "admin": true,
+             "notes": "Chargement dynamique de ComfyUI (comfy-aimdo). Coupé par défaut : sous Windows ROCm sans mémoire épinglée, il relit les poids qui ne tiennent pas en mémoire vidéo à chaque étape. Coupé, ComfyUI estime la place et charge tout d'un coup."
+            },
+            "ref_megapixels": {
+             "type": "number",
+             "min": 0.25,
+             "max": 1.0,
+             "default": 1.0,
+             "admin": true,
+             "notes": "Taille des références dans le modèle (1,0 = 1024x1024 environ, 4096 jetons par référence). 0,5 divise par deux les jetons ajoutés."
             }
            },
            "workflow_source": "workflows/flux3_klein_bf16_mi2i.json du depot black-forest-labs/flux-3-image-klein-comfy (sous-graphe Multiple image to image, sans l'agrandisseur de prompt), converti au format API",
@@ -369,7 +405,34 @@
             "node": "refs",
             "input": "images.image{n}"
            },
-           "timeout_s": 1800
+           "timeout_s": 1800,
+           "comfyui_flags": {
+            "unet_dtype": {
+             "fp16": [
+              "--fp16-unet"
+             ],
+             "bf16": [
+              "--bf16-unet"
+             ]
+            },
+            "attention": {
+             "quad": [
+              "--use-quad-cross-attention"
+             ],
+             "split": [
+              "--use-split-cross-attention"
+             ],
+             "pytorch": [
+              "--use-pytorch-cross-attention"
+             ]
+            },
+            "dynamic_vram": {
+             "false": [
+              "--disable-dynamic-vram"
+             ]
+            }
+           },
+           "fp16_fallback": "default"
           }
       }
     },
