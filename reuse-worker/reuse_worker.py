@@ -1113,6 +1113,8 @@ class Gpu:
                 values[name] = ps['default']
         values.setdefault('seed', 0)
         values.setdefault('ref_megapixels', float((model.get('references') or {}).get('megapixels') or 1.0))
+        for key, how in (model.get('workflow_values') or {}).items():   # réglage lisible -> valeur du workflow (text_encoder cpu -> device cpu)
+            values[key] = how['map'].get(str(values.get(how['from'])).lower(), how.get('default'))
         values.update(prompt=job.get('prompt') or '')
         tries = [values]
         if values.get('unet_dtype') == 'fp16' and model.get('fp16_fallback'):
@@ -1158,13 +1160,13 @@ class Gpu:
         self.last_trace = h['box']['all']
         h['on_trace'] = lambda t: setattr(self, 'last_trace', t)   # avancement, précision et extrait du journal au hub pendant le calcul
         meta['comfyui_flags'] = ' '.join(extra) or 'aucune'
-        meta.update({k: values[k] for k in ('unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels') if k in values})
+        meta.update({k: values[k] for k in ('unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels', 'vram_mode', 'text_encoder') if k in values})
         free = (((comfy_local(h['port'], 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
         if free.get('vram_free') is not None:
             meta['vram_free_before_mib'] = int(free['vram_free'] / 1048576)
         # Repris dans le journal envoyé au hub pendant le calcul : un travail raté dit lui aussi avec quels réglages
         h['box']['all'].meta.update({k: meta[k] for k in ('comfyui_flags', 'unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels',
-                                                         'vram_free_before_mib') if k in meta})
+                                                         'vram_mode', 'text_encoder', 'vram_free_before_mib') if k in meta})
         wf = comfy_workflow(model, values)
         inputs = lay['data'] / 'input'
         inputs.mkdir(parents=True, exist_ok=True)
@@ -1190,7 +1192,8 @@ class Gpu:
             raise
         finally:
             if h.get('trace') is not None:
-                meta.update({k: v for k, v in h['trace'].summary().items() if k in ('weight_dtype', 'compute_dtype', 'vram_state', 'load')})
+                meta.update({k: v for k, v in h['trace'].summary().items()
+                             if k in ('weight_dtype', 'compute_dtype', 'vram_state', 'load', 'dit_load', 'te_load', 'before_dit_s', 'vram_free_min_mib')})
             for p in placed:
                 p.unlink(missing_ok=True)
         if self.comfy:
@@ -2315,9 +2318,17 @@ class ComfyTrace(EngineTrace):
         m = re.search(r'Set vram state to: (\w+)', line)
         if m:
             self.meta['vram_state'] = m.group(1)
+        m = re.search(r'Requested to load (\w+)', line)
+        if m:
+            name = m.group(1)
+            self.loading = 'te' if re.search(r'TE|CLIP|Text', name) else ('vae' if re.search(r'Autoencoder|VAE', name, re.I) else 'dit')
+            if self.loading == 'dit' and 'before_dit_s' not in self.meta:
+                # Depuis le début du travail : encodage du texte et des références compris (l'encodeur passe avant le DiT)
+                self.meta['before_dit_s'] = round(self.clock() - self.t0, 1)
         m = re.search(r'(loaded (?:completely|partially)[^\r\n]{0,120})', line)
         if m:
             self.meta['load'] = m.group(1)[:160]
+            self.meta['%s_load' % getattr(self, 'loading', 'dit')] = m.group(1)[:160]   # dit_load : le DiT tient-il en entier ?
         if re.search(r'dynamic vram|staged', line, re.I):
             self.meta['load'] = line.strip()[:160]
 
@@ -2717,7 +2728,7 @@ def comfy_stop(h):
 def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
     """Un workflow joué par ComfyUI. -> (chemin de la première image, mesures). progress(fraction 0..1 du calcul, étape)."""
     trace = ComfyTrace(int(steps))
-    trace.meta.update(h['box']['all'].meta)       # précision, mode mémoire vus au démarrage ou au travail précédent
+    trace.meta.update({k: v for k, v in h['box']['all'].meta.items() if k not in ('before_dit_s', 'vram_free_min_mib')})   # précision, mode mémoire
     trace.lines = list(h['box']['all'].lines[-30:])
     h['box']['trace'] = trace
     h['trace'] = trace
@@ -2744,6 +2755,14 @@ def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
                 label, trace.step_rate, int(steps), fmt_duration(timeout), trace.meta.get('weight_dtype', '?'),
                 trace.meta.get('compute_dtype', '?'), trace.meta.get('load', '?')))
         progress(max(0.0, min(1.0, (trace.progress - 0.35) / 0.55)), '%s : %s' % (label, trace.stage()))
+        if trace.step and int(time.time() - t1) % 5 == 0:   # mémoire vidéo libre pendant l'échantillonnage (le plus bas vu)
+            try:
+                dev = ((comfy_local(port, 'GET', '/system_stats', timeout=5)[1] or {}).get('devices') or [{}])[0]
+                if dev.get('vram_free') is not None:
+                    low = int(dev['vram_free'] / 1048576)
+                    trace.meta['vram_free_min_mib'] = min(low, trace.meta.get('vram_free_min_mib', low))
+            except OSError:
+                pass
         time.sleep(1)
         status, hist = comfy_local(port, 'GET', '/history/%s' % pid, timeout=30)
         if status == 200 and isinstance(hist, dict) and pid in hist:

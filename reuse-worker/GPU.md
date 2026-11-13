@@ -87,10 +87,20 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
   - `unet_dtype` : fp16 par défaut (`--fp16-unet`). Si l'image sort unie (NaN), le même job est refait en `default` ;
   - `dynamic_vram` : false par défaut (`--disable-dynamic-vram`) ;
   - `attention` : quad par défaut, ou split ou pytorch ;
-  - `ref_megapixels` : 1,0 par défaut, 0,25 au plus petit.
+  - `ref_megapixels` : 1,0 par défaut, 0,25 au plus petit ;
+  - `vram_mode` : high par défaut (`--highvram`).
+    - Cause du job 53 (260 s par étape en fp16) : en mode normal, ComfyUI réserve pour l'échantillonnage une estimation
+      prudente. Avec l'attention quad, c'est environ 9 Go à 1024 avec une référence.
+    - Il ne chargeait donc que 6,2 Go du DiT de 11,1 Go, et faisait passer le reste à chaque étape.
+    - En high, le DiT est chargé en entier.
+  - `text_encoder` : cpu par défaut. L'encodeur, 8,9 Go en fp16, calcule sur le processeur, et le DiT reste seul sur la
+    carte d'un travail à l'autre. Avec gpu, l'encodeur passe sur la carte, puis il est déchargé avant le DiT.
 - **Diagnostic dans `engine` du job** :
   - `weight_dtype` et `compute_dtype`, la précision réelle ;
-  - `load`, la ligne de chargement de ComfyUI (complet, partiel, dynamique) ;
+  - `dit_load` et `te_load`, les lignes de chargement du DiT et de l'encodeur (complet ou partiel). `load` est la
+    dernière ligne de chargement ;
+  - `before_dit_s`, le temps avant le chargement du DiT : encodage du texte et des références ;
+  - `vram_free_min_mib`, la mémoire vidéo libre au plus bas pendant l'échantillonnage ;
   - `vram_state` ;
   - `vram_free_before_mib` et `vram_free_after_mib` ;
   - `comfyui_flags` ;

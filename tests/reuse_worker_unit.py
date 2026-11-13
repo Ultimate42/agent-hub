@@ -306,7 +306,8 @@ class GpuTest(unittest.TestCase):
             for mid, m in spec['models'].items():
                 values = {k: (v['default'] if v.get('default') != 'random' else 1) for k, v in m['params'].items()}
                 if m.get('engine') == 'comfyui':   # modèle joué par ComfyUI : un workflow au lieu d'une ligne de commande
-                    wf = w.comfy_workflow(m, dict(values, prompt='x', ref_megapixels=1.0))
+                    extra = {k: how['map'][str(values[how['from']])] for k, how in (m.get('workflow_values') or {}).items()}
+                    wf = w.comfy_workflow(m, dict(values, prompt='x', ref_megapixels=1.0, **extra))
                     self.assertTrue(all(isinstance(n.get('class_type'), str) for n in wf.values()))
                     self.assertNotRegex(json.dumps(wf), r'"\{\w+\}"', 'toutes les valeurs posées')
                 else:
@@ -732,6 +733,10 @@ def run(pid, wf):
         if n['class_type'] == 'LoadImage':
             assert os.path.exists(os.path.join(base, 'input', n['inputs']['image'])), 'reference placed in ComfyUI input'
     steps = node('KSampler')['inputs']['steps']
+    print('Requested to load Flux3TEModel_', flush=True)
+    print('loaded completely; 15000.00 MB usable, 8000.00 MB loaded, full load: True', flush=True)
+    time.sleep(0.3)
+    print('Requested to load Flux3', flush=True)
     print('model weight dtype torch.%s, manual cast: %s' % ('float16' if '--fp16-unet' in a else 'bfloat16', 'None' if '--fp16-unet' in a else 'torch.float32'), flush=True)
     print('loaded completely; 14000.00 MB usable, 11000.00 MB loaded, full load: True', flush=True)
     for i in range(1, steps + 1):
@@ -816,6 +821,7 @@ class KleinJobTest(unittest.TestCase):
             self.assertEqual(wf['refs']['inputs']['images.image1'], ['ref1', 0])
             self.assertEqual(wf['refs']['inputs']['resolution.megapixels'], 1.0)
             self.assertEqual(wf['pos']['inputs']['text'], job['prompt'])
+            self.assertEqual(wf['clip']['inputs']['device'], 'cpu', 'text encoder on the processor by default')
             self.assertEqual(wf['latent']['inputs'], {'width': 320, 'height': 256, 'batch_size': 1})
             self.assertEqual(wf['sampler']['inputs']['steps'], 4)
             self.assertEqual(list((lay['data'] / 'input').iterdir()), [], 'references removed from ComfyUI')
@@ -833,6 +839,12 @@ class KleinJobTest(unittest.TestCase):
             self.assertEqual(sum(cmd.count(f) for f in w.ATTENTION_FLAGS), 1)
             self.assertEqual((meta['weight_dtype'], meta['compute_dtype']), ('float16', 'float16'))
             self.assertTrue(meta['load'].startswith('loaded completely'))
+            self.assertTrue(meta['dit_load'].startswith('loaded completely; 14000'), meta)
+            self.assertTrue(meta['te_load'].startswith('loaded completely; 15000'), meta)
+            self.assertGreaterEqual(meta['before_dit_s'], 0.3)
+            self.assertIn('vram_free_min_mib', meta)
+            self.assertIn('--highvram', cmd)
+            self.assertEqual(meta['text_encoder'], 'cpu')
             self.assertEqual(meta['vram_state'], 'NORMAL_VRAM')
             self.assertEqual(meta['unet_dtype'], 'fp16')
             self.assertIn('vram_free_before_mib', meta)

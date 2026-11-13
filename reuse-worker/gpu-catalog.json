@@ -265,6 +265,27 @@
              "default": 1.0,
              "admin": true,
              "notes": "Taille des références dans le modèle (1,0 = 1024x1024 environ, 4096 jetons par référence). 0,5 divise par deux les jetons ajoutés."
+            },
+            "vram_mode": {
+             "type": "enum",
+             "values": [
+              "high",
+              "normal",
+              "low"
+             ],
+             "default": "high",
+             "admin": true,
+             "notes": "Mode mémoire de ComfyUI. normal : il réserve pour l'échantillonnage une estimation prudente (0,15 Mo par unité de surface avec l'attention quad, environ 9 Go à 1024 avec une référence) et ne charge que le reste du DiT. Job 53 du 13/11 : « loaded partially; 6403 MB usable, 6241 loaded, 4341 offloaded », 260 s par étape. high (défaut) : le DiT de 11,1 Go est chargé en entier (--highvram). low : --lowvram."
+            },
+            "text_encoder": {
+             "type": "enum",
+             "values": [
+              "cpu",
+              "gpu"
+             ],
+             "default": "cpu",
+             "admin": true,
+             "notes": "Où calculer l'encodeur Qwen3-VL-4B (8,9 Go en fp16), une fois par image. cpu (défaut) : le DiT reste seul sur la carte d'un travail à l'autre, au prix de quelques secondes de processeur et de 9 Go de RAM (temps dans engine.before_dit_s). gpu : chargé sur la carte, puis déchargé avant le DiT."
             }
            },
            "workflow_source": "workflows/flux3_klein_bf16_mi2i.json du depot black-forest-labs/flux-3-image-klein-comfy (sous-graphe Multiple image to image, sans l'agrandisseur de prompt), converti au format API",
@@ -281,7 +302,7 @@
              "inputs": {
               "clip_name": "qwen3vl_4b_bf16.safetensors",
               "type": "flux3",
-              "device": "default"
+              "device": "{te_device}"
              }
             },
             "vae": {
@@ -430,9 +451,27 @@
              "false": [
               "--disable-dynamic-vram"
              ]
+            },
+            "vram_mode": {
+             "high": [
+              "--highvram"
+             ],
+             "low": [
+              "--lowvram"
+             ]
             }
            },
-           "fp16_fallback": "default"
+           "fp16_fallback": "default",
+           "workflow_values": {
+            "te_device": {
+             "from": "text_encoder",
+             "map": {
+              "cpu": "cpu",
+              "gpu": "default"
+             },
+             "default": "default"
+            }
+           }
           }
       }
     },
