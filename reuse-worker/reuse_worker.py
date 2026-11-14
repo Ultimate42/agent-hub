@@ -3859,6 +3859,8 @@ class Atelier:
         flags, kwargs = self.gpu.spawn_options()
         if IS_WINDOWS:
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        for d in ('custom_nodes', 'input', 'output', 'user'):   # ComfyUI (prestartup du Manager) liste custom_nodes avant de le créer
+            (lay['data'] / d).mkdir(parents=True, exist_ok=True)
         logf = lay['logs'] / 'atelier.log'
         if logf.exists():
             os.replace(logf, lay['logs'] / 'atelier.previous.log')
