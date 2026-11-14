@@ -1545,6 +1545,38 @@ class AtelierLifeTest(AtelierBase):
         args = self.runs()[-1]['args']
         self.assertEqual(args[args.index('--enable-cors-header') + 1], 'http://100.101.102.103:3000')
 
+    def test_comfyui_dying_at_start_is_retried_later_and_its_log_is_shown(self):
+        """gpu-box, 14/11 : ComfyUI s'arrêtait au démarrage ; la surveillance lisait le code d'un Popen déjà oublié
+        (AttributeError), relançait aussitôt, toutes les 25 s, état figé sur « démarrage »."""
+        (self.lay['src'] / 'main.py').write_text("import sys\nprint('Traceback: ModuleNotFoundError: No module named comfyui_manager', flush=True)\n"
+                                                  "print('token=abcdef0123456789 ' + 'a' * 40, flush=True)\nsys.exit(3)\n")
+        a = self.atelier()
+        a.tick()
+        self.assertEqual(a.state, 'en échec')
+        self.assertIn('code 3', a.error)
+        self.assertIn('No module named comfyui_manager', a.error)
+        self.assertIsNone(a.pid)
+        self.assertGreater(a.next_try, time.time() + 10, 'waits before the next try')
+        d = a.describe()
+        self.assertIn('Traceback: ModuleNotFoundError: No module named comfyui_manager', d['log'])
+        self.assertNotIn('abcdef0123456789', json.dumps(d), 'secret-looking values masked')
+        self.assertNotIn('a' * 40, json.dumps(d))
+        a.tick()
+        self.assertEqual(len([l for l in (self.lay['logs'] / 'atelier.log').read_text().splitlines() if l.startswith('# ')]), 1,
+                         'not relaunched right away')
+
+    def test_any_startup_exception_backs_off(self):
+        a = self.atelier()
+        saved = a.prepare
+        a.prepare = lambda spec, lay: (_ for _ in ()).throw(AttributeError('boom'))
+        try:
+            a.tick()
+        finally:
+            a.prepare = saved
+        self.assertEqual(a.state, 'en échec')
+        self.assertIn('boom', a.error)
+        self.assertGreater(a.next_try, time.time() + 10)
+
     def test_jobs_environment_missing(self):
         (self.lay['jobs']['root'] / '.ok-torch').unlink()
         a = self.atelier()

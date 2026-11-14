@@ -3244,6 +3244,12 @@ def can_hardlink(folder):
         b.unlink(missing_ok=True)
 
 
+def redact(line):
+    """Masque ce qui ressemble à un secret dans une ligne de journal (jeton=…, clé: …, Bearer …, longue suite hexadécimale)."""
+    line = re.sub(r'(?i)\b(token|api[_-]?key|key|password|passwd|secret|authorization|bearer)\b(\s*[=:]\s*|\s+)\S+', r'\1\2***', line)
+    return re.sub(r'\b[A-Za-z0-9_\-]{32,}\b', '***', line)
+
+
 def listen_ip_ok(text):
     """Adresse d'écoute en plus de 127.0.0.1 : une adresse IPv4 précise, jamais 0.0.0.0, une diffusion ou une boucle."""
     try:
@@ -3618,6 +3624,8 @@ class Atelier:
         self.net = {'listening': None, 'at': 0.0}
         self.vram = {}
         self.vram_at = 0.0
+        self.log_at = None
+        self.log_lines = []
         self.purge_at = 0.0
         self.files_gb = None
         self.looked_for_orphan = False
@@ -3869,10 +3877,12 @@ class Atelier:
             if self.stopping.is_set():
                 self.stop('arrêt du worker')
                 return
-            if self.proc.poll() is not None:
-                tail = log_tail(logf, 6)
-                self.forget(lay)
-                raise RuntimeError('ComfyUI s\'est arrêté au démarrage (code %s) : %s' % (self.proc.returncode, ' | '.join(tail)[-400:]))
+            code = self.proc.poll()
+            if code is not None:
+                self.read_log(force=True)
+                self.forget(lay)   # self.proc vaut None ensuite : le code est lu avant (boucle de relance du 14/11)
+                said = [l for l in self.log_lines if not l.startswith('# ')]   # sans la ligne de commande écrite en tête
+                raise RuntimeError('ComfyUI s\'est arrêté au démarrage (code %s) : %s' % (code, ' | '.join(said[-3:])[-230:]))
             if time.time() > deadline:
                 self.stop('pas prêt à temps')
                 raise RuntimeError('atelier pas prêt après %s' % fmt_duration(deadline - now))
@@ -3975,6 +3985,19 @@ class Atelier:
             return max(1.0, float(self.config.get('atelier_hung_s', ATELIER_HUNG_S)))
         except (TypeError, ValueError):
             return float(ATELIER_HUNG_S)
+
+    def read_log(self, force=False):
+        """Fin du journal de ComfyUI (atelier\\logs\\atelier.log) pour l'état remonté au hub : 8 lignes, sans couleurs ni
+        barres, valeurs d'allure secrète masquées. Relu seulement si le fichier a changé."""
+        try:
+            logf = atelier_layout(self.base, self.spec())['logs'] / 'atelier.log'
+            mtime = logf.stat().st_mtime
+        except (OSError, RuntimeError):
+            return
+        if not force and mtime == self.log_at:
+            return
+        self.log_at = mtime
+        self.log_lines = [redact(l)[:200] for l in log_tail(logf, 8)]
 
     def read_vram(self):
         try:
@@ -4252,7 +4275,9 @@ class Atelier:
                     return
                 try:
                     self.start(now)
-                except (RuntimeError, OSError, ValueError, KeyError) as e:
+                except Exception as e:   # toute panne du démarrage : pause croissante, jamais une relance immédiate en boucle
+                    if self.pid and not self.running():
+                        self.forget()
                     self.failures += 1
                     pause = min(1800, 30 * 2 ** (self.failures - 1))
                     self.next_try = now + pause
@@ -4262,6 +4287,7 @@ class Atelier:
                 return
             if not self.running():
                 code = self.proc.returncode if self.proc is not None else '?'
+                self.read_log(force=True)
                 self.forget()
                 self.error = 'arrêté de lui-même (code %s)' % code
                 self.state = 'en échec'
@@ -4295,6 +4321,7 @@ class Atelier:
             if now - self.vram_at >= 30:
                 self.vram_at = now
                 self.read_vram()
+                self.read_log()
             # Tailscale prêt après coup, adresse changée, pare-feu posé ou retiré : relance (seulement sans calcul en cours)
             ip = self.remote_ip(now)
             want = '127.0.0.1' + (',' + ip if ip else '')
@@ -4315,7 +4342,8 @@ class Atelier:
              'manager': self.manager if self.manager is not None else None, 'started_at': self.started_at, 'files_gb': self.files_gb,
              'error': self.error or (self.ts.get('error') if self.pid and not self.ts.get('ip') else None), 'note': self.env_note,
              'task': ('%(id)d %(action)s %(ok)s' % dict(self.last_task, ok='ok' if self.last_task['ok'] else 'raté')) if self.last_task else None,
-             'tasks': ','.join(ATELIER_TASK_ACTIONS)}   # ce que cette version sait faire : le hub ne donne de tâche qu'à elle
+             'tasks': ','.join(ATELIER_TASK_ACTIONS),
+             'log': list(self.log_lines) or None}   # fin du journal de ComfyUI : pourquoi il ne démarre pas, vu du hub   # ce que cette version sait faire : le hub ne donne de tâche qu'à elle
         if self.net.get('port_taken_by'):
             d['port_taken_by'] = ', '.join(self.net['port_taken_by'])
         return {k: v for k, v in d.items() if v is not None}

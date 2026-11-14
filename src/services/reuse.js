@@ -347,7 +347,7 @@ function announcedAtelierTask(w, name, now) {
 /** What a worker says about its ComfyUI workshop (info.atelier): flat object, known keys, short scalars only. */
 const ATELIER_KEYS = ['enabled', 'state', 'pid', 'port', 'listen', 'listening', 'tailscale_ip', 'firewall', 'allowed_from', 'busy', 'queue',
   'vram_free_mib', 'vram_total_mib', 'vram_atelier_mib', 'freed', 'manager', 'started_at', 'files_gb', 'error', 'note', 'port_taken_by',
-  'task', 'tasks', 'unresponsive_s'];
+  'task', 'tasks', 'unresponsive_s', 'log'];
 function cleanAtelier(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return undefined;
   const out = {};
@@ -355,7 +355,7 @@ function cleanAtelier(a) {
     const v = a[k];
     if (v == null) continue;
     if (typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) out[k] = v;
-    else if (Array.isArray(v)) out[k] = v.slice(0, 16).map(x => String(x).slice(0, 80));
+    else if (Array.isArray(v)) out[k] = v.slice(0, 16).map(x => String(x).slice(0, k === 'log' ? 200 : 80));
     else out[k] = String(v).slice(0, 300);
   }
   return out;
