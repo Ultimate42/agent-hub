@@ -1102,6 +1102,26 @@ class Gpu:
                 out.append(mid)
         return out
 
+    def comfy_free(self, h, need_mib, stop):
+        """Carte libérée par ComfyUI lui-même (POST /free : modèles déchargés, cache vidé), sans le relancer ; la place revient
+        quand son fil de travail a déchargé. -> Mio libres après (None : inconnu)."""
+        try:
+            code, _ = comfy_local(h['port'], 'POST', '/free', {'unload_models': True, 'free_memory': True}, timeout=10)
+        except (OSError, ValueError) as e:
+            log.warning('POST /free de ComfyUI a échoué : %s', e)
+            return None
+        if code != 200:
+            log.warning('POST /free de ComfyUI refusé (HTTP %s).', code)
+        free, deadline = None, time.time() + COMFY_FREE_WAIT_S
+        while True:
+            try:
+                free = comfy_vram(h['port'])[0]
+            except (OSError, ValueError):
+                free = None
+            if free is not None and free >= need_mib or time.time() > deadline or stop is not None and stop.is_set():
+                return free
+            time.sleep(0.5)
+
     def stop_comfy(self, why=''):
         h, self.comfy = self.comfy, None
         if h:
@@ -1179,26 +1199,53 @@ class Gpu:
         key = json.dumps([extra, sorted(opt_env.items())])
         if self.comfy and (self.comfy['h']['proc'].poll() is not None or self.comfy.get('key') != key):
             self.stop_comfy('il s\'était arrêté' if self.comfy['h']['proc'].poll() is not None else 'réglages changés')
-        if self.comfy is None:
+        def start():
             progress(0.3, 'démarrage de ComfyUI')
             if self.hip_device is None:
                 comfy_pick_device(lay, env, spec, self, stop, meta)
                 self.hip_device = env.get('HIP_VISIBLE_DEVICES', '')
             self.comfy = {'h': comfy_start(lay, env, spec, self, stop, progress, extra), 'key': key}
             meta['server_start_s'] = self.comfy['h']['start_s']
-        else:
+        reused = self.comfy is not None
+        if reused:
             meta['server_reused'] = True
-        h = self.comfy['h']
-        self.last_trace = h['box']['all']
-        h['on_trace'] = lambda t: setattr(self, 'last_trace', t)   # avancement, précision et extrait du journal au hub pendant le calcul
+        else:
+            start()
         meta['comfyui_flags'] = (' '.join(extra) + ''.join(' %s=%s' % kv for kv in sorted(opt_env.items()))).strip() or 'aucune'
         meta.update({k: values[k] for k in ('unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels', 'vram_mode', 'text_encoder') if k in values})
-        free = (((comfy_local(h['port'], 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
-        if free.get('vram_free') is not None:
-            meta['vram_free_before_mib'] = int(free['vram_free'] / 1048576)
+        # Place sur la carte : les poids d'un travail précédent restés chargés font déborder le suivant (job 67) ; carte
+        # libérée par ComfyUI (POST /free) quand la place manque, ComfyUI relancé si cela ne suffit pas
+        for k in ('vram_free_before_mib', 'freed', 'vram_free_after_free_mib', 'free_restart'):
+            meta.pop(k, None)
+            self.comfy['h']['box']['all'].meta.pop(k, None)   # journal de toute la vie de ComfyUI : pas de reste du travail précédent
+        need, need_all = comfy_vram_need(model, values)
+        resident = json.dumps([job.get('model'), str(values.get('te_device'))])
+        free, total = comfy_vram(self.comfy['h']['port'])
+        if free is not None:
+            meta['vram_free_before_mib'] = free
+        if reused and comfy_should_free(free, total, need, need_all, self.comfy.get('resident') == resident):
+            progress(0.32, 'carte libérée avant le calcul')
+            after = self.comfy_free(self.comfy['h'], need, stop)
+            meta['freed'] = True
+            if stop is not None and stop.is_set():
+                raise JobLost('calcul interrompu')
+            if after is None or after < need:
+                log.warning('ComfyUI n\'a rendu que %s Mio sur %d demandés : relancé.', after, need)
+                self.stop_comfy('carte pas assez libérée par /free')
+                start()
+                meta['free_restart'] = True
+                after = comfy_vram(self.comfy['h']['port'])[0]
+            if after is not None:
+                meta['vram_free_after_free_mib'] = after
+            log.info('Carte libérée avant le travail %s : %s Mio libres avant, %s après (%d demandés).', job.get('id'), free, after, need)
+        h = self.comfy['h']
+        self.comfy['resident'] = None   # su seulement quand le calcul a abouti
+        self.last_trace = h['box']['all']
+        h['on_trace'] = lambda t: setattr(self, 'last_trace', t)   # avancement, précision et extrait du journal au hub pendant le calcul
         # Repris dans le journal envoyé au hub pendant le calcul : un travail raté dit lui aussi avec quels réglages
         h['box']['all'].meta.update({k: meta[k] for k in ('comfyui_flags', 'unet_dtype', 'attention', 'dynamic_vram', 'ref_megapixels',
-                                                         'vram_mode', 'text_encoder', 'vram_free_before_mib') if k in meta})
+                                                         'vram_mode', 'text_encoder', 'vram_free_before_mib', 'freed',
+                                                         'vram_free_after_free_mib', 'free_restart') if k in meta})
         wf = comfy_workflow(model, values)
         inputs = lay['data'] / 'input'
         inputs.mkdir(parents=True, exist_ok=True)
@@ -1217,6 +1264,8 @@ class Gpu:
             path, run = comfy_prompt(h, wf, values['steps'], stop, lambda f, st: progress(0.35 + 0.6 * f, st),
                                      float(model.get('timeout_s') or 1800), 'génération')
             self.last_trace = h.get('trace') or self.last_trace
+            if self.comfy:
+                self.comfy['resident'] = resident   # poids de ce travail restés chargés : le suivant identique les garde s'ils tiennent
             shutil.copyfile(path, out)
             path.unlink(missing_ok=True)   # rien ne reste dans ComfyUI : la sortie part au hub
         except (JobLost, Final):
@@ -1229,9 +1278,9 @@ class Gpu:
             for p in placed:
                 p.unlink(missing_ok=True)
         if self.comfy:
-            after = (((comfy_local(h['port'], 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
-            if after.get('vram_free') is not None:
-                meta['vram_free_after_mib'] = int(after['vram_free'] / 1048576)
+            after = comfy_vram(h['port'])[0]
+            if after is not None:
+                meta['vram_free_after_mib'] = after
         return out, run
 
     def installed(self, kind):
@@ -2685,6 +2734,36 @@ def comfy_local(port, method, path, body=None, timeout=30):
             return e.code, {'error': text[:300].decode('utf-8', 'replace')}
 
 
+COMFY_VRAM_MARGIN_GB = 1.0   # en plus du plus gros modèle posé sur la carte : calcul, VAE (réglable par modèle : vram_margin_gb)
+COMFY_FREE_WAIT_S = 20       # après POST /free, ComfyUI décharge dans son fil de travail : la place revient en une seconde ou deux
+
+
+def comfy_vram(port):
+    """Mémoire de la carte vue par ComfyUI -> (Mio libres, Mio au total), None si inconnu."""
+    dev = (((comfy_local(port, 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
+    mib = lambda v: int(v / 1048576) if isinstance(v, (int, float)) else None
+    return mib(dev.get('vram_free')), mib(dev.get('vram_total'))
+
+
+def comfy_vram_need(model, values):
+    """Mio qu'un travail pose sur la carte -> (plus gros modèle + marge, tous ses modèles + marge). ComfyUI charge un modèle
+    à la fois (encodeur texte, DiT, VAE) ; l'encodeur n'y va pas s'il tourne sur le processeur (te_device cpu)."""
+    sizes = [int(f.get('size') or 0) / 1048576 for f in model.get('files') or []
+             if not (f.get('dir') == 'text_encoders' and str(values.get('te_device')) == 'cpu')]
+    margin = float(model.get('vram_margin_gb') or COMFY_VRAM_MARGIN_GB) * 1024
+    return int(max(sizes or [0]) + margin), int(sum(sizes) + margin)
+
+
+def comfy_should_free(free_mib, total_mib, need_mib, all_mib, same_resident):
+    """Libérer la carte avant le travail ? Oui si la place libre ne suffit pas au plus gros modèle à charger, sauf si les poids
+    restés chargés sont ceux de ce travail et tiennent tous ensemble sur la carte (rien à recharger : gain gardé). Avec
+    --highvram, un modèle qui ne tient pas est chargé quand même et déborde en mémoire partagée : Klein passe de 18 à 111 s
+    par étape quand le DiT du travail précédent occupe encore 11 Go (job 67)."""
+    if free_mib is None or free_mib >= need_mib:
+        return False
+    return not (same_resident and total_mib and all_mib <= total_mib)
+
+
 ATTENTION_FLAGS = ('--use-quad-cross-attention', '--use-split-cross-attention', '--use-pytorch-cross-attention')
 # Options d'essai de ComfyUI qu'un admin peut ajouter à un job (paramètre comfyui_options, liste séparée par des virgules) :
 # jeton -> (options en plus, options retirées, variables d'environnement). Rien d'autre n'atteint la ligne de commande.
@@ -2835,7 +2914,8 @@ def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
                 label, steady, ','.join('%.0f' % x for x in trace.step_durations()), int(steps), fmt_duration(timeout),
                 trace.meta.get('weight_dtype', '?'), trace.meta.get('compute_dtype', '?'), trace.meta.get('load', '?')))
         progress(max(0.0, min(1.0, (trace.progress - 0.35) / 0.55)), '%s : %s' % (label, trace.stage()))
-        if trace.step and int(time.time() - t1) % 5 == 0:   # mémoire vidéo libre pendant l'échantillonnage (le plus bas vu)
+        # Mémoire vidéo libre pendant l'échantillonnage (le plus bas vu) : dès la première étape vue, puis toutes les 5 s
+        if trace.step and ('vram_free_min_mib' not in trace.meta or int(time.time() - t1) % 5 == 0):
             try:
                 dev = ((comfy_local(port, 'GET', '/system_stats', timeout=5)[1] or {}).get('devices') or [{}])[0]
                 if dev.get('vram_free') is not None:

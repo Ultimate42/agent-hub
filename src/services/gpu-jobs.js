@@ -586,8 +586,8 @@ export function gpuRefFor(caller, id, n) {
   return { ok: true, job: r.job, file: refPath(r.job.id, i, refs[i].ext), ref: refs[i] };
 }
 
-/** Small flat object from a worker: lower-case keys, strings, numbers, booleans only. */
-function cleanMeta(meta, max = 24) {
+/** Small flat object from a worker: lower-case keys, strings, numbers, booleans only (40 keys: a ComfyUI job sends about 26). */
+function cleanMeta(meta, max = 40) {
   const kept = {};
   if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
     for (const [k, v] of Object.entries(meta).slice(0, max)) {

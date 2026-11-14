@@ -763,6 +763,7 @@ def run(pid, wf):
     for i in range(1, steps + 1):
         print(' %3d%%|###   | %d/%d [00:01<00:02,  %s]' % (100 * i // steps, i, steps, '500.00s/it' if slow else '0.05s/it'), end='\r', flush=True)
         time.sleep(0.2 if slow else 0.05)
+    time.sleep(0.2 if slow else 1.1)   # décodage VAE : le worker voit les étapes finies et mesure la mémoire vidéo
     print('\nPrompt executed in 0.42 seconds', flush=True)
     lat = [n for n in wf.values() if n['class_type'].startswith('Empty')][0]['inputs']
     os.makedirs(os.path.join(base, 'output'), exist_ok=True)
@@ -780,11 +781,19 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/system_stats':
             return self.answer(200, {'system': {'comfyui_version': '0.45.0', 'pytorch_version': '2.13.0+rocm10.0.0', 'python_version': sys.version, 'os': 'nt'},
-                                     'devices': [{'name': 'cuda:0 AMD Radeon RX 6950 XT : native', 'type': 'cuda', 'vram_total': 17163091968, 'vram_free': 16000000000}]})
+                                     'devices': [{'name': 'cuda:0 AMD Radeon RX 6950 XT : native', 'type': 'cuda', 'vram_total': 17163091968,
+                                                  'vram_free': 5270 * 1048576 if os.path.exists(os.path.join(base, 'vram-busy')) else 16000000000}]})
         pid = self.path.rsplit('/', 1)[-1]
         return self.answer(200, {pid: history[pid]} if pid in history else {})
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/free':   # comme ComfyUI : drapeaux posés, déchargement par le fil de travail, réponse vide
+            with open(os.path.join(base, 'free-calls'), 'a') as f:
+                f.write(json.dumps(body, sort_keys=True) + '\n')
+            if not os.path.exists(os.path.join(base, 'vram-stuck')):
+                threading.Timer(0.3, lambda: os.path.exists(os.path.join(base, 'vram-busy')) and os.unlink(os.path.join(base, 'vram-busy'))).start()
+            self.send_response(200); self.send_header('Content-Length', '0'); self.end_headers()
+            return
         pid = 'p%d' % (len(history) + 100)
         threading.Thread(target=run, args=(pid, body['prompt'])).start()
         return self.answer(200, {'prompt_id': pid, 'number': 1})
@@ -835,7 +844,7 @@ class KleinJobTest(unittest.TestCase):
             self.assertEqual(w.png_size(out), (320, 256))
             self.assertEqual(meta['references'], 2)
             self.assertEqual(meta['backend'], 'rocm')
-            self.assertEqual(meta['s_per_step'], 0.05)
+            self.assertAlmostEqual(meta['s_per_step'], 0.05, delta=0.02)   # mesuré à l'horloge : tolérance pour une machine chargée
             self.assertIn('server_start_s', meta)
             wf = json.loads((lay['data'] / 'last-workflow.json').read_text())
             self.assertEqual(wf['refs']['inputs']['images.image0'], ['ref0', 0])
@@ -871,11 +880,52 @@ class KleinJobTest(unittest.TestCase):
             self.assertIn('vram_free_before_mib', meta)
             self.assertTrue(all(re.fullmatch(r'[a-z_]{1,32}', k) for k in meta), 'keys the hub keeps')
 
+            self.assertNotIn('freed', meta2, 'card with room (15258 MiB free): the weights left loaded are kept')
+            self.assertFalse((lay['data'] / 'free-calls').exists())
+
+            # Carte encore occupée par le DiT du travail précédent (5270 Mio libres, job 67) : libérée par POST /free avant
+            # le calcul, place remesurée, ComfyUI gardé
+            (lay['data'] / 'vram-busy').write_text('')
+            out5, _, meta5 = gpu.run(dict(job, id=12, ref_paths=refs[:1]), None, work, None, lambda f, st: None)
+            self.assertEqual(meta5['vram_free_before_mib'], 5270)
+            self.assertIs(meta5['freed'], True)
+            self.assertEqual(meta5['vram_free_after_free_mib'], 15258)
+            self.assertNotIn('free_restart', meta5)
+            self.assertEqual(gpu.comfy['h']['proc'].pid, pid, 'freed by ComfyUI itself, not restarted')
+            self.assertEqual((lay['data'] / 'free-calls').read_text(), '{"free_memory": true, "unload_models": true}\n')
+            self.assertEqual(w.png_size(out5), (320, 256))
+            self.assertIs(gpu.last_trace.meta.get('freed'), True, 'sent to the hub with the progress, not only at the end')
+            # Travail suivant, carte de nouveau pleine place : rien de libéré, plus de reste « freed » du travail précédent
+            _, _, meta6 = gpu.run(dict(job, id=13, ref_paths=[]), None, work, None, lambda f, st: None)
+            self.assertNotIn('freed', meta6)
+            self.assertNotIn('freed', gpu.comfy['h']['box']['all'].meta)
+            # Encodeur sur le processeur : les mêmes poids restés chargés tiennent tous sur la carte, gardés malgré 5270 Mio libres
+            cpu_params = dict(job['params'], text_encoder='cpu')
+            gpu.run(dict(job, id=14, ref_paths=[], params=cpu_params), None, work, None, lambda f, st: None)
+            (lay['data'] / 'vram-busy').write_text('')
+            _, _, meta7 = gpu.run(dict(job, id=15, ref_paths=[], params=cpu_params), None, work, None, lambda f, st: None)
+            self.assertEqual(meta7['vram_free_before_mib'], 5270)
+            self.assertNotIn('freed', meta7)
+            self.assertEqual(len((lay['data'] / 'free-calls').read_text().splitlines()), 1)
+            # /free sans effet : ComfyUI relancé, la carte repart vide
+            (lay['data'] / 'vram-stuck').write_text('')
+            w.COMFY_FREE_WAIT_S, wait = 1, w.COMFY_FREE_WAIT_S
+            try:
+                _, _, meta8 = gpu.run(dict(job, id=16, ref_paths=[]), None, work, None, lambda f, st: None)
+            finally:
+                w.COMFY_FREE_WAIT_S = wait
+            self.assertTrue(meta8['freed'] and meta8['free_restart'])
+            self.assertNotEqual(gpu.comfy['h']['proc'].pid, pid)
+            self.assertEqual(meta8['vram_free_after_free_mib'], 5270, 'measured again after the restart (the fake card stays busy)')
+            for name in ('vram-stuck', 'vram-busy'):
+                (lay['data'] / name).unlink()
+            pid = gpu.comfy['h']['proc'].pid
+
             # Image unie en fp16 (NaN) : refaite dans la précision sûre, ComfyUI relancé sans --fp16-unet
             (lay['data'] / 'flat-fp16').write_text('')
             out3, _, meta3 = gpu.run(dict(job, id=9, ref_paths=[]), None, work, None, lambda f, st: None)
             self.assertTrue(meta3['half_fallback'])
-            self.assertRegex(meta3['try_first'], r'^fp16 quad : 0\.05 s/étape, [\d.]+ s, écart 0\.0$')
+            self.assertRegex(meta3['try_first'], r'^fp16 quad : 0\.0[3-7] s/étape, [\d.]+ s, écart 0\.0$')
             self.assertRegex(meta3['try_second'], r'^default quad : ')
             self.assertEqual(meta3['compute_dtype'], 'float32')
             self.assertGreater(w.png_stats(out3)['std'], 2)
@@ -904,6 +954,28 @@ class KleinJobTest(unittest.TestCase):
         finally:
             gpu.stop_comfy()
         self.assertFalse(lay['pid'].exists(), 'card given back')
+
+
+class ComfyFreeRuleTest(unittest.TestCase):
+    """Quand libérer la carte avant un travail ComfyUI : mesures réelles de gpu-box (jobs 62, 66, 67)."""
+    def test_klein_need_and_rule(self):
+        gpu = w.Gpu(Path(tempfile.mkdtemp()), {}, Path(w.__file__).resolve().parent)
+        model = gpu.catalog['types']['image']['models']['flux3-klein']
+        need, need_all = w.comfy_vram_need(model, {'te_device': 'default'})
+        self.assertEqual(need, 10583 + 1024, 'DiT, the biggest model, plus margin')
+        mib = {f['dir']: int(f['size']) / 1048576 for f in model['files']}
+        self.assertEqual(need_all, int(sum(mib.values()) + 1024), 'text encoder + DiT do not fit together on 16 GB')
+        self.assertGreater(need_all, 16368)
+        cpu_need, cpu_all = w.comfy_vram_need(model, {'te_device': 'cpu'})
+        self.assertEqual((cpu_need, cpu_all), (need, int(mib['diffusion_models'] + mib['vae'] + 1024)), 'text encoder on the processor: not on the card')
+        total = 16368
+        self.assertFalse(w.comfy_should_free(16226, total, need, need_all, False), 'empty card (job 62): nothing to do')
+        self.assertTrue(w.comfy_should_free(5270, total, need, need_all, True), 'DiT left loaded, encoder must come back (job 67)')
+        self.assertTrue(w.comfy_should_free(5270, total, need, need_all, False))
+        self.assertFalse(w.comfy_should_free(5270, total, cpu_need, cpu_all, True), 'same weights, all fit: kept loaded')
+        self.assertTrue(w.comfy_should_free(5270, total, cpu_need, cpu_all, False), 'other weights left loaded')
+        self.assertTrue(w.comfy_should_free(5270, None, cpu_need, cpu_all, True), 'card size unknown: freed')
+        self.assertFalse(w.comfy_should_free(None, total, need, need_all, False), 'free memory unknown: left as is')
 
 
 class ComfyBenchTest(unittest.TestCase):
@@ -975,8 +1047,8 @@ class ComfyBenchTest(unittest.TestCase):
         self.assertEqual(len(report['runs']), 2)
         self.assertEqual([r['seed'] for r in report['runs']], [42, 43], 'another seed each run (ComfyUI would serve its cache)')
         self.assertEqual(report['runs'][1]['executed_s'], 0.4)
-        self.assertEqual(report['s_per_step'], 0.05)
-        self.assertEqual(report['speedup_vs_sdcpp'], round(13.2 / 0.05, 2))
+        self.assertAlmostEqual(report['s_per_step'], 0.05, delta=0.02)   # mesuré à l'horloge : tolérance pour une machine chargée
+        self.assertEqual(report['speedup_vs_sdcpp'], round(13.2 / report['s_per_step'], 2))
         self.assertEqual(report['torch'], '2.13.0+rocm10.0.0 7.1 True 2')
         self.assertEqual(report['torch_device'], {'index': 1, 'arch': 'gfx1030', 'memory_gb': 17.2, 'name': 'AMD Radeon RX 6950 XT'},
                          'integrated graphics seen too: the dedicated card is the one used')
