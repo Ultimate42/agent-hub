@@ -443,7 +443,7 @@ Seulement dans `reuse-worker.config.json` du PC :
 **Pare-feu : la commande à coller une fois sur le PC GPU** (PowerShell en administrateur)
 ```powershell
 $DevPc = 'desktop-example'   # nom Tailscale du poste client (Windows : DESKTOP-EXAMPLE) ou son IP 100.x.y.z
-$Py = 'C:\reuse-worker\atelier\python\python.exe'
+$Py = "$env:USERPROFILE\Documents\ReuseWorker\atelier\python\python.exe"   # dossier du worker sur gpu-box (vérifié le 14/11)
 $ts = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source; if (-not $ts) { $ts = "$env:ProgramFiles\Tailscale\tailscale.exe" }
 $Dev = if ($DevPc -match '^\d+(\.\d+){3}$') { $DevPc } else { & $ts ip -4 $DevPc 2>$null | Select-Object -First 1 }
 if ("$Dev" -notmatch '^100\.') { & $ts status; throw "IP Tailscale du poste client introuvable pour '$DevPc' : mettre dans `$DevPc son nom ou son IP (liste ci-dessus)" }
