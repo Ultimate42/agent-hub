@@ -347,7 +347,7 @@ function announcedAtelierTask(w, name, now) {
 /** What a worker says about its ComfyUI workshop (info.atelier): flat object, known keys, short scalars only. */
 const ATELIER_KEYS = ['enabled', 'state', 'pid', 'port', 'listen', 'listening', 'tailscale_ip', 'firewall', 'allowed_from', 'busy', 'queue',
   'vram_free_mib', 'vram_total_mib', 'vram_atelier_mib', 'freed', 'manager', 'started_at', 'files_gb', 'error', 'note', 'port_taken_by',
-  'task', 'tasks'];
+  'task', 'tasks', 'unresponsive_s'];
 function cleanAtelier(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return undefined;
   const out = {};

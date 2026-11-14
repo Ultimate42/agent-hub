@@ -1089,6 +1089,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(out)
     def do_GET(self):
         if self.path == '/queue':
+            if os.path.exists(os.path.join(base, 'hang')):   # vivant mais muet (au-delà du délai de lecture du worker)
+                time.sleep(7)
             busy = os.path.exists(os.path.join(base, 'busy'))
             return self.answer(200, {'queue_running': [[1, 'p1', {}, {}, []]] if busy else [], 'queue_pending': []})
         if self.path == '/system_stats':
@@ -1412,6 +1414,50 @@ class AtelierLifeTest(AtelierBase):
         b.tick()
         self.assertEqual(len(self.runs()), 3, "nothing started again once switched off")
         self.assertEqual(b.describe()['state'], 'éteint')
+
+    def test_silent_workshop_blocks_new_jobs_for_a_while_only_and_never_stops_a_running_one(self):
+        a = self.atelier()
+        a.tick()
+        pid = a.pid
+        (self.lay['data'] / 'busy').write_text('1')
+        a.tick()
+        self.assertTrue(a.busy(sure=True), 'a queue really read: a running hub job gives way')
+        (self.lay['data'] / 'busy').unlink()
+        a.tick()
+        (self.lay['data'] / 'hang').write_text('1')
+        for _ in range(3):
+            a.tick()
+        self.assertTrue(a.busy(), 'silent: no new hub job for now')
+        self.assertFalse(a.busy(sure=True), 'a slow answer never stops a running hub job')
+        self.assertGreaterEqual(a.describe()['unresponsive_s'], 0)
+        self.assertEqual(a.pid, pid, 'not before atelier_hung_s')
+        self.config['atelier_hung_s'] = 1
+        (self.lay['data'] / 'hang').unlink()
+        a.queue_errors, a.unresponsive_since = 3, time.time() - 5
+        (self.lay['data'] / 'hang').write_text('1')
+        a.tick()
+        self.assertIsNone(a.pid, 'restarted, not counted busy forever')
+        self.assertFalse(alive(pid))
+        self.assertFalse(a.busy())
+        (self.lay['data'] / 'hang').unlink()
+        a.tick()
+        self.assertEqual(a.state, 'en marche')
+        self.assertNotEqual(a.pid, pid)
+        self.assertIn('ne répondait plus à /queue', a.describe()['error'], 'said to the hub')
+        self.assertFalse(a.busy())
+
+    def test_jobs_environment_is_not_reinstalled_under_a_running_workshop(self):
+        a = self.atelier()
+        a.tick()
+        self.gpu.atelier = a
+        (self.lay['jobs']['root'] / '.ok-torch').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'liens physiques'):
+            w.comfy_install(self.base, self.spec, self.gpu, None, lambda *x: None, {}, files=[])
+        a.stop('suite')
+        self.config['atelier_enabled'] = False
+        with self.assertRaises(RuntimeError) as e:   # éteint : l'installation part (ici, refusée plus loin faute de Windows)
+            w.comfy_install(self.base, self.spec, self.gpu, None, lambda *x: None, {}, files=[])
+        self.assertNotIn('liens physiques', str(e.exception))
 
     def test_port_taken_and_crash_are_retried_later(self):
         import socket

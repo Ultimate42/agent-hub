@@ -1711,6 +1711,7 @@ class Worker:
         self.engine = Engine(base, self.config)
         self.gpu = Gpu(base, self.config, self.app, self.engine)
         self.atelier = Atelier(base, self.config, self.app, self.gpu)
+        self.gpu.atelier = self.atelier   # l'environnement des travaux n'est pas réinstallé sous un atelier en marche
         self.card_lock = threading.Lock()   # un travail du hub qui démarre / l'atelier qui fait vider la carte des moteurs résidents
         self.job_active = False
         self.work = base / 'work'
@@ -1976,9 +1977,10 @@ class Worker:
             # Plus fréquent qu'un nettoyage : l'avancement se voit côté client et une annulation arrête la carte vite
             period = max(5, min(15, job.get('lease_s', 600) // 5))
             while True:
-                if not preempted and self.atelier.busy():
-                    # Alice a lancé un calcul dans l'atelier : il passe d'abord, ce travail repart dans la file du hub
-                    preempted['why'] = 'atelier ComfyUI en calcul : travail rendu à la file, il reprendra plus tard'
+                if not preempted and self.atelier.busy(sure=True):
+                    # Alice a lancé un calcul dans l'atelier (file lue, non vide) : il passe d'abord, ce travail repart
+                    # dans la file du hub. Un atelier qui répond lentement n'arrête jamais un travail en cours.
+                    preempted['why'] = ATELIER_RELEASE
                     log.info('Job %s : %s.', label, preempted['why'])
                     stop.set()
                 try:
@@ -2276,9 +2278,9 @@ class Worker:
             orders = body.get('orders') or {}
             job = body.get('job')
             self.note_pause(orders)
-            if job and job.get('kind', 'reuse') != 'reuse' and self.atelier.busy(live=True):
+            if job and job.get('kind', 'reuse') != 'reuse' and self.atelier.busy(live=True, sure=True):
                 # L'atelier s'est mis à calculer pendant l'attente : le travail GPU repart dans la file, essai non compté
-                self.release(job['id'], 'atelier ComfyUI en marche sur la carte', '/api/gpu/jobs/')
+                self.release(job['id'], ATELIER_RELEASE, '/api/gpu/jobs/')
                 job = None
             if job:
                 continue           # une mise à jour attendra la fin du job
@@ -2359,6 +2361,12 @@ class Worker:
         if kind not in GPU_TEST_KINDS:
             post({'status': 'failed', 'report': {'ok': False, 'error': 'essai %r inconnu de cette version' % kind}})
             return
+        if kind in ('comfyui', 'comfyui_remove') and self.atelier.pid:
+            spec = comfy_spec(self.app)
+            lay = comfy_layout(self.base, spec)
+            if kind == 'comfyui_remove' or not all(comfy_done(lay, spec, x) for x in ('python', 'pip', 'source', 'torch', 'requirements')):
+                post({'status': 'failed', 'report': {'ok': False, 'error': ATELIER_SHARES}})
+                return
         log.info('Essai GPU %d (%s) demandé par le hub : %s', tid, kind, json.dumps(test.get('params') or {}))
         self.set_state('essai %s' % kind, 'essai %d' % tid)
         self.gpu.stop_server('essai GPU demandé')   # la carte entière pour l'essai
@@ -2687,6 +2695,9 @@ def comfy_install(base, spec, gpu, stop, progress, report, files=None):
     root = lay['root']
     root.mkdir(parents=True, exist_ok=True)
     files = (spec.get('files') or []) if files is None else files
+    atelier = getattr(gpu, 'atelier', None)
+    if atelier is not None and atelier.pid and not all(comfy_done(lay, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')):
+        raise RuntimeError('environnement ComfyUI des travaux à (ré)installer : ' + ATELIER_SHARES)
     need = comfy_need_bytes(lay, spec, files)
     used = folder_bytes(gpu.root) if gpu.root.exists() else 0
     free = shutil.disk_usage(str(root)).free
@@ -3152,6 +3163,10 @@ ATELIER_FW_GROUP = 'ComfyUI atelier'   # groupe des règles de pare-feu créées
 ATELIER_TS_RETRY_S = 120         # Tailscale pas prêt ou pare-feu absent : nouveau regard toutes les 2 minutes
 ATELIER_TS_RECHECK_S = 600       # adresse Tailscale et pare-feu relus toutes les 10 minutes une fois bons
 ATELIER_NET_S = 60               # adresses d'écoute réelles (netstat) relues toutes les minutes
+ATELIER_HUNG_S = 300             # sans réponse à /queue depuis 5 minutes : relancé (réglable dans la config : atelier_hung_s)
+ATELIER_SHARES = ('l\'atelier ComfyUI tourne et partage les fichiers de l\'environnement des travaux (liens physiques) : '
+                  'l\'éteindre d\'abord (POST /api/reuse/workers/<nom>/atelier {"on":false})')
+ATELIER_RELEASE = 'atelier ComfyUI en calcul : travail rendu à la file, il reprendra plus tard'
 ATELIER_FREE_DONE_MIB = 1024     # mémoire gardée par le PyTorch de l'atelier sous laquelle la carte est rendue
 ATELIER_KEEP_DAYS = 7            # sorties et images envoyées gardées 7 jours (réglable : atelier_keep_days)
 ATELIER_FILES_MAX_GB = 20.0      # et 20 Go au plus à elles deux, les plus anciennes d'abord (réglable : atelier_files_max_gb)
@@ -3574,6 +3589,8 @@ class Atelier:
         self.busy_flag = False
         self.queue = None           # (en cours, en attente)
         self.queue_errors = 0
+        self.unresponsive_since = None
+        self.hung_restarts = 0
         self.last_busy = time.time()
         self.freed = True
         self.next_try = 0.0
@@ -3850,7 +3867,8 @@ class Atelier:
             time.sleep(2)
         self.state = 'en marche'
         self.failures = 0
-        self.error = None
+        if not (self.error or '').startswith('ne répondait plus'):   # la relance pour mutisme reste dite au hub
+            self.error = None
         self.last_busy, self.freed = time.time(), False
         self.look_net(time.time(), force=True)
         self.purge(time.time())
@@ -3858,6 +3876,7 @@ class Atelier:
 
     def forget(self, lay=None):
         self.proc, self.pid, self.busy_flag, self.queue, self.vram, self.listen = None, None, False, None, {}, None
+        self.queue_errors, self.unresponsive_since = 0, None
         self.net = {'listening': None, 'at': 0.0}
         try:
             (lay or atelier_layout(self.base, self.spec()))['state'].unlink(missing_ok=True)
@@ -3902,26 +3921,43 @@ class Atelier:
 
     # ---- file, mémoire vidéo ----
     def poll(self):
-        """File de l'atelier -> occupé (calcul en cours ou en attente). Trois lectures ratées de suite : réputé occupé (un
-        ComfyUI qui calcule fort peut répondre lentement) jusqu'à ce qu'il réponde ou s'arrête."""
+        """File de l'atelier -> occupé. busy_flag ne vient que d'une file réellement lue. Trois lectures ratées de suite :
+        douteux (doubtful) ; tick relance l'atelier s'il ne répond plus depuis atelier_hung_s."""
         try:
             code, q = comfy_local(self.port, 'GET', '/queue', timeout=5)
             if code != 200 or not isinstance(q, dict):
                 raise OSError('HTTP %s' % code)
             self.queue = (len(q.get('queue_running') or []), len(q.get('queue_pending') or []))
             self.queue_errors = 0
+            self.unresponsive_since = None
             self.busy_flag = sum(self.queue) > 0
         except (OSError, ValueError):
             self.queue_errors += 1
-            if self.queue_errors >= 3:
-                self.busy_flag = True
-        return self.busy_flag
+            if self.unresponsive_since is None:
+                self.unresponsive_since = time.time()
+        return self.busy()
 
-    def busy(self, live=False):
-        """Sans verrou : le fil principal n'attend jamais un démarrage de l'atelier (installation, jusqu'à quelques minutes)."""
+    def doubtful(self):
+        return self.queue_errors >= 3
+
+    def busy(self, live=False, sure=False):
+        """Sans verrou : le fil principal n'attend jamais un démarrage de l'atelier (installation, jusqu'à quelques minutes).
+        sure=False (prendre un nouveau travail ?) : occupé, ou muet depuis trois lectures (au plus atelier_hung_s, puis
+        relancé). sure=True (arrêter un travail en cours ?) : seulement une file réellement lue et non vide ; une réponse
+        lente n'abandonne jamais un travail."""
         if not self.pid or self.state != 'en marche':
             return False
-        return self.poll() if live else self.busy_flag
+        if live:
+            self.poll()
+        if sure:
+            return self.busy_flag and self.queue_errors == 0
+        return self.busy_flag or self.doubtful()
+
+    def hung_s(self):
+        try:
+            return max(1.0, float(self.config.get('atelier_hung_s', ATELIER_HUNG_S)))
+        except (TypeError, ValueError):
+            return float(ATELIER_HUNG_S)
 
     def read_vram(self):
         try:
@@ -4217,12 +4253,22 @@ class Atelier:
                 log.warning('Atelier ComfyUI arrêté de lui-même (code %s) : relance dans %s.', code, fmt_duration(self.next_try - now))
                 return
             busy = self.poll()
+            if self.doubtful() and now - self.unresponsive_since >= self.hung_s():
+                # Vivant mais muet : jamais compté occupé sans fin (les files du hub resteraient gelées), relancé et dit au hub
+                self.hung_restarts += 1
+                why = 'ne répondait plus à /queue depuis %s : relancé (%d fois depuis le démarrage du worker)' % (
+                    fmt_duration(now - self.unresponsive_since), self.hung_restarts)
+                log.error('Atelier : %s.', why)
+                self.stop('ne répond plus')
+                self.error = why
+                self.next_try = 0.0
+                return
             if self.restart_wanted and not busy:
                 self.restart_wanted = False
                 self.stop('nœuds ajoutés ou retirés : relance')
                 self.next_try = 0.0
                 return
-            if busy:
+            if self.busy_flag:
                 self.last_busy, self.freed = now, False
             elif not self.freed and self.idle_free_s() > 0 and now - self.last_busy >= self.idle_free_s():
                 self.free('%s sans calcul' % fmt_duration(self.idle_free_s()), wait_s=0)
@@ -4246,6 +4292,7 @@ class Atelier:
                  self.fw.get('problem') or ('à vérifier' if self.fw.get('ok') is None else 'pas prêt')),
              'allowed_from': ','.join(self.fw.get('allow_from') or []) or None,
              'busy': self.busy_flag if self.pid else None, 'queue': '%d+%d' % self.queue if self.queue else None,
+             'unresponsive_s': int(time.time() - self.unresponsive_since) if self.pid and self.doubtful() else None,
              'vram_free_mib': self.vram.get('free_mib'), 'vram_total_mib': self.vram.get('total_mib'),
              'vram_atelier_mib': self.vram.get('atelier_mib'), 'freed': self.freed if self.pid else None,
              'manager': self.manager if self.manager is not None else None, 'started_at': self.started_at, 'files_gb': self.files_gb,
