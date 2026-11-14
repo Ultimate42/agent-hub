@@ -1796,21 +1796,78 @@ class AtelierTaskTest(AtelierBase):
         dest.write_bytes(b'previous weights')
         p, data = self.release_zip()
         w_sleep, w.time.sleep = w.time.sleep, lambda s: None   # deux essais de téléchargement : pas 5 s d'attente
+        kept = ['archive-%s.zip' % p['archive_sha256'][:16], 'archive-%s.zip.ok' % p['archive_sha256'][:16]]
         try:
-            for bad, why in ((dict(p, archive_sha256='0' * 64), 'empreinte inattendue'),
-                             (dict(p, sha256='0' * 64), 'empreinte inattendue pour Pack-1.0/Models/up.safetensors'),
-                             (dict(p, member='Pack-1.0/Models/missing.safetensors', name='up.safetensors'), 'pas de Pack-1.0/Models/missing'),
-                             (dict(p, member='Pack-1.0/up.safetensors'), 'même nom ailleurs : Pack-1.0/Models/up.safetensors'),
-                             (dict(p, size=len(data) - 1), r'attendus \(size\)')):
+            for bad, why, left in ((dict(p, archive_sha256='0' * 64), 'empreinte inattendue', []),
+                                   (dict(p, sha256='0' * 64), 'empreinte inattendue pour Pack-1.0/Models/up.safetensors', kept),
+                                   (dict(p, member='Pack-1.0/Models/missing.safetensors', name='up.safetensors'), 'pas de Pack-1.0/Models/missing', kept),
+                                   (dict(p, member='Pack-1.0/up.safetensors'), 'même nom ailleurs : Pack-1.0/Models/up.safetensors', kept),
+                                   (dict(p, size=len(data) - 1), r'attendus \(size\)', kept)):
                 with self.assertRaisesRegex(RuntimeError, why):
                     a.task_download_model(41, bad, None, lambda *x: None)
                 self.assertEqual(dest.read_bytes(), b'previous weights', 'a refused file leaves the previous one in place')
                 self.assertEqual(sorted(x.name for x in dest.parent.iterdir()), ['up.safetensors'], 'no .part left')
-                self.assertEqual(self.leftovers(), [], 'no archive left')
+                self.assertEqual(self.leftovers(), left, 'bad zip: nothing kept; verified zip: kept for a retry')
         finally:
             w.time.sleep = w_sleep
         with self.assertRaises(ValueError):
             w.check_atelier_task('download_model', dict(p, member='Pack-1.0/../up.safetensors'))
+
+    def test_zip_kept_after_a_failed_or_cancelled_extraction_then_deleted(self):
+        a = self.atelier()
+        p, data = self.release_zip()
+        with self.assertRaisesRegex(RuntimeError, 'empreinte inattendue'):
+            a.task_download_model(51, dict(p, sha256='0' * 64), None, lambda *x: None)
+        self.assertEqual(len(self.leftovers()), 2, 'verified zip and its .ok kept')
+        stop = __import__('threading').Event()
+        stop.set()
+        with self.assertRaises(w.JobLost):
+            a.task_download_model(52, p, stop, lambda *x: None)
+        self.assertEqual(len(self.leftovers()), 2, 'cancelled while extracting: zip kept')
+        (self.base / 'store' / 'Pack-1.0.zip').unlink()   # une relance qui retéléchargerait échouerait
+        out = a.task_download_model(53, p, None, lambda *x: None)
+        self.assertEqual(Path(out['path']).read_bytes(), data)
+        self.assertEqual(self.leftovers(), [], 'deleted after success')
+
+    def test_zip_held_by_an_antivirus_does_not_fail_a_done_task(self):
+        a = self.atelier()
+        p, data = self.release_zip()
+        real = w.os.remove
+
+        def held(path, *x, **k):
+            if Path(path).name.startswith('archive-'):
+                raise PermissionError(13, 'used by another process')
+            return real(path, *x, **k)
+        w.os.remove = held
+        try:
+            out = a.task_download_model(61, p, None, lambda *x: None)
+        finally:
+            w.os.remove = real
+        self.assertIn('used by another process', out['archive_left'])
+        self.assertEqual(Path(out['path']).read_bytes(), data)
+        self.assertTrue((self.lay['root'] / 'journal' / '61.json').exists(), 'journaled: undo possible')
+        a.task_undo(62, {'task': 61}, None, None)
+        self.assertFalse(Path(out['path']).exists())
+
+    def test_abandoned_zips_purged_after_7_days_never_during_a_task(self):
+        a = self.atelier()
+        d = self.lay['root'] / 'downloads'
+        d.mkdir(parents=True)
+        now = time.time()
+        old, recent, other = d / ('archive-%s.zip.part' % ('a' * 16)), d / ('archive-%s.zip' % ('b' * 16)), d / 'notes.zip'
+        for x in (old, recent, other):
+            x.write_bytes(b'x')
+        for x in (old, other):
+            os.utime(x, (now - 8 * 86400, now - 8 * 86400))
+
+        class Running:
+            is_alive = staticmethod(lambda: True)
+        a.task_thread = Running()
+        a.purge(now)
+        self.assertTrue(old.exists(), 'not while a task runs')
+        a.task_thread = None
+        a.purge(now)
+        self.assertEqual(sorted(x.name for x in d.iterdir()), sorted([recent.name, other.name]))
 
     def test_zip_member_links_and_bombs_refused(self):
         d = self.base / 'zips'

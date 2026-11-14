@@ -3518,6 +3518,8 @@ def atelier_args(spec, atelier, port, listen, data, extra, manager):
 # ---- Tâches d'atelier données par le hub : packs de nœuds et fichiers de modèle, journalisés et réversibles -------------
 ATELIER_TASK_ACTIONS = ('install_nodes', 'remove_nodes', 'download_model', 'remove_model', 'undo')
 ATELIER_TRASH_DAYS = 30          # ce qu'une tâche a remplacé ou retiré reste 30 jours dans atelier\trash (undo possible)
+ATELIER_ARCHIVE_DAYS = 7         # zip de download_model (member) abandonné dans atelier\downloads : effacé après 7 jours
+ATELIER_ARCHIVE = re.compile(r'archive-[0-9a-f]{16}\.zip(\.part|\.ok)?')
 GITHUB_REPO = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?')
 SAFE_PART = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.() +-]{0,119}')
 MODEL_EXT = re.compile(r'.+\.(safetensors|sft|gguf|pt|pth|bin|ckpt|onnx)', re.I)
@@ -3667,6 +3669,18 @@ def extract_member(archive, member, dest, expected_sha256, size=None, room=None,
             tmp.unlink()
 
 
+def remove_files(paths):
+    """Efface ce qui existe ; une erreur (fichier tenu par un antivirus) ne remonte pas. -> raison du premier échec, ou None."""
+    first = None
+    for x in paths:
+        try:
+            if os.path.lexists(x):
+                os.remove(x)
+        except OSError as e:
+            first = first or '%s : %s' % (Path(x).name, e)
+    return first
+
+
 def remote_size(url, timeout=60):
     try:
         with urllib.request.urlopen(urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'reuse-worker'}), timeout=timeout) as r:
@@ -3770,6 +3784,16 @@ class Atelier:
             for d in trash.iterdir():
                 if d.is_dir() and re.fullmatch(r'\d{8}', d.name) and d.name < limit:
                     rmtree(d)
+        downloads = lay['root'] / 'downloads'
+        busy = self.task_thread is not None and self.task_thread.is_alive()
+        if downloads.is_dir() and not busy:   # archives de download_model laissées par un échec ou une annulation
+            for x in downloads.iterdir():
+                try:
+                    if ATELIER_ARCHIVE.fullmatch(x.name) and x.is_file() and now - x.stat().st_mtime > ATELIER_ARCHIVE_DAYS * 86400:
+                        x.unlink()
+                        log.info('Atelier : ménage, archive abandonnée %s effacée.', x.name)
+                except OSError:
+                    continue
         self.files_gb = round(left / 1e9, 2)
         if removed:
             log.info('Atelier : ménage, %d fichiers retirés (%.1f Go), %.1f Go gardés.', removed, freed / 1e9, left / 1e9)
@@ -4302,15 +4326,12 @@ class Atelier:
             got = download_resume(p['url'], self.archive_path(lay, p) if member else dest, p['archive_sha256'] if member else p['sha256'], fetch,
                                   what, stop, lambda frac: progress(0.01 + share * frac, 'téléchargement de %s : %d %%' % (what, 100 * frac)), tries=2)
             if member:
-                try:
-                    progress(0.82, 'extraction de %s' % member)
-                    room = shutil.disk_usage(str(lay['root'])).free - keep
-                    size = extract_member(got, member, dest, p['sha256'], p['size'], room, stop,
-                                          lambda frac: progress(0.82 + 0.17 * frac, 'extraction de %s : %d %%' % (p['name'], 100 * frac)))
-                finally:
-                    for x in (got, Path(str(got) + '.ok')):   # archive vérifiée : effacée, qu'elle ait servi ou non
-                        if x.exists():
-                            x.unlink()
+                # Échec ou annulation ici : l'archive vérifiée reste (une relance ne la retélécharge pas), purgée après
+                # ATELIER_ARCHIVE_DAYS jours si personne ne la reprend
+                progress(0.82, 'extraction de %s' % member)
+                room = shutil.disk_usage(str(lay['root'])).free - keep
+                size = extract_member(got, member, dest, p['sha256'], p['size'], room, stop,
+                                      lambda frac: progress(0.82 + 0.17 * frac, 'extraction de %s : %d %%' % (p['name'], 100 * frac)))
         except BaseException:
             if displaced and not dest.exists():
                 self.from_trash(displaced, dest)
@@ -4319,13 +4340,18 @@ class Atelier:
         out = {'path': str(dest), 'sha256': p['sha256'], 'size': size}
         if member:
             out.update(member=member, archive_sha256=p['archive_sha256'])
+            # Après le journal : un zip tenu (antivirus de Windows) ne fait pas rater une tâche faite ; la purge le reprendra
+            left = remove_files([got, Path(str(got) + '.ok')])
+            if left:
+                log.warning('Atelier : archive %s pas effacée (%s), laissée au ménage', got, left)
+                out['archive_left'] = left
         if displaced:
             out['replaced'] = str(displaced)
         return out
 
     @staticmethod
     def archive_path(lay, p):
-        """Zip en cours de téléchargement, nommé par son empreinte : une tâche relancée reprend le même .part."""
+        """Zip de download_model, nommé par son empreinte : une tâche relancée reprend le même .part, ou l'archive déjà vérifiée."""
         return lay['root'] / 'downloads' / ('archive-%s.zip' % p['archive_sha256'][:16])
 
     def task_remove_model(self, tid, p, stop, progress):

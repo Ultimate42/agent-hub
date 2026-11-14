@@ -544,7 +544,8 @@ curl -H "$A" $T ; curl -H "$A" $T/12 ; curl -H "$A" -X POST $T/12/cancel
   - `sha256` et `size` sont ceux du fichier extrait ; le nom par défaut est celui du fichier ;
   - refusés : « .. », chemin absolu, `\`, lien, fichier chiffré, membre absent ou en double ;
   - sans `size`, l'extraction est bornée à 64 Go et à la place libre ; elle s'arrête à la taille annoncée par le zip ;
-  - l'archive est téléchargée dans `atelier\downloads\` (reprise) et effacée après l'extraction, réussie ou non.
+  - l'archive est téléchargée dans `atelier\downloads\` (reprise), puis effacée une fois le fichier posé ;
+  - après un échec ou une annulation, l'archive vérifiée reste pour la relance ; le ménage l'efface après 7 jours.
 - `undo` ne défait pas les paquets pip, partagés entre packs : l'état d'avant est dans le journal.
 - `folder` :
   - un dossier de modèles ComfyUI (`loras`, `upscale_models`, `model_patches`, `checkpoints`, `controlnet`…), avec un

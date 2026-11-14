@@ -10,7 +10,8 @@ import { journal, clip } from './worker-control.js';
 //  - download_model {url: https://..., sha256, folder: loras|upscale_models|model_patches|..., name?, size?}: resumable,
 //    checked against the SHA-256 before it is put in place. With member (path of one file inside a .zip at url) and
 //    archive_sha256 (required then), archive_size?: the archive is downloaded and checked, only that file is extracted
-//    (bounded to size, or to the worker's ZIP_MEMBER_MAX), checked against sha256 and put in place; the archive is deleted.
+//    (bounded to size, or to the worker's ZIP_MEMBER_MAX), checked against sha256 and put in place; the archive is deleted then
+//    (kept after a failure for a retry, purged after 7 days).
 //  - remove_model {folder, name}
 //  - undo {task}: what that task put in place goes to the PC's trash, what it replaced or removed comes back.
 // Nothing is ever deleted by a task: replaced or removed files go to <atelier>/trash for 30 days. Every step is
