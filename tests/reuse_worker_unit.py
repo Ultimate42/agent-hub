@@ -965,6 +965,55 @@ class KleinJobTest(unittest.TestCase):
         self.assertFalse(lay['pid'].exists(), 'card given back')
 
 
+class ComfySlowReadsTest(unittest.TestCase):
+    """Job 75 : une lecture lente juste après « Prompt executed » ne fait pas échouer un travail fini."""
+
+    def test_vram_reading_that_times_out_is_skipped(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(1)   # accepte, ne répond jamais
+        try:
+            t0 = time.time()
+            self.assertEqual(w.comfy_vram_safe(srv.getsockname()[1], timeout=0.5), (None, None))
+            self.assertLess(time.time() - t0, 5)
+            self.assertEqual(w.comfy_vram_safe(free_port(), timeout=0.5), (None, None), 'nothing listening')
+        finally:
+            srv.close()
+
+    def test_history_poll_survives_a_timeout(self):
+        import socket
+        base = Path(tempfile.mkdtemp())
+        out = base / 'data' / 'output'
+        out.mkdir(parents=True)
+        calls = []
+        entry = {'status': {'status_str': 'success', 'completed': True}, 'outputs': {'9': {'images': [{'filename': 'a.png', 'subfolder': '', 'type': 'output'}]}}}
+
+        def fake_local(port, method, path, body=None, timeout=30):
+            calls.append(path)
+            if path == '/prompt':
+                return 200, {'prompt_id': 'p1'}
+            if path.startswith('/history'):
+                if calls.count(path) == 1:
+                    raise socket.timeout('timed out')
+                return 200, {'p1': entry}
+            return 200, {}
+
+        class Proc:
+            def poll(self):
+                return None
+        h = {'proc': Proc(), 'port': 1, 'box': {'all': w.ComfyTrace(), 'trace': None}, 'lay': {'data': base / 'data'}}
+        saved = w.comfy_local
+        w.comfy_local = fake_local
+        try:
+            path, meta = w.comfy_prompt(h, {}, 4, None, lambda *x: None, 60)
+        finally:
+            w.comfy_local = saved
+        self.assertEqual(path, out / 'a.png')
+        self.assertEqual(h['trace'].meta.get('history_retries'), 1)
+        self.assertEqual(calls.count('/history/p1'), 2)
+
+
 class ComfyFreeRuleTest(unittest.TestCase):
     """Quand libérer la carte avant un travail ComfyUI : mesures réelles de gpu-box (jobs 62, 66, 67)."""
     def test_klein_need_and_rule(self):

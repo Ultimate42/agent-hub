@@ -1221,7 +1221,7 @@ class Gpu:
             self.comfy['h']['box']['all'].meta.pop(k, None)   # journal de toute la vie de ComfyUI : pas de reste du travail précédent
         need, need_all = comfy_vram_need(model, values)
         resident = json.dumps([job.get('model'), str(values.get('te_device'))])
-        free, total = comfy_vram(self.comfy['h']['port'])
+        free, total = comfy_vram_safe(self.comfy['h']['port'])
         if free is not None:
             meta['vram_free_before_mib'] = free
         if reused and comfy_should_free(free, total, need, need_all, self.comfy.get('resident') == resident):
@@ -1235,7 +1235,7 @@ class Gpu:
                 self.stop_comfy('carte pas assez libérée par /free')
                 start()
                 meta['free_restart'] = True
-                after = comfy_vram(self.comfy['h']['port'])[0]
+                after = comfy_vram_safe(self.comfy['h']['port'])[0]
             if after is not None:
                 meta['vram_free_after_free_mib'] = after
             log.info('Carte libérée avant le travail %s : %s Mio libres avant, %s après (%d demandés).', job.get('id'), free, after, need)
@@ -1279,7 +1279,7 @@ class Gpu:
             for p in placed:
                 p.unlink(missing_ok=True)
         if self.comfy:
-            after = comfy_vram(h['port'])[0]
+            after = comfy_vram_safe(h['port'])[0]
             if after is not None:
                 meta['vram_free_after_mib'] = after
         return out, run
@@ -2846,6 +2846,18 @@ def comfy_vram(port):
     return mib(dev.get('vram_free')), mib(dev.get('vram_total'))
 
 
+def comfy_vram_safe(port, timeout=30):
+    """Comme comfy_vram, mais une lecture ratée donne (None, None) : c'est un relevé, il ne fait jamais échouer un travail.
+    Job 75 : « timed out » juste après « Prompt executed », quand ComfyUI vide la carte et que /system_stats attend la carte."""
+    try:
+        dev = (((comfy_local(port, 'GET', '/system_stats', timeout=timeout)[1] or {}).get('devices') or [{}])[0])
+    except (OSError, ValueError) as e:
+        log.warning('Mémoire vidéo de ComfyUI non lue (%s) : relevé sauté.', e)
+        return None, None
+    mib = lambda v: int(v / 1048576) if isinstance(v, (int, float)) else None
+    return mib(dev.get('vram_free')), mib(dev.get('vram_total'))
+
+
 def comfy_vram_need(model, values):
     """Mio qu'un travail pose sur la carte -> (plus gros modèle + marge, tous ses modèles + marge). ComfyUI charge un modèle
     à la fois (encodeur texte, DiT, VAE) ; l'encodeur n'y va pas s'il tourne sur le processeur (te_device cpu)."""
@@ -3025,7 +3037,12 @@ def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
             except OSError:
                 pass
         time.sleep(1)
-        status, hist = comfy_local(port, 'GET', '/history/%s' % pid, timeout=30)
+        try:   # une lecture lente (ComfyUI vide la carte après le calcul) n'arrête pas le suivi : plafond et processus le bornent
+            status, hist = comfy_local(port, 'GET', '/history/%s' % pid, timeout=30)
+        except (OSError, ValueError) as e:
+            trace.meta['history_retries'] = trace.meta.get('history_retries', 0) + 1
+            log.warning('Suivi du calcul : /history pas lu (%s), nouvel essai.', e)
+            continue
         if status == 200 and isinstance(hist, dict) and pid in hist:
             entry = hist[pid]
     h['last_used'] = time.time()
