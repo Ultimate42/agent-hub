@@ -1,6 +1,7 @@
 """Tests unitaires du worker RE-USE (fonctions pures). Lancé par tests/reuse-worker.test.js."""
 import array
 import atexit
+import hashlib
 import importlib.util
 import io
 import json
@@ -1659,6 +1660,17 @@ class AtelierTaskTest(AtelierBase):
         self.assertEqual(w.check_atelier_task('download_model', {'url': 'https://x/a.safetensors', 'sha256': 'b' * 64, 'folder': 'loras/style'})['folder'], 'loras/style')
         with self.assertRaises(ValueError):
             w.check_atelier_task('format_disk', {})
+        # Un fichier dans un zip de release : nom tiré du membre, empreinte de l'archive obligatoire
+        z = {'url': 'https://github.com/Kim2091/PBRify_Remix/releases/download/v1.7.2/PBRify_Remix-1.7.2.zip', 'sha256': 'b' * 64,
+             'folder': 'upscale_models', 'member': 'PBRify_Remix-1.7.2/Models/4x-PBRify-UpscalerV4.safetensors', 'archive_sha256': 'c' * 64}
+        m = w.check_atelier_task('download_model', z)
+        self.assertEqual((m['name'], m['member'], m['archive_sha256'], m['archive_size']), ('4x-PBRify-UpscalerV4.safetensors', z['member'], 'c' * 64, None))
+        for bad in (dict(z, archive_sha256=None), dict(z, archive_sha256='C' * 64), dict(z, member='../Models/x.safetensors'),
+                    dict(z, member='a/../x.safetensors'), dict(z, member='/etc/x.safetensors'), dict(z, member='a\\x.safetensors'),
+                    dict(z, member='C:/x.safetensors'), dict(z, member='a//x.safetensors'), dict(z, member='a/x.exe'), dict(z, member=7),
+                    dict(z, archive_size=0), {'url': z['url'], 'sha256': 'b' * 64, 'folder': 'loras', 'name': 'x.safetensors', 'archive_sha256': 'c' * 64}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                w.check_atelier_task('download_model', bad)
 
     def test_node_pack_install_replace_undo_and_pip_failure(self):
         a = self.atelier()
@@ -1746,6 +1758,95 @@ class AtelierTaskTest(AtelierBase):
         self.assertFalse(dest.exists(), 'undo of the download: file to the trash')
         with self.assertRaises(RuntimeError):
             a.task_remove_model(27, {'folder': 'loras', 'name': 'lora.safetensors'}, None, None)
+
+    def release_zip(self, member='Pack-1.0/Models/up.safetensors', data=b'upscaler weights ' * 4000):
+        """Petit zip de release, construit ici : le fichier voulu, un autre modèle du même nom ailleurs, un README."""
+        src = self.base / 'store' / 'Pack-1.0.zip'
+        src.parent.mkdir(exist_ok=True)
+        with zipfile.ZipFile(src, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr(member, data)
+            z.writestr('Pack-1.0/Other/up.safetensors', b'another model')
+            z.writestr('Pack-1.0/README.md', 'read me')
+        p = w.check_atelier_task('download_model', {'url': src.as_uri().replace('file://', 'https://'), 'sha256': hashlib.sha256(data).hexdigest(),
+                                                    'folder': 'upscale_models', 'member': member, 'archive_sha256': w.sha256_file(src),
+                                                    'size': len(data), 'archive_size': src.stat().st_size})
+        return dict(p, url=src.as_uri()), data
+
+    def leftovers(self):
+        d = self.lay['root'] / 'downloads'
+        return sorted(x.name for x in d.iterdir()) if d.exists() else []
+
+    def test_model_from_a_zip_only_that_file_checked_then_archive_deleted(self):
+        a = self.atelier()
+        p, data = self.release_zip()
+        out = a.task_download_model(31, p, None, lambda *x: None)
+        dest = self.lay['data'] / 'models' / 'upscale_models' / 'up.safetensors'
+        self.assertEqual((Path(out['path']), out['size'], out['member']), (dest, len(data), 'Pack-1.0/Models/up.safetensors'))
+        self.assertEqual(dest.read_bytes(), data)
+        self.assertEqual(sorted(x.name for x in dest.parent.iterdir()), ['up.safetensors', 'up.safetensors.ok'], 'only that file, no .part')
+        self.assertEqual(self.leftovers(), [], 'archive deleted')
+        self.assertEqual(a.task_download_model(32, p, None, lambda *x: None)['note'], 'déjà présent, identique')
+        a.task_undo(33, {'task': 31}, None, None)
+        self.assertFalse(dest.exists(), 'undo: file to the trash')
+
+    def test_model_from_a_zip_refused(self):
+        a = self.atelier()
+        dest = self.lay['data'] / 'models' / 'upscale_models' / 'up.safetensors'
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b'previous weights')
+        p, data = self.release_zip()
+        w_sleep, w.time.sleep = w.time.sleep, lambda s: None   # deux essais de téléchargement : pas 5 s d'attente
+        try:
+            for bad, why in ((dict(p, archive_sha256='0' * 64), 'empreinte inattendue'),
+                             (dict(p, sha256='0' * 64), 'empreinte inattendue pour Pack-1.0/Models/up.safetensors'),
+                             (dict(p, member='Pack-1.0/Models/missing.safetensors', name='up.safetensors'), 'pas de Pack-1.0/Models/missing'),
+                             (dict(p, member='Pack-1.0/up.safetensors'), 'même nom ailleurs : Pack-1.0/Models/up.safetensors'),
+                             (dict(p, size=len(data) - 1), r'attendus \(size\)')):
+                with self.assertRaisesRegex(RuntimeError, why):
+                    a.task_download_model(41, bad, None, lambda *x: None)
+                self.assertEqual(dest.read_bytes(), b'previous weights', 'a refused file leaves the previous one in place')
+                self.assertEqual(sorted(x.name for x in dest.parent.iterdir()), ['up.safetensors'], 'no .part left')
+                self.assertEqual(self.leftovers(), [], 'no archive left')
+        finally:
+            w.time.sleep = w_sleep
+        with self.assertRaises(ValueError):
+            w.check_atelier_task('download_model', dict(p, member='Pack-1.0/../up.safetensors'))
+
+    def test_zip_member_links_and_bombs_refused(self):
+        d = self.base / 'zips'
+        d.mkdir()
+        dest = d / 'out' / 'x.safetensors'
+        link = d / 'link.zip'
+        with zipfile.ZipFile(link, 'w') as z:
+            info = zipfile.ZipInfo('m/x.safetensors')
+            info.external_attr = (0o120777 << 16)   # lien symbolique
+            z.writestr(info, '/etc/passwd')
+        with self.assertRaisesRegex(RuntimeError, 'lien ou dossier'):
+            w.extract_member(link, 'm/x.safetensors', dest, 'a' * 64)
+        zeros = b'\0' * (4 << 20)
+        bomb = d / 'bomb.zip'
+        with zipfile.ZipFile(bomb, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('m/x.safetensors', zeros)
+        self.assertLess(bomb.stat().st_size, 64 << 10)
+        saved, w.ZIP_MEMBER_MAX = w.ZIP_MEMBER_MAX, 1 << 20
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'borne'):
+                w.extract_member(bomb, 'm/x.safetensors', dest, hashlib.sha256(zeros).hexdigest())
+        finally:
+            w.ZIP_MEMBER_MAX = saved
+        with self.assertRaisesRegex(RuntimeError, 'disque'):
+            w.extract_member(bomb, 'm/x.safetensors', dest, hashlib.sha256(zeros).hexdigest(), room=1 << 20)
+        # Taille annoncée mentie (en-têtes réécrits à 1 000 octets) : jamais plus que l'annoncé, puis refusé
+        raw = bytearray(bomb.read_bytes())
+        for sig, at in ((b'PK\x03\x04', 22), (b'PK\x01\x02', 24)):
+            i = raw.index(sig)
+            raw[i + at:i + at + 4] = struct.pack('<I', 1000)
+        liar = d / 'liar.zip'
+        liar.write_bytes(bytes(raw))
+        with self.assertRaises(RuntimeError):
+            w.extract_member(liar, 'm/x.safetensors', dest, hashlib.sha256(zeros).hexdigest())
+        self.assertFalse(dest.exists() or Path(str(dest) + '.part').exists())
+        self.assertEqual(w.extract_member(bomb, 'm/x.safetensors', dest, hashlib.sha256(zeros).hexdigest()), len(zeros))
 
     def test_old_trash_is_purged(self):
         a = self.atelier()

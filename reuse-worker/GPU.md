@@ -525,6 +525,8 @@ T=$H/atelier/tasks
 curl -H "$A" -H "$J" -d '{"action":"install_nodes","url":"https://github.com/OliverCrosby/ComfyUI-Universal-Seamless-Tiles","commit":"<40 caractères>"}' $T
 # modèle : téléchargement repris en cas de coupure, empreinte vérifiée avant de le poser (size facultatif)
 curl -H "$A" -H "$J" -d '{"action":"download_model","url":"https://huggingface.co/<dépôt>/resolve/<commit>/x.safetensors","sha256":"<64>","folder":"loras"}' $T
+# modèle livré seulement dans un zip : l'archive est vérifiée, seul ce fichier est extrait, puis l'archive effacée
+curl -H "$A" -H "$J" -d '{"action":"download_model","url":"https://github.com/<compte>/<dépôt>/releases/download/<v>/x.zip","archive_sha256":"<64>","member":"x/Models/y.safetensors","sha256":"<64>","size":139793020,"folder":"upscale_models"}' $T
 curl -H "$A" -H "$J" -d '{"action":"remove_nodes","name":"ComfyUI-Universal-Seamless-Tiles"}' $T
 curl -H "$A" -H "$J" -d '{"action":"remove_model","folder":"loras","name":"x.safetensors"}' $T
 curl -H "$A" -H "$J" -d '{"action":"undo","task":12}' $T      # défait la tâche 12
@@ -536,6 +538,13 @@ curl -H "$A" $T ; curl -H "$A" $T/12 ; curl -H "$A" -X POST $T/12/cancel
   - `install.py` n'est jamais exécuté (signalé) ;
   - si pip échoue, le pack est retiré et l'ancienne version remise ;
   - l'atelier est relancé pour charger le pack, dès qu'il ne calcule plus.
+- `download_model` avec `member` :
+  - `member` est le chemin du fichier dans le zip, tel que le liste `unzip -l` ;
+  - `archive_sha256` est obligatoire, `archive_size` facultatif ;
+  - `sha256` et `size` sont ceux du fichier extrait ; le nom par défaut est celui du fichier ;
+  - refusés : « .. », chemin absolu, `\`, lien, fichier chiffré, membre absent ou en double ;
+  - sans `size`, l'extraction est bornée à 64 Go et à la place libre ; elle s'arrête à la taille annoncée par le zip ;
+  - l'archive est téléchargée dans `atelier\downloads\` (reprise) et effacée après l'extraction, réussie ou non.
 - `undo` ne défait pas les paquets pip, partagés entre packs : l'état d'avant est dans le journal.
 - `folder` :
   - un dossier de modèles ComfyUI (`loras`, `upscale_models`, `model_patches`, `checkpoints`, `controlnet`…), avec un

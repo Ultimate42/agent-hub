@@ -252,6 +252,12 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.match((await post({ action: 'install_nodes', url: 'https://github.com/a/b', commit: 'main' })).error, /40-character/);
     assert.match((await post({ action: 'download_model', url: 'https://x/a.safetensors', sha256: 'b'.repeat(64), folder: '../x' })).error, /folder/);
     assert.match((await post({ action: 'download_model', url: 'http://x/a.safetensors', sha256: 'b'.repeat(64), folder: 'loras' })).error, /https/);
+    const zip = { action: 'download_model', url: 'https://x/r.zip', sha256: 'b'.repeat(64), folder: 'upscale_models', member: 'R-1.0/Models/up.safetensors' };
+    assert.match((await post(zip)).error, /member needs archive_sha256/);
+    for (const member of ['R-1.0/../up.safetensors', '/up.safetensors', 'R\\up.safetensors', 'C:/up.safetensors', 'R//up.safetensors']) {
+      assert.match((await post({ ...zip, member, archive_sha256: 'c'.repeat(64) })).error, /member: relative path/, member);
+    }
+    assert.match((await post({ ...zip, member: undefined, name: 'up.safetensors', archive_sha256: 'c'.repeat(64) })).error, /go with member/);
     assert.match((await post({ action: 'rm -rf' })).error, /action must be one of/);
     const lora = path.join(data, 'models', 'loras', 'style.safetensors');
     fs.mkdirSync(path.dirname(lora), { recursive: true });

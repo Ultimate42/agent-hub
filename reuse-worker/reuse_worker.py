@@ -26,6 +26,7 @@ import re
 import shutil
 import socket
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -36,6 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 
 EXIT_STOP, EXIT_NOT_READY, EXIT_UPDATED, EXIT_LAUNCHER_UPDATED = 0, 3, 42, 43
@@ -3519,6 +3521,19 @@ ATELIER_TRASH_DAYS = 30          # ce qu'une tâche a remplacé ou retiré reste
 GITHUB_REPO = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?')
 SAFE_PART = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.() +-]{0,119}')
 MODEL_EXT = re.compile(r'.+\.(safetensors|sft|gguf|pt|pth|bin|ckpt|onnx)', re.I)
+SHA256_HEX = re.compile(r'[0-9a-f]{64}')
+ZIP_MEMBER_MAX = 64 * 10 ** 9    # fichier extrait d'un zip sans size donné : au-delà, refusé (bombe zip, taille annoncée fausse)
+
+
+def is_zip_member(m):
+    """Chemin d'un fichier dans un zip, selon la même règle que le hub : relatif, « / » entre les parties, chaque partie comme
+    un nom de fichier (ni « .. », ni « \\ », ni lecteur « C: », ni « / » en tête)."""
+    return (isinstance(m, str) and len(m) <= 500 and '..' not in m and len(m.split('/')) <= 20
+            and all(SAFE_PART.fullmatch(part) for part in m.split('/')))
+
+
+def positive_int(n):
+    return isinstance(n, int) and not isinstance(n, bool) and n > 0
 
 
 def check_atelier_task(action, p):
@@ -3546,17 +3561,33 @@ def check_atelier_task(action, p):
         if not re.fullmatch(r'[a-z][a-z0-9_]{1,40}(/[A-Za-z0-9_][A-Za-z0-9_.-]{0,59})?', folder):
             raise ValueError('dossier de modèle refusé : %r (ex. loras, upscale_models, model_patches)' % folder)
         url = str(p.get('url') or '')
-        name = str(p.get('name') or urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit('/', 1)[-1]))
+        member = p.get('member') if action == 'download_model' else None
+        if member is not None and not is_zip_member(member):
+            raise ValueError('member : chemin relatif d\'un fichier du zip attendu, ex. Pack-1.0/Models/x.safetensors (ni « .. », ni « \\ », ni « / » en tête)')
+        name = p.get('name')
+        if name is None:
+            name = str(member).rsplit('/', 1)[-1] if member is not None else urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit('/', 1)[-1])
+        name = str(name)
         if not SAFE_PART.fullmatch(name) or not MODEL_EXT.fullmatch(name) or '..' in name:
             raise ValueError('nom de fichier refusé : %r (safetensors, gguf, pt, pth, bin, ckpt, onnx)' % name)
         if action == 'remove_model':
             return {'folder': folder, 'name': name}
-        if not re.fullmatch(r'https://\S{1,2000}', url) or not re.fullmatch(r'[0-9a-f]{64}', str(p.get('sha256') or '')):
+        if not re.fullmatch(r'https://\S{1,2000}', url) or not SHA256_HEX.fullmatch(str(p.get('sha256') or '')):
             raise ValueError('download_model : url https et sha256 (64 caractères hexadécimaux) attendus')
         size = p.get('size')
-        if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size <= 0):
+        if size is not None and not positive_int(size):
             raise ValueError('size : nombre d\'octets attendu')
-        return {'url': url, 'sha256': p['sha256'], 'folder': folder, 'name': name, 'size': size}
+        out = {'url': url, 'sha256': p['sha256'], 'folder': folder, 'name': name, 'size': size}
+        if member is None:
+            if p.get('archive_sha256') is not None or p.get('archive_size') is not None:
+                raise ValueError('archive_sha256 et archive_size vont avec member')
+            return out
+        if not SHA256_HEX.fullmatch(str(p.get('archive_sha256') or '')):
+            raise ValueError('member : archive_sha256 (64 caractères hexadécimaux) du zip attendu')
+        archive_size = p.get('archive_size')
+        if archive_size is not None and not positive_int(archive_size):
+            raise ValueError('archive_size : nombre d\'octets attendu')
+        return dict(out, member=member, archive_sha256=p['archive_sha256'], archive_size=archive_size)
     task = p.get('task')
     if not isinstance(task, int) or isinstance(task, bool) or task <= 0:
         raise ValueError('undo : numéro de tâche attendu')
@@ -3575,6 +3606,65 @@ def fetch_file(url, dest, stop=None, timeout=120):
             f.write(block)
             h.update(block)
     return h.hexdigest()
+
+
+def extract_member(archive, member, dest, expected_sha256, size=None, room=None, stop=None, progress=None):
+    """Un seul fichier d'un zip, écrit dans dest (via dest.part) sans jamais se servir de son chemin dans l'archive.
+    Refusé : membre absent ou en double, lien, dossier, chiffré, plus grand que size (ou ZIP_MEMBER_MAX) ou que la place
+    libre (room), et toute décompression qui dépasse la taille annoncée (bombe zip). Empreinte vérifiée avant de le poser,
+    avec le témoin .ok de download_resume. -> taille du fichier."""
+    dest = Path(dest)
+    tmp = Path(str(dest) + '.part')
+    limit = size if size is not None else ZIP_MEMBER_MAX
+    try:
+        with zipfile.ZipFile(archive) as z:
+            found = [i for i in z.infolist() if i.filename == member]
+            if not found:
+                base = member.rsplit('/', 1)[-1]
+                near = [i.filename for i in z.infolist() if i.filename.rsplit('/', 1)[-1] == base][:3]
+                raise RuntimeError('pas de %s dans l\'archive%s' % (member, (' (même nom ailleurs : %s)' % ', '.join(near)) if near else ''))
+            if len(found) > 1:
+                raise RuntimeError('%s présent %d fois dans l\'archive' % (member, len(found)))
+            info = found[0]
+            kind = stat.S_IFMT(info.external_attr >> 16)   # type Unix s'il est noté (0 pour un zip fait sous Windows)
+            if info.is_dir() or kind not in (0, stat.S_IFREG):
+                raise RuntimeError('%s n\'est pas un fichier ordinaire dans l\'archive (lien ou dossier)' % member)
+            if info.flag_bits & 0x1:
+                raise RuntimeError('%s est chiffré dans l\'archive' % member)
+            if size is not None and info.file_size != size:
+                raise RuntimeError('%s fait %d octets d\'après l\'archive, %d attendus (size)' % (member, info.file_size, size))
+            if info.file_size > limit:
+                raise RuntimeError('%s : %.1f Go une fois décompressé, plus que la borne de %.0f Go (donner size)' % (member, info.file_size / 1e9, limit / 1e9))
+            if room is not None and info.file_size > room:
+                raise RuntimeError('disque : %.1f Go à décompresser, %.1f Go disponibles' % (info.file_size / 1e9, room / 1e9))
+            h, done, last = hashlib.sha256(), 0, 0
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as src, open(tmp, 'wb') as out:
+                for block in iter(lambda: src.read(1 << 20), b''):
+                    done += len(block)
+                    if done > info.file_size:   # zipfile s'arrête déjà là ; revérifié, c'est la seule borne qui compte
+                        raise RuntimeError('%s : décompression au-delà de la taille annoncée (archive piégée ?)' % member)
+                    out.write(block)
+                    h.update(block)
+                    if stop is not None and stop.is_set():
+                        raise JobLost('extraction interrompue')
+                    if progress and done - last > (64 << 20):
+                        last = done
+                        progress(done / max(info.file_size, 1))
+        if done != info.file_size:
+            raise RuntimeError('%s : %d octets décompressés, %d annoncés' % (member, done, info.file_size))
+        got = h.hexdigest()
+        if got != expected_sha256:
+            raise RuntimeError('empreinte inattendue pour %s extrait de l\'archive (%s…)' % (member, got[:12]))
+        os.replace(tmp, dest)
+        st = dest.stat()
+        Path(str(dest) + '.ok').write_text('%s %d %d' % (expected_sha256, st.st_size, st.st_mtime_ns))
+        return st.st_size
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, EOFError, zlib.error) as e:
+        raise RuntimeError('archive illisible (%s) : %s' % (type(e).__name__, e))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def remote_size(url, timeout=60):
@@ -4184,35 +4274,59 @@ class Atelier:
         return {'name': p['name'], 'trash': str(trash), 'note': 'paquets pip gardés (communs à d\'autres packs)'}
 
     def task_download_model(self, tid, p, stop, progress):
+        """Fichier de modèle, ou (member) un seul fichier d'un zip : l'archive est téléchargée (reprise), vérifiée
+        (archive_sha256), le fichier seul extrait et vérifié (sha256), puis l'archive effacée."""
         spec, lay = self.task_layout()
         folder = lay['data'] / 'models' / Path(*p['folder'].split('/'))
         dest = folder / p['name']
-        size = p['size'] or remote_size(p['url'])
-        if not size:
-            raise RuntimeError('taille inconnue (pas de Content-Length) : donner size en octets')
-        free = shutil.disk_usage(str(lay['root'])).free
-        if size + self.gpu.keep_free_bytes() > free:
-            raise RuntimeError('disque : %.1f Go à poser, %.1f Go libres, %.0f Go à laisser libres' % (size / 1e9, free / 1e9, self.gpu.keep_free_bytes() / 1e9))
+        member = p.get('member')
+        size = p['size'] if member else (p['size'] or remote_size(p['url']))
+        fetch = (p.get('archive_size') or remote_size(p['url'])) if member else size
+        if not fetch:
+            raise RuntimeError('taille inconnue (pas de Content-Length) : donner %s en octets' % ('archive_size' if member else 'size'))
+        need = fetch + (size or 0) if member else size
+        free, keep = shutil.disk_usage(str(lay['root'])).free, self.gpu.keep_free_bytes()
+        if need + keep > free:
+            raise RuntimeError('disque : %.1f Go à poser, %.1f Go libres, %.0f Go à laisser libres' % (need / 1e9, free / 1e9, keep / 1e9))
         displaced = None
         if dest.exists():
             st = dest.stat()
-            if st.st_size == size and sha256_file(dest) == p['sha256']:
-                return {'path': str(dest), 'sha256': p['sha256'], 'size': size, 'note': 'déjà présent, identique'}
+            if (size is None or st.st_size == size) and sha256_file(dest) == p['sha256']:
+                return {'path': str(dest), 'sha256': p['sha256'], 'size': st.st_size, 'note': 'déjà présent, identique'}
             displaced = self.to_trash(lay, dest, tid, 'remplace')
-        progress(0.01, 'téléchargement de %s (%.2f Go)' % (p['name'], size / 1e9))
+        what = '%s (atelier)' % (p['url'].rsplit('/', 1)[-1][:80] if member else p['name'])
+        share = 0.8 if member else 0.98
+        progress(0.01, 'téléchargement de %s (%.2f Go)' % (what, fetch / 1e9))
         try:
             # Deux essais : une empreinte fausse au bout de 6 Go ne se corrige pas en retéléchargeant huit fois
-            download_resume(p['url'], dest, p['sha256'], size, '%s (atelier)' % p['name'], stop,
-                            lambda frac: progress(0.01 + 0.98 * frac, 'téléchargement de %s : %d %%' % (p['name'], 100 * frac)), tries=2)
+            got = download_resume(p['url'], self.archive_path(lay, p) if member else dest, p['archive_sha256'] if member else p['sha256'], fetch,
+                                  what, stop, lambda frac: progress(0.01 + share * frac, 'téléchargement de %s : %d %%' % (what, 100 * frac)), tries=2)
+            if member:
+                try:
+                    progress(0.82, 'extraction de %s' % member)
+                    room = shutil.disk_usage(str(lay['root'])).free - keep
+                    size = extract_member(got, member, dest, p['sha256'], p['size'], room, stop,
+                                          lambda frac: progress(0.82 + 0.17 * frac, 'extraction de %s : %d %%' % (p['name'], 100 * frac)))
+                finally:
+                    for x in (got, Path(str(got) + '.ok')):   # archive vérifiée : effacée, qu'elle ait servi ou non
+                        if x.exists():
+                            x.unlink()
         except BaseException:
             if displaced and not dest.exists():
                 self.from_trash(displaced, dest)
             raise
         self.write_task_journal(lay, tid, {'action': 'download_model', 'installed': str(dest), 'displaced': str(displaced) if displaced else None, 'params': p})
         out = {'path': str(dest), 'sha256': p['sha256'], 'size': size}
+        if member:
+            out.update(member=member, archive_sha256=p['archive_sha256'])
         if displaced:
             out['replaced'] = str(displaced)
         return out
+
+    @staticmethod
+    def archive_path(lay, p):
+        """Zip en cours de téléchargement, nommé par son empreinte : une tâche relancée reprend le même .part."""
+        return lay['root'] / 'downloads' / ('archive-%s.zip' % p['archive_sha256'][:16])
 
     def task_remove_model(self, tid, p, stop, progress):
         spec, lay = self.task_layout()

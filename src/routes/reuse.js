@@ -177,6 +177,7 @@ router.post('/api/reuse/workers/:name/atelier', guard('admin'), json, (req, res)
  *   {action: "install_nodes", url: "https://github.com/<owner>/<repo>", commit: "<40 hex>", name?, pip?: true}
  *   {action: "remove_nodes", name}
  *   {action: "download_model", url: "https://...", sha256, folder: "loras"|"upscale_models"|"model_patches"|..., name?, size?}
+ *   {action: "download_model", url: "https://.../x.zip", member: "dir/in/zip/x.safetensors", archive_sha256, sha256, folder, name?, size?, archive_size?}
  *   {action: "remove_model", folder, name}
  *   {action: "undo", task: <id>}
  * GET .../tasks (most recent first), GET .../tasks/:id (status, stage, progress, result, error), POST .../tasks/:id/cancel.

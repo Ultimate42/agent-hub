@@ -8,7 +8,9 @@ import { journal, clip } from './worker-control.js';
 //    is never run. pip freeze before/after kept on the PC, the difference in the result.
 //  - remove_nodes {name}
 //  - download_model {url: https://..., sha256, folder: loras|upscale_models|model_patches|..., name?, size?}: resumable,
-//    checked against the SHA-256 before it is put in place.
+//    checked against the SHA-256 before it is put in place. With member (path of one file inside a .zip at url) and
+//    archive_sha256 (required then), archive_size?: the archive is downloaded and checked, only that file is extracted
+//    (bounded to size, or to the worker's ZIP_MEMBER_MAX), checked against sha256 and put in place; the archive is deleted.
 //  - remove_model {folder, name}
 //  - undo {task}: what that task put in place goes to the PC's trash, what it replaced or removed comes back.
 // Nothing is ever deleted by a task: replaced or removed files go to <atelier>/trash for 30 days. Every step is
@@ -59,11 +61,19 @@ const PACK = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$/;
 const FOLDER = /^[a-z][a-z0-9_]{1,40}(\/[A-Za-z0-9_][A-Za-z0-9_.-]{0,59})?$/;
 const FILE = /^[A-Za-z0-9_][A-Za-z0-9_.() +-]{0,119}$/;
 const MODEL_EXT = /\.(safetensors|sft|gguf|pt|pth|bin|ckpt|onnx)$/i;
+const SHA = /^[0-9a-f]{64}$/;
+// Path of a file inside a zip: relative, '/' between parts, each part like a file name (no '..', no '\\', no 'C:')
+const MEMBER_PART = /^[A-Za-z0-9_][A-Za-z0-9_.() +-]{0,119}$/;
 
-function fileName(url, name) {
+function fileName(url, name, member) {
   if (name != null) return String(name);
+  if (member != null) return String(member).split('/').pop();
   try { return decodeURIComponent(new URL(url).pathname.split('/').pop() || ''); } catch { return ''; }
 }
+
+const isMember = (m) => typeof m === 'string' && m.length <= 500 && !m.includes('..')
+  && m.split('/').length <= 20 && m.split('/').every(part => MEMBER_PART.test(part));
+const isSize = (n) => Number.isInteger(n) && n > 0;
 
 /** -> {action, params} cleaned, or {error}. Same rules as check_atelier_task in reuse_worker.py. */
 export function checkAtelierTask(body) {
@@ -86,16 +96,28 @@ export function checkAtelierTask(body) {
     case 'remove_model': {
       const folder = String(p.folder || '');
       if (!FOLDER.test(folder)) return { error: 'folder expected, e.g. loras, upscale_models, model_patches (lowercase, one optional subfolder)' };
-      const name = fileName(p.url, p.name);
+      const member = action === 'download_model' ? p.member : null;
+      if (member != null && !isMember(member)) {
+        return { error: 'member: relative path of a file inside the zip expected, e.g. Pack-1.0/Models/x.safetensors (no "..", no "\\", no leading "/")' };
+      }
+      const name = fileName(p.url, p.name, member);
       if (!FILE.test(name) || !MODEL_EXT.test(name) || name.includes('..')) {
         return { error: `invalid file name "${name}" (.safetensors, .gguf, .pt, .pth, .bin, .ckpt, .onnx)` };
       }
       if (action === 'remove_model') return { action, params: { folder, name } };
-      if (!/^https:\/\/\S{1,2000}$/.test(String(p.url || '')) || !/^[0-9a-f]{64}$/.test(String(p.sha256 || ''))) {
+      if (!/^https:\/\/\S{1,2000}$/.test(String(p.url || '')) || !SHA.test(String(p.sha256 || ''))) {
         return { error: 'download_model: https url and sha256 (64 lowercase hex characters) expected' };
       }
-      if (p.size != null && !(Number.isInteger(p.size) && p.size > 0)) return { error: 'size must be a number of bytes' };
-      return { action, params: { url: p.url, sha256: p.sha256, folder, name, ...(p.size != null ? { size: p.size } : {}) } };
+      if (p.size != null && !isSize(p.size)) return { error: 'size must be a number of bytes' };
+      const params = { url: p.url, sha256: p.sha256, folder, name, ...(p.size != null ? { size: p.size } : {}) };
+      if (member == null) {
+        if (p.archive_sha256 != null || p.archive_size != null) return { error: 'archive_sha256 and archive_size go with member' };
+        return { action, params };
+      }
+      if (!SHA.test(String(p.archive_sha256 || ''))) return { error: 'member needs archive_sha256 (64 lowercase hex characters) of the zip' };
+      if (p.archive_size != null && !isSize(p.archive_size)) return { error: 'archive_size must be a number of bytes' };
+      return { action, params: { ...params, member, archive_sha256: p.archive_sha256,
+                                 ...(p.archive_size != null ? { archive_size: p.archive_size } : {}) } };
     }
     case 'undo':
       return Number.isInteger(p.task) && p.task > 0 ? { action, params: { task: p.task } } : { error: 'undo: task (id of the task to undo) expected' };
