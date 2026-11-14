@@ -4,7 +4,7 @@ import { logger } from '../utils/logger.js';
 // ---------------------------------------------------------------------------
 // Remote control of the RE-USE worker machines, beyond pause and update:
 //  - settings: a few keys of reuse-worker.config.json the admin may override from the hub (enable_3d, gpu_max_gb,
-//    gpu_keep_loaded_s). Sent with every order; the worker lays them over its local config. null removes an
+//    gpu_keep_loaded_s, and the ComfyUI workshop: atelier_enabled, atelier_window_only, atelier_idle_free_s). Sent with every order; the worker lays them over its local config. null removes an
 //    override, so the machine is back on its own file. Every change is journaled (who, when, from, to).
 //  - GPU tests: the remote form of `reuse_worker.py --gpu-test`, plus the ComfyUI bench. The admin queues one test;
 //    the worker runs it between two jobs, inside its schedule, reports its stage while it runs and its report at
@@ -18,7 +18,13 @@ const err = (status, error) => ({ ok: false, status, error });
 export const WORKER_SETTINGS = {
   enable_3d: { type: 'bool' },
   gpu_max_gb: { type: 'number', min: 5, max: 200 },
-  gpu_keep_loaded_s: { type: 'int', min: 0, max: 7200 }
+  gpu_keep_loaded_s: { type: 'int', min: 0, max: 7200 },
+  // ComfyUI workshop (reuse-worker/GPU.md, "Atelier ComfyUI"): Alice's own ComfyUI on the machine, on or off from here
+  atelier_enabled: { type: 'bool' },
+  atelier_window_only: { type: 'bool' },          // true: only inside the machine's schedule (default: always, when enabled)
+  atelier_idle_free_s: { type: 'int', min: 0, max: 86400 },  // the workshop gives the card back after this long idle (600; 0 never)
+  atelier_keep_days: { type: 'number', min: 0.5, max: 365 },   // its outputs and uploaded images kept this long (7)...
+  atelier_files_max_gb: { type: 'number', min: 1, max: 500 }   // ...and this much at most, oldest removed first (20)
 };
 
 /** Kinds of remote test and the parameters each accepts (anything else is refused, never passed to the PC). */
@@ -95,7 +101,7 @@ const q = {
                      WHERE id = ? AND status IN ('pending', 'running')`)
 };
 
-function journal(worker, what, detail, now = Date.now()) {
+export function journal(worker, what, detail, now = Date.now()) {
   q.event.run(worker, now, what, JSON.stringify(detail));
   logger.info('RE-USE worker control', { worker, what, ...detail });
 }

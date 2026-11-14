@@ -6,7 +6,8 @@ import {
   reuseEnabled, identifyReuseCaller, submitJob, listJobs, getJob, jobView, retryJob, cancelJob, deleteBatch,
   noteReusePoll, claimJob, claimView, canReadInput, heartbeat, failJob, completeJob,
   listWorkers, orderWorker, getSchedule, setSchedule, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost,
-  getWorkerSettings, setWorkerSettings, requestWorkerTest, listWorkerTests, getWorkerTest, cancelWorkerTest, reportWorkerTest,
+  getWorkerSettings, setWorkerSettings, getAtelier, switchAtelier, requestAtelierTask, atelierTasks, atelierTask, stopAtelierTask,
+  reportFromWorkerAtelierTask, requestWorkerTest, listWorkerTests, getWorkerTest, cancelWorkerTest, reportWorkerTest,
   storeTestOutput, workerTestOutput
 } from '../services/reuse.js';
 import { gpuClaimHooks, gpuClaimView } from '../services/gpu-jobs.js';
@@ -147,7 +148,9 @@ router.delete('/api/reuse/workers/:name/schedule', guard('admin'), (req, res) =>
 /**
  * GET /api/reuse/workers/:name/settings - {settings, history}: config keys the hub overrides on this machine, and the
  * journal of changes and remote tests (most recent first) (admin).
- * POST - body {enable_3d: true|false|null, gpu_max_gb: 5..200|null, gpu_keep_loaded_s: 0..7200|null}: merged; null
+ * POST - body {enable_3d: true|false|null, gpu_max_gb: 5..200|null, gpu_keep_loaded_s: 0..7200|null, atelier_enabled,
+ * atelier_window_only: true|false|null, atelier_idle_free_s: 0..86400|null, atelier_keep_days: 0.5..365|null,
+ * atelier_files_max_gb: 1..500|null}: merged; null
  * removes the override (the machine's own reuse-worker.config.json applies again). Sent at its next poll.
  */
 router.get('/api/reuse/workers/:name/settings', guard('admin'), (req, res) => {
@@ -155,6 +158,40 @@ router.get('/api/reuse/workers/:name/settings', guard('admin'), (req, res) => {
 });
 router.post('/api/reuse/workers/:name/settings', guard('admin'), json, (req, res) => {
   answer(res, setWorkerSettings(req.params.name, req.body));
+});
+
+/**
+ * GET /api/reuse/workers/:name/atelier - {settings, online, atelier: {enabled, state, listen, listening, firewall, busy, vram...}}:
+ * Alice's ComfyUI workshop on that machine, as the worker last described it (admin).
+ * POST {on: true|false} - turn it on or off (setting atelier_enabled, journaled; applied at the worker's next poll).
+ */
+router.get('/api/reuse/workers/:name/atelier', guard('admin'), (req, res) => {
+  answer(res, getAtelier(req.params.name));
+});
+router.post('/api/reuse/workers/:name/atelier', guard('admin'), json, (req, res) => {
+  answer(res, switchAtelier(req.params.name, req.body));
+});
+
+/**
+ * POST /api/reuse/workers/:name/atelier/tasks - a task for the workshop (admin), journaled, undoable. 201 {task[, warning]}:
+ *   {action: "install_nodes", url: "https://github.com/<owner>/<repo>", commit: "<40 hex>", name?, pip?: true}
+ *   {action: "remove_nodes", name}
+ *   {action: "download_model", url: "https://...", sha256, folder: "loras"|"upscale_models"|"model_patches"|..., name?, size?}
+ *   {action: "remove_model", folder, name}
+ *   {action: "undo", task: <id>}
+ * GET .../tasks (most recent first), GET .../tasks/:id (status, stage, progress, result, error), POST .../tasks/:id/cancel.
+ */
+router.post('/api/reuse/workers/:name/atelier/tasks', guard('admin'), json, (req, res) => {
+  answer(res, requestAtelierTask(req.params.name, req.body), 201);
+});
+router.get('/api/reuse/workers/:name/atelier/tasks', guard('admin'), (req, res) => {
+  answer(res, atelierTasks(req.params.name, req.query.limit));
+});
+router.get('/api/reuse/workers/:name/atelier/tasks/:id', guard('admin'), (req, res) => {
+  answer(res, atelierTask(req.params.name, req.params.id));
+});
+router.post('/api/reuse/workers/:name/atelier/tasks/:id/cancel', guard('admin'), (req, res) => {
+  answer(res, stopAtelierTask(req.params.name, req.params.id));
 });
 
 /**
@@ -212,7 +249,7 @@ router.post('/api/reuse/next', guard('worker'), json, (req, res) => {
     const changed = orders.paused !== first.paused || orders.update !== first.update || orders.worker_version !== first.worker_version
       || JSON.stringify(orders.settings) !== JSON.stringify(first.settings);
     // An order the worker must act on (update, a GPU test) is delivered at once; otherwise wait for a job
-    if (changed || orders.update || orders.gpu_test || Date.now() >= deadline) return res.json({ job: null, orders });
+    if (changed || orders.update || orders.gpu_test || orders.atelier_task || Date.now() >= deadline) return res.json({ job: null, orders });
     setTimeout(attempt, 1000);
   };
   attempt();
@@ -230,6 +267,11 @@ router.post('/api/reuse/worker/status', guard('worker'), json, (req, res) => {
  */
 router.post('/api/reuse/worker/tests/:id', guard('worker'), jsonReport, (req, res) => {
   answer(res, reportWorkerTest(req.reuseCaller.name, req.params.id, req.body));
+});
+
+/** POST /api/reuse/worker/atelier-tasks/:id {status: "running", stage, progress} every 30 s, then {status: "done"|"failed", result}. */
+router.post('/api/reuse/worker/atelier-tasks/:id', guard('worker'), jsonReport, (req, res) => {
+  answer(res, reportFromWorkerAtelierTask(req.reuseCaller.name, req.params.id, req.body));
 });
 
 /** POST /api/reuse/worker/tests/:id/output?ext=png|glb - Raw file made by the test, header X-Sha256 (before the final report). */

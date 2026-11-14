@@ -1,18 +1,27 @@
 """Tests unitaires du worker RE-USE (fonctions pures). Lancé par tests/reuse-worker.test.js."""
 import array
+import atexit
 import importlib.util
 import io
 import json
 import math
 import os
 import re
+import shutil
 import struct
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
+
+# Un seul dossier temporaire par lancement, effacé à la sortie : chaque essai de pip pose 12 Mo, et /tmp est souvent un
+# tmpfs de quelques Go (3 600 dossiers oubliés l'ont rempli le 14/11)
+RUN_TMP = tempfile.mkdtemp(prefix='reuse-unit-')
+tempfile.tempdir = RUN_TMP
+atexit.register(shutil.rmtree, RUN_TMP, True)
 
 spec = importlib.util.spec_from_file_location('reuse_worker', Path(__file__).resolve().parent.parent / 'reuse-worker' / 'reuse_worker.py')
 w = importlib.util.module_from_spec(spec)
@@ -1060,6 +1069,573 @@ class ComfyBenchTest(unittest.TestCase):
         self.assertTrue(any('passage 2/2' in s for s in stages))
         self.assertTrue(any('Prompt executed' in l for l in report['log']))
         self.assertTrue(any(l == 'HIP_VISIBLE_DEVICES 1 TEMP %s' % lay['tmp'] for l in report['log']), report['log'][:5])
+
+
+FAKE_ATELIER = r'''
+import http.server, json, os, sys, time
+a = sys.argv[1:]
+opt = lambda k: a[a.index(k) + 1] if k in a else None
+base, port = opt('--base-directory'), int(opt('--port'))
+os.makedirs(base, exist_ok=True)
+with open(os.path.join(base, 'argv.jsonl'), 'a') as f:
+    f.write(json.dumps({'args': a, 'pid': os.getpid(), 'alloc': os.environ.get('PYTORCH_HIP_ALLOC_CONF'), 'temp': os.environ.get('TEMP')}) + '\n')
+held = {'mib': 9000}
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *x):
+        pass
+    def answer(self, code, body):
+        out = json.dumps(body).encode()
+        self.send_response(code); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(out)))
+        self.end_headers(); self.wfile.write(out)
+    def do_GET(self):
+        if self.path == '/queue':
+            busy = os.path.exists(os.path.join(base, 'busy'))
+            return self.answer(200, {'queue_running': [[1, 'p1', {}, {}, []]] if busy else [], 'queue_pending': []})
+        if self.path == '/system_stats':
+            return self.answer(200, {'devices': [{'vram_total': 16384 * 1048576, 'vram_free': (16384 - held['mib']) * 1048576,
+                                                  'torch_vram_total': held['mib'] * 1048576, 'torch_vram_free': 0}]})
+        return self.answer(404, {})
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
+        if self.path == '/free':
+            with open(os.path.join(base, 'free-calls'), 'a') as f:
+                f.write(json.dumps(body, sort_keys=True) + '\n')
+            held['mib'] = 300
+            self.send_response(200); self.send_header('Content-Length', '0'); self.end_headers()
+            return
+        return self.answer(404, {})
+time.sleep(0.3)
+print('Starting server', flush=True)
+http.server.ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
+'''
+
+
+def free_port():
+    import socket
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def alive(pid, settle=5.0):
+    """Vivant après settle secondes au plus (un processus tué met un instant à devenir zombie)."""
+    deadline = time.time() + settle
+    while True:
+        try:
+            up = Path('/proc/%d/stat' % pid).read_text().split(' ')[2] != 'Z'
+        except OSError:
+            up = False
+        if not up or time.time() > deadline:
+            return up
+        time.sleep(0.05)
+
+
+GOOD_RULES = [
+    {'name': 'ComfyUI atelier : poste client', 'action': 'Allow', 'direction': 'Inbound', 'enabled': 'True', 'remote': ['100.101.102.103']},
+    {'name': 'ComfyUI atelier : tout le reste', 'action': 'Block', 'direction': 'Inbound', 'enabled': 'True',
+     'remote': ['0.0.0.0-100.101.102.102', '100.101.102.104-126.255.255.255', '128.0.0.0-255.255.255.255']},
+]
+
+
+class AtelierNetTest(unittest.TestCase):
+    """Ce qui décide de l'écoute de l'atelier : adresse Tailscale, adresses refusées, sockets réelles, règles de pare-feu."""
+
+    def test_tailscale_address_is_taken_from_the_tailnet_only(self):
+        self.assertEqual(w.parse_tailscale_ip('100.101.102.103\n'), '100.101.102.103')
+        self.assertEqual(w.parse_tailscale_ip('192.168.1.20\n100.64.0.7\n'), '100.64.0.7')
+        self.assertIsNone(w.parse_tailscale_ip('192.168.1.20\n'))
+        self.assertIsNone(w.parse_tailscale_ip('100.128.0.1\n'), 'outside 100.64.0.0/10')
+        self.assertIsNone(w.parse_tailscale_ip('Tailscale is stopped.\n'))
+        self.assertIsNone(w.parse_tailscale_ip('fd7a:115c:a1e0::1\n'))
+
+    def test_listen_address_never_everything(self):
+        for bad in ('0.0.0.0', '::', '127.0.0.1', '255.255.255.255', '224.0.0.1', 'dev-box', '', '100.1.2.3,0.0.0.0'):
+            self.assertIsNone(w.listen_ip_ok(bad), bad)
+        self.assertEqual(w.listen_ip_ok(' 100.101.102.103 '), '100.101.102.103')
+
+    def test_command_line_from_the_catalog(self):
+        spec = w.comfy_spec()
+        at = spec['atelier']
+        args = w.atelier_args(spec, at, 8188, '127.0.0.1,100.101.102.103', '/x/data', '/x/extra.yaml', True)
+        self.assertEqual(args[args.index('--listen') + 1], '127.0.0.1,100.101.102.103')
+        self.assertEqual(args[args.index('--port') + 1], '8188')
+        self.assertEqual(args[args.index('--extra-model-paths-config') + 1], '/x/extra.yaml')
+        self.assertIn('--enable-manager', args)
+        for flag in ('--disable-all-custom-nodes', '--disable-api-nodes'):
+            self.assertNotIn(flag, args, 'the workshop allows custom nodes')
+        self.assertIn('--disable-comfy-compiler', args)
+        self.assertNotIn('--enable-manager', w.atelier_args(spec, at, 8188, '127.0.0.1', '/x', '/y', False))
+        for listen in ('0.0.0.0', '127.0.0.1,0.0.0.0', '127.0.0.1,::'):
+            with self.assertRaises(RuntimeError):
+                w.atelier_args(spec, at, 8188, listen, '/x', '/y', False)
+        self.assertEqual(at['env']['PYTORCH_HIP_ALLOC_CONF'], 'expandable_segments:True')
+        self.assertNotIn('HF_HUB_OFFLINE', at['env'], 'custom nodes may fetch their own files')
+
+    def test_netstat_rows_whatever_the_language(self):
+        text = '''
+Connexions actives
+
+  Proto  Adresse locale         Adresse distante       État
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1104
+  TCP    127.0.0.1:8188         0.0.0.0:0              ÉCOUTE          4242
+  TCP    100.101.102.50:8188    0.0.0.0:0              ÉCOUTE          4242
+  TCP    127.0.0.1:8188         127.0.0.1:50311        ESTABLISHED     4242
+  TCP    [::]:445               [::]:0                 LISTENING       4
+  UDP    0.0.0.0:5353           *:*                                    2200
+'''
+        self.assertEqual(w.parse_netstat(text), [('0.0.0.0', 135, 1104), ('127.0.0.1', 8188, 4242), ('100.101.102.50', 8188, 4242), ('::', 445, 4)])
+
+    def test_firewall_rules_must_allow_the_dev_pc_only_and_block_the_rest(self):
+        exe = '/x/atelier/python/python.exe'
+        rules = lambda rs: [dict(r, program=exe) for r in rs]
+        ok = w.atelier_firewall_check(rules(GOOD_RULES), exe)
+        self.assertEqual((ok['ok'], ok['allow_from']), (True, ['100.101.102.103']))
+        self.assertFalse(w.atelier_firewall_check([], exe)['ok'])
+        self.assertFalse(w.atelier_firewall_check(rules(GOOD_RULES[:1]), exe)['ok'], 'no block rule')
+        self.assertFalse(w.atelier_firewall_check([dict(r, program='/other/python.exe') for r in GOOD_RULES], exe)['ok'], 'another program')
+        self.assertFalse(w.atelier_firewall_check(rules([dict(GOOD_RULES[0], enabled='False'), GOOD_RULES[1]]), exe)['ok'])
+        anyone = w.atelier_firewall_check(rules([dict(GOOD_RULES[0], remote=['Any']), GOOD_RULES[1]]), exe)
+        self.assertFalse(anyone['ok'])
+        self.assertIn('toute adresse', anyone['problem'])
+        lan = w.atelier_firewall_check(rules([dict(GOOD_RULES[0], remote=['192.168.1.0/255.255.255.0']), GOOD_RULES[1]]), exe)
+        self.assertFalse(lan['ok'])
+        self.assertIn('hors du tailnet', lan['problem'])
+        two = w.atelier_firewall_check(rules([dict(GOOD_RULES[0], remote=['100.101.102.103', '100.64.0.9']), GOOD_RULES[1]]), exe)
+        self.assertFalse(two['ok'], 'one address only: the dev PC')
+        hole = w.atelier_firewall_check(rules([GOOD_RULES[0], dict(GOOD_RULES[1], remote=GOOD_RULES[1]['remote'][:2])]), exe)
+        self.assertFalse(hole['ok'])
+        self.assertIn('128.0.0.0', hole['problem'])
+        # Blocage de tout : le poste client serait bloqué aussi (un blocage l'emporte sur une autorisation)
+        everything = w.atelier_firewall_check(rules([GOOD_RULES[0], dict(GOOD_RULES[1], remote=['Any'])]), exe)
+        self.assertFalse(everything['ok'])
+        self.assertIn('poste client', everything['problem'])
+        cidr = w.atelier_firewall_check(rules([GOOD_RULES[0], dict(GOOD_RULES[1], remote=['0.0.0.0/2', '64.0.0.0/3', '96.0.0.0/6',
+                                                                                        '100.0.0.0-100.101.102.102', '100.101.102.104-126.255.255.255', '128.0.0.0/1'])]), exe)
+        self.assertTrue(cidr['ok'], cidr)
+
+
+class AtelierFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def test_clone_by_hard_links_keeps_both_sides_independent(self):
+        src = self.dir / 'jobs' / 'python'
+        (src / 'Lib' / 'site-packages' / 'torch').mkdir(parents=True)
+        (src / 'Lib' / 'site-packages' / 'torch' / '__init__.py').write_text('v1')
+        (src / 'python313._pth').write_text('python313.zip\n.\n..\\ComfyUI-0.45.0\nimport site\n')
+        (src / 'bin').mkdir()
+        os.symlink(sys.executable, src / 'bin' / 'python3')
+        dst = self.dir / 'atelier' / 'python'
+        linked, copied = w.link_tree(src, dst)
+        self.assertEqual((linked, copied), (1, 1))
+        a, b = src / 'Lib' / 'site-packages' / 'torch' / '__init__.py', dst / 'Lib' / 'site-packages' / 'torch' / '__init__.py'
+        self.assertEqual(a.stat().st_ino, b.stat().st_ino, 'no extra disk for torch')
+        self.assertNotEqual((src / 'python313._pth').stat().st_ino, (dst / 'python313._pth').stat().st_ino, '._pth copied, never linked')
+        self.assertEqual(os.readlink(dst / 'bin' / 'python3'), sys.executable)
+        # Ce que fait pip : nouveau fichier puis renommage ; la copie des travaux ne bouge pas
+        tmp = b.with_name('__init__.py.new')
+        tmp.write_text('v2')
+        os.replace(tmp, b)
+        self.assertEqual(a.read_text(), 'v1')
+        w.write_pth(dst, self.dir / 'atelier' / 'ComfyUI-0.45.0')
+        self.assertIn('..\\ComfyUI-0.45.0', (src / 'python313._pth').read_text())
+
+    def test_write_pth_never_writes_through_a_hard_link(self):
+        py = self.dir / 'py'
+        py.mkdir()
+        (py / 'python313._pth').write_text('python313.zip\n.\n')
+        os.link(py / 'python313._pth', self.dir / 'other._pth')
+        w.write_pth(py, self.dir / 'ComfyUI-0.45.0')
+        self.assertEqual((self.dir / 'other._pth').read_text(), 'python313.zip\n.\n')
+        self.assertIn('import site', (py / 'python313._pth').read_text())
+
+    def test_purge_by_age_then_by_size_oldest_first(self):
+        out, inp = self.dir / 'output', self.dir / 'input'
+        now = time.time()
+        made = {}
+        for i, (folder, days, size) in enumerate([(out, 10, 100), (out / 'sub', 3, 400), (inp, 2, 300), (out, 1, 200), (out, 0, 50)]):
+            folder.mkdir(parents=True, exist_ok=True)
+            p = folder / ('f%d.png' % i)
+            p.write_bytes(b'x' * size)
+            os.utime(p, (now - days * 86400, now - days * 86400))
+            made[i] = p
+        (out / '_output_images_will_be_put_here').write_text('')
+        (out / '.keep').write_text('x' * 5000)
+        removed, freed, left = w.purge_files([out, inp], 7, 600, now)
+        self.assertEqual((removed, freed, left), (2, 500, 550))   # 10 jours, puis les plus anciens tant qu'on dépasse 600 octets
+        self.assertEqual(sorted(p.name for p in made.values() if p.exists()), ['f2.png', 'f3.png', 'f4.png'])
+        self.assertFalse((out / 'sub').exists(), 'emptied subfolder removed')
+        self.assertTrue((out / '_output_images_will_be_put_here').exists() and (out / '.keep').exists())
+        self.assertTrue(out.exists() and inp.exists())
+
+    def test_shared_models_file(self):
+        models = self.dir / "C'est" / 'models'
+        for d in ('diffusion_models', 'vae', 'text_encoders'):
+            (models / d).mkdir(parents=True)
+        (models / 'readme.txt').write_text('x')
+        text = w.atelier_extra_paths(models)
+        self.assertIn("base_path: '%s'" % str(models).replace("'", "''"), text)
+        self.assertEqual(re.findall(r'^    (\w+): \1$', text, re.M), ['diffusion_models', 'text_encoders', 'vae'])
+        self.assertIn('reuse_jobs:', w.atelier_extra_paths(self.dir / 'missing'))
+
+
+class AtelierBase(unittest.TestCase):
+    """L'atelier mené par tick() contre un faux ComfyUI : environnement cloné de celui des travaux, lancé sur 127.0.0.1, puis
+    relancé sur l'adresse Tailscale quand le pare-feu est prêt (jamais pendant un calcul), carte rendue après l'inactivité,
+    repris après un redémarrage du worker, arrêté quand le hub l'éteint."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp())
+        (self.base / 'logs').mkdir()
+        self.port = free_port()
+        self.config = {'atelier_enabled': True, 'comfyui_any_os': True, 'atelier_port': self.port, 'gpu_keep_free_gb': 0}
+        self.gpu = w.Gpu(self.base, self.config, Path(w.__file__).resolve().parent)
+        self.spec = self.gpu.catalog['benchmarks']['comfyui']
+        jobs = w.comfy_layout(self.base, self.spec)
+        (jobs['python'] / 'bin').mkdir(parents=True)
+        os.symlink(sys.executable, jobs['python'] / 'bin' / 'python3')
+        (jobs['python'] / 'lib-marker.txt').write_text('torch')
+        for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+            (jobs['root'] / ('.ok-' + step)).write_text(w.comfy_marker(self.spec, step))
+        (jobs['data'] / 'models' / 'vae').mkdir(parents=True)
+        self.lay = w.atelier_layout(self.base, self.spec)
+        self.lay['src'].mkdir(parents=True)
+        (self.lay['src'] / 'main.py').write_text(FAKE_ATELIER)
+        self.saved = (w.tailscale_ip, w.read_firewall_rules)
+        self.ts = [None, 'tailscale pas prêt : Tailscale is stopped.']
+        self.rules = [None, 'pare-feu Windows absent ici']
+        w.tailscale_ip = lambda: tuple(self.ts)
+        w.read_firewall_rules = lambda: tuple(self.rules)
+        self.ateliers = []
+
+    def tearDown(self):
+        w.tailscale_ip, w.read_firewall_rules = self.saved
+        for a in self.ateliers:
+            a.shutdown('fin du test')
+
+    def atelier(self):
+        a = w.Atelier(self.base, self.config, Path(w.__file__).resolve().parent, self.gpu)
+        self.ateliers.append(a)
+        return a
+
+    def runs(self):
+        p = self.lay['data'] / 'argv.jsonl'
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+
+class AtelierLifeTest(AtelierBase):
+    def test_life(self):
+        a = self.atelier()
+        self.assertFalse(a.busy(), 'nothing running yet')
+        a.tick()
+        self.assertEqual(a.state, 'en marche', a.error)
+        first = self.runs()[-1]
+        self.assertEqual(first['args'][first['args'].index('--listen') + 1], '127.0.0.1', 'Tailscale not ready: local only')
+        self.assertEqual(first['alloc'], 'expandable_segments:True')
+        self.assertTrue(first['temp'].startswith(str(self.lay['root'])))
+        self.assertEqual(Path(first['args'][first['args'].index('--base-directory') + 1]), self.lay['data'])
+        self.assertTrue((self.lay['python'] / 'lib-marker.txt').exists(), 'environment cloned from the jobs one')
+        self.assertIn(str(self.lay['jobs']['data'] / 'models'), self.lay['extra'].read_text())
+        self.assertEqual(a.manager, 'absent de cette version de ComfyUI')
+        self.assertNotIn('--enable-cors-header', first['args'], 'no CORS by default: the page is served by the workshop itself')
+        self.assertEqual(a.describe()['files_gb'], 0.0, 'housekeeping ran')
+        d = a.describe()
+        self.assertEqual((d['state'], d['port'], d['listen'], d['busy']), ('en marche', self.port, '127.0.0.1', False))
+        self.assertIn('tailscale pas prêt', d['error'])
+        pid1 = a.pid
+        # Tailscale prêt mais pas de pare-feu : toujours local seulement, pas de relance
+        self.ts[:] = ['100.101.102.50', None]
+        a.ts['at'] = a.fw['at'] = 0
+        a.tick()
+        self.assertEqual((a.pid, a.listen), (pid1, '127.0.0.1'))
+        self.assertIn('pare-feu', a.describe()['firewall'])
+        # Pare-feu posé pendant un calcul : la relance attend la fin du calcul
+        self.rules[:] = [[dict(r, program=str(self.lay['exe'])) for r in GOOD_RULES], None]
+        (self.lay['data'] / 'busy').write_text('1')
+        a.fw['at'] = 0
+        a.tick()
+        self.assertTrue(a.busy())
+        self.assertEqual(a.pid, pid1, 'never restarted while Alice computes')
+        self.assertEqual(a.describe()['queue'], '1+0')
+        (self.lay['data'] / 'busy').unlink()
+        a.tick()
+        self.assertIsNone(a.pid, 'stopped to listen on the new address')
+        self.assertFalse(alive(pid1))
+        a.tick()
+        self.assertEqual(a.listen, '127.0.0.1,100.101.102.50')
+        last = self.runs()[-1]
+        self.assertEqual(last['args'][last['args'].index('--listen') + 1], '127.0.0.1,100.101.102.50')
+        self.assertEqual(a.describe()['firewall'], 'prêt')
+        self.assertEqual(a.describe()['allowed_from'], '100.101.102.103')
+        # Inactif : la carte est rendue une fois (POST /free), pas à chaque tour
+        self.config['atelier_idle_free_s'] = 0.2
+        freed = self.lay['data'] / 'free-calls'
+        for _ in range(50):   # machine chargée : quelques tours au plus
+            time.sleep(0.1)
+            a.tick()
+            if freed.exists():
+                break
+        a.tick()
+        calls = freed.read_text().splitlines()
+        self.assertEqual(calls, ['{"free_memory": true, "unload_models": true}'])
+        self.assertTrue(a.describe()['freed'])
+        # Avant un travail du hub : /free et attente de la mémoire rendue
+        self.assertEqual(a.free('travail image 1 du hub'), 300)
+        # Le worker redémarre (mise à jour) : l'atelier continue, le nouveau worker le reprend
+        pid2 = a.pid
+        b = self.atelier()
+        b.tick()
+        self.assertEqual((b.pid, b.state, b.listen), (pid2, 'en marche', '127.0.0.1,100.101.102.50'))
+        self.assertTrue(w.pid_alive(pid2) and b.running())
+        self.assertFalse(w.pid_alive(2 ** 22 + 7))
+        self.assertEqual(len(self.runs()), 2, 'not relaunched')
+        (self.lay['data'] / 'busy').write_text('1')
+        b.tick()
+        self.assertTrue(b.busy(live=True))
+        (self.lay['data'] / 'busy').unlink()
+        # Créneau seulement : hors créneau, arrêté ; éteint depuis le hub : arrêté et rien ne repart
+        self.config['atelier_window_only'] = True
+        b.in_window = False
+        b.tick()
+        self.assertFalse(alive(pid2))
+        self.assertEqual(b.state, 'éteint')
+        b.in_window = True
+        b.tick()
+        self.assertEqual(b.state, 'en marche')
+        pid3 = b.pid
+        self.config['atelier_enabled'] = False
+        b.tick()
+        self.assertFalse(alive(pid3))
+        self.assertFalse(self.lay['state'].exists())
+        b.tick()
+        self.assertEqual(len(self.runs()), 3, "nothing started again once switched off")
+        self.assertEqual(b.describe()['state'], 'éteint')
+
+    def test_port_taken_and_crash_are_retried_later(self):
+        import socket
+        s = socket.socket()
+        s.bind(('127.0.0.1', self.port))
+        s.listen(1)
+        a = self.atelier()
+        try:
+            a.tick()
+            self.assertEqual(a.state, 'en échec')
+            self.assertIn('port %d déjà pris' % self.port, a.error)
+            a.tick()
+            self.assertEqual(a.failures, 1, 'waits before the next try')
+        finally:
+            s.close()
+        a.next_try = 0
+        a.tick()
+        self.assertEqual(a.state, 'en marche')
+        os.kill(a.pid, 9)
+        a.proc.wait()
+        a.tick()
+        self.assertEqual(a.state, 'en échec')
+        self.assertIn('arrêté de lui-même', a.error)
+        a.next_try = 0
+        a.tick()
+        self.assertEqual(a.state, 'en marche')
+
+    def test_cors_only_for_one_precise_origin(self):
+        self.config['atelier_cors_origin'] = '*'
+        a = self.atelier()
+        a.tick()
+        self.assertNotIn('--enable-cors-header', self.runs()[-1]['args'])
+        a.stop('suite')
+        self.config['atelier_cors_origin'] = 'http://100.101.102.103:3000'
+        a.tick()
+        args = self.runs()[-1]['args']
+        self.assertEqual(args[args.index('--enable-cors-header') + 1], 'http://100.101.102.103:3000')
+
+    def test_jobs_environment_missing(self):
+        (self.lay['jobs']['root'] / '.ok-torch').unlink()
+        a = self.atelier()
+        a.tick()
+        self.assertEqual(a.state, 'en échec')
+        self.assertIn('essai comfyui', a.error)
+        self.assertEqual(self.runs(), [])
+
+    def test_manager_installed_with_torch_pinned_then_skipped(self):
+        (self.lay['src'] / 'manager_requirements.txt').write_text('comfyui_manager==4.2.2\n')
+        calls = []
+        saved = w.run_logged
+        w.run_logged = lambda args, *x, **k: calls.append([str(v) for v in args]) or ''
+        try:
+            a = self.atelier()
+            a.tick()
+            a.stop('suite du test')
+            a.tick()
+        finally:
+            w.run_logged = saved
+        self.assertEqual(len(calls), 1, 'installed once')
+        self.assertEqual(calls[0][1:6], ['-s', '-m', 'pip', 'install', '--no-warn-script-location'])
+        self.assertIn('torch==2.13.0+rocm10.0.0', (self.lay['root'] / 'constraints.txt').read_text())
+        self.assertTrue(a.manager is True)
+        self.assertIn('--enable-manager', self.runs()[-1]['args'])
+
+
+class AtelierTaskTest(AtelierBase):
+    """Tâches du hub sur l'atelier : rien n'est effacé (corbeille), tout se défait, pip garde torch et dit ce qu'il a changé."""
+    COMMIT = 'a' * 40
+
+    def setUp(self):
+        super().setUp()
+        self.saved_tasks = (w.fetch_file, w.run_logged)
+        self.pip_calls, self.freeze = [], [['numpy==2.1.0', 'torch==2.13.0+rocm10.0.0']]
+        self.pip_fails = False
+
+        def fake_fetch(url, dest, stop=None, timeout=120):
+            self.fetched = url
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(dest, 'w') as z:
+                top = 'Pack-%s/' % self.COMMIT
+                z.writestr(top + '__init__.py', 'NODE_CLASS_MAPPINGS = {}  # v%d\n' % len(self.pip_calls))
+                z.writestr(top + 'requirements.txt', 'opencv-python-headless\n')
+                z.writestr(top + 'install.py', 'raise SystemExit("never run")\n')
+            return 'f' * 64
+
+        def fake_run(args, *a, **k):
+            args = [str(x) for x in args]
+            if 'freeze' in args:
+                return '\n'.join(self.freeze[-1]) + '\n'
+            self.pip_calls.append(args)
+            if self.pip_fails:
+                raise RuntimeError('pip a échoué (code 1)')
+            self.freeze.append(self.freeze[-1] + ['opencv-python-headless==4.11.0'])
+            return ''
+        w.fetch_file, w.run_logged = fake_fetch, fake_run
+
+    def tearDown(self):
+        w.fetch_file, w.run_logged = self.saved_tasks
+        super().tearDown()
+
+    def test_rules_shared_with_the_hub(self):
+        ok = w.check_atelier_task('install_nodes', {'url': 'https://github.com/OliverCrosby/ComfyUI-Universal-Seamless-Tiles.git', 'commit': self.COMMIT})
+        self.assertEqual((ok['name'], ok['owner'], ok['pip']), ('ComfyUI-Universal-Seamless-Tiles', 'OliverCrosby', True))
+        for bad in ({'url': 'https://gitlab.com/a/b', 'commit': self.COMMIT}, {'url': 'https://github.com/a/b', 'commit': 'main'},
+                    {'url': 'https://github.com/a/b', 'commit': self.COMMIT, 'name': '../x'}):
+            with self.assertRaises(ValueError):
+                w.check_atelier_task('install_nodes', bad)
+        m = w.check_atelier_task('download_model', {'url': 'https://huggingface.co/x/y/resolve/0123/4x-Ultra%20Sharp.pth?download=true',
+                                                    'sha256': 'b' * 64, 'folder': 'upscale_models'})
+        self.assertEqual(m['name'], '4x-Ultra Sharp.pth')
+        for bad in ({'url': 'http://x/a.safetensors', 'sha256': 'b' * 64, 'folder': 'loras'},
+                    {'url': 'https://x/a.exe', 'sha256': 'b' * 64, 'folder': 'loras'},
+                    {'url': 'https://x/a.safetensors', 'sha256': 'b' * 64, 'folder': '../custom_nodes'},
+                    {'url': 'https://x/a.safetensors', 'sha256': 'B' * 64, 'folder': 'loras'},
+                    {'url': 'https://x/a.safetensors', 'sha256': 'b' * 64, 'folder': 'loras', 'size': True}):
+            with self.assertRaises(ValueError):
+                w.check_atelier_task('download_model', bad)
+        self.assertEqual(w.check_atelier_task('download_model', {'url': 'https://x/a.safetensors', 'sha256': 'b' * 64, 'folder': 'loras/style'})['folder'], 'loras/style')
+        with self.assertRaises(ValueError):
+            w.check_atelier_task('format_disk', {})
+
+    def test_node_pack_install_replace_undo_and_pip_failure(self):
+        a = self.atelier()
+        a.tick()
+        self.assertEqual(a.state, 'en marche')
+        pid = a.pid
+        reports = []
+        post = lambda tid, body: reports.append((tid, body)) or {'ok': True}
+        a.submit({'id': 11, 'action': 'install_nodes', 'params': {'url': 'https://github.com/lonecatone23/ComfyUI_LC_MaskMaker_nodes', 'commit': self.COMMIT}}, post)
+        a.task_thread.join(30)
+        final = reports[-1][1]
+        self.assertEqual(final['status'], 'done', final)
+        r = final['result']
+        dest = self.lay['data'] / 'custom_nodes' / 'ComfyUI_LC_MaskMaker_nodes'
+        self.assertEqual(self.fetched, 'https://github.com/lonecatone23/ComfyUI_LC_MaskMaker_nodes/archive/%s.zip' % self.COMMIT)
+        self.assertTrue((dest / '__init__.py').exists())
+        self.assertEqual(json.loads((dest / '.atelier-pack.json').read_text())['commit'], self.COMMIT)
+        self.assertEqual(r['pip'], {'added': ['opencv-python-headless==4.11.0'], 'removed': []})
+        self.assertIn('non exécuté', r['install_py'])
+        self.assertEqual(self.pip_calls[0][-2:], ['-c', str(self.lay['root'] / 'constraints.txt')])
+        self.assertIn('torch==2.13.0+rocm10.0.0', (self.lay['root'] / 'constraints.txt').read_text())
+        self.assertEqual(reports[0][1]['status'], 'running')
+        # Relance pour charger le pack : pas pendant un calcul
+        (self.lay['data'] / 'busy').write_text('1')
+        a.tick()
+        self.assertEqual(a.pid, pid)
+        (self.lay['data'] / 'busy').unlink()
+        a.tick()
+        self.assertIsNone(a.pid)
+        a.tick()
+        self.assertEqual(a.state, 'en marche')
+        # Même pack, nouvelle version : l'ancienne part à la corbeille ; undo la remet
+        a.submit({'id': 12, 'action': 'install_nodes', 'params': {'url': 'https://github.com/lonecatone23/ComfyUI_LC_MaskMaker_nodes', 'commit': self.COMMIT}}, post)
+        a.task_thread.join(30)
+        self.assertIn('v1', (dest / '__init__.py').read_text())
+        self.assertTrue(Path(reports[-1][1]['result']['replaced']).exists())
+        a.submit({'id': 13, 'action': 'undo', 'params': {'task': 12}}, post)
+        a.task_thread.join(30)
+        self.assertEqual(reports[-1][1]['status'], 'done', reports[-1])
+        self.assertIn('v0', (dest / '__init__.py').read_text())
+        self.assertIn('pip_not_undone', reports[-1][1]['result'])
+        a.submit({'id': 14, 'action': 'undo', 'params': {'task': 12}}, post)
+        a.task_thread.join(30)
+        self.assertIn('déjà défaite', reports[-1][1]['result']['error'])
+        a.submit({'id': 14, 'action': 'undo', 'params': {'task': 12}}, post)
+        self.assertFalse(a.task_thread.is_alive() and False)
+        self.assertEqual([t for t, _ in reports].count(14), 2, 'a task already seen is not run again')
+        # pip refuse : pas de pack à moitié installé, l'ancien revient
+        self.pip_fails = True
+        a.submit({'id': 15, 'action': 'install_nodes', 'params': {'url': 'https://github.com/lonecatone23/ComfyUI_LC_MaskMaker_nodes', 'commit': self.COMMIT}}, post)
+        a.task_thread.join(30)
+        self.assertEqual(reports[-1][1]['status'], 'failed')
+        self.assertIn('pack retiré', reports[-1][1]['result']['error'])
+        self.assertIn('v0', (dest / '__init__.py').read_text())
+        # Retrait puis undo
+        a.submit({'id': 16, 'action': 'remove_nodes', 'params': {'name': 'ComfyUI_LC_MaskMaker_nodes'}}, post)
+        a.task_thread.join(30)
+        self.assertFalse(dest.exists())
+        a.submit({'id': 17, 'action': 'undo', 'params': {'task': 16}}, post)
+        a.task_thread.join(30)
+        self.assertTrue((dest / '__init__.py').exists())
+        self.assertEqual(a.describe()['task'], '17 undo ok')
+        self.assertTrue(all(d.parent.name == 'trash' and re.fullmatch(r'\d{8}', d.name) for d in (self.lay['root'] / 'trash').iterdir()))
+
+    def test_model_download_checked_then_removed_and_restored(self):
+        a = self.atelier()
+        src = self.base / 'store' / 'lora.safetensors'
+        src.parent.mkdir()
+        src.write_bytes(b'lora weights ' * 100)
+        digest = w.sha256_file(src)
+        p = {'url': src.as_uri(), 'sha256': digest, 'folder': 'loras', 'name': 'lora.safetensors', 'size': src.stat().st_size}
+        out = a.task_download_model(21, p, None, lambda *x: None)
+        dest = self.lay['data'] / 'models' / 'loras' / 'lora.safetensors'
+        self.assertEqual((Path(out['path']), out['sha256']), (dest, digest))
+        self.assertEqual(a.task_download_model(22, p, None, lambda *x: None)['note'], 'déjà présent, identique')
+        with self.assertRaises(RuntimeError):
+            a.task_download_model(23, dict(p, sha256='0' * 64), None, lambda *x: None)
+        self.assertEqual(dest.read_bytes(), src.read_bytes(), 'a bad download leaves the previous file in place')
+        a.task_remove_model(24, {'folder': 'loras', 'name': 'lora.safetensors'}, None, None)
+        self.assertFalse(dest.exists())
+        a.task_undo(25, {'task': 24}, None, None)
+        self.assertEqual(w.sha256_file(dest), digest)
+        self.assertTrue(Path(str(dest) + '.ok').exists(), 'checked once, not hashed again')
+        a.task_undo(26, {'task': 21}, None, None)
+        self.assertFalse(dest.exists(), 'undo of the download: file to the trash')
+        with self.assertRaises(RuntimeError):
+            a.task_remove_model(27, {'folder': 'loras', 'name': 'lora.safetensors'}, None, None)
+
+    def test_old_trash_is_purged(self):
+        a = self.atelier()
+        old = self.lay['root'] / 'trash' / '20200101'
+        old.mkdir(parents=True)
+        (old / 'x.safetensors.retire1').write_text('x')
+        recent = self.lay['root'] / 'trash' / time.strftime('%Y%m%d')
+        recent.mkdir()
+        a.purge(time.time())
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
+    def test_never_fast_nor_miopen(self):
+        at = w.comfy_spec()['atelier']
+        flat = json.dumps(at)
+        self.assertNotIn('--fast', flat)
+        self.assertNotIn('COMFYUI_ENABLE_MIOPEN', flat)
 
 
 if __name__ == '__main__':

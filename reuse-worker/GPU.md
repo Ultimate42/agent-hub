@@ -166,8 +166,8 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   - `models\` : les poids ;
   - `logs\` : la dernière sortie de chaque moteur.
 - Rien dans le registre ni dans Program Files. Aucun service, aucun pilote, pas de Python en plus (sauf le banc
-  ComfyUI, sous `gpu\comfyui`). Le Python portable du worker suffit. Le calcul passe par le pilote graphique déjà
-  installé (Vulkan).
+  ComfyUI, sous `gpu\comfyui`, et l'atelier sous `atelier\`, cloné par liens physiques). Le Python portable du worker
+  suffit. Le calcul passe par le pilote graphique déjà installé (Vulkan).
 - L'installation est paresseuse : rien n'est téléchargé avant le premier travail du type. Un fichier vérifié
   porte un témoin `.ok`, il n'est donc pas re-haché à chaque travail. Un téléchargement coupé reprend où il en
   était.
@@ -321,7 +321,9 @@ Ce que fait un essai :
 Réglages que le hub peut poser, et aucun autre :
 - `enable_3d` (vrai ou faux) ;
 - `gpu_max_gb` (5 à 200) ;
-- `gpu_keep_loaded_s` (0 à 7200).
+- `gpu_keep_loaded_s` (0 à 7200) ;
+- atelier ComfyUI (section plus bas) : `atelier_enabled`, `atelier_window_only` (vrai ou faux), `atelier_idle_free_s`
+  (0 à 86400), `atelier_keep_days` (0,5 à 365), `atelier_files_max_gb` (1 à 500).
 
 Ils sont envoyés à chaque échange. Le worker les pose sur sa config en mémoire, sans réécrire le fichier du PC.
 
@@ -361,6 +363,195 @@ de pip, les caches MIOpen, Hugging Face et torch (variables d'environnement), et
 
 Pour tout retirer : essai `comfyui_remove`, ou supprimer le dossier `gpu\comfyui`.
 
+## Atelier ComfyUI : Alice et les agents du poste client
+
+Un second ComfyUI sur gpu-box, pour s'en servir à la main (navigateur) ou par l'API (agents du poste client).
+- Il tourne en serveur, sans aucune fenêtre, lancé et surveillé par le worker.
+- Seuls deux PC peuvent l'atteindre : le PC GPU lui-même et le poste client, par Tailscale.
+
+Il est séparé du ComfyUI des travaux du hub, qui reste sans nœuds additionnels.
+
+**Ce qu'il est**
+- Dossier `C:\reuse-worker\atelier\` : hors de `gpu\`, il ne compte donc pas dans `gpu_max_gb`.
+  - `python\` est un clone de l'environnement des travaux par liens physiques : 0 octet de plus pour PyTorch ROCm. pip
+    remplace un fichier au lieu de l'écrire en place, donc un paquet ajouté à l'atelier ne touche pas les travaux.
+  - `ComfyUI-0.45.0\` vient de la même archive épinglée.
+  - `data\` contient `custom_nodes`, `models`, `input`, `output` et `user`.
+  - `logs\atelier.log`.
+- Nœuds additionnels permis, ComfyUI-Manager installé (`comfyui_manager==4.2.2`, épinglé par ComfyUI) et lancé avec
+  `--enable-manager`.
+- Modèles des travaux partagés en lecture (`extra_model_paths.yaml`, réécrit à chaque démarrage). Les modèles de
+  l'atelier vont dans `atelier\data\models`.
+- Port fixe 8188.
+- Écoute sur `127.0.0.1`, plus l'adresse Tailscale du PC (`tailscale ip -4`), jamais `0.0.0.0`.
+  - L'adresse Tailscale n'est ajoutée que si les règles de pare-feu ci-dessous sont en place : sans elles, Windows
+    ouvrirait sa fenêtre « autoriser l'accès ».
+  - Tailscale pas prêt au démarrage, adresse changée, pare-feu posé ensuite : le worker regarde toutes les 2 minutes et
+    relance l'atelier sur la bonne adresse, jamais pendant un calcul.
+  - Une écoute sur toutes les adresses vue par netstat arrête l'atelier.
+- Options :
+  - catalogue (`benchmarks.comfyui.atelier`) : `--use-quad-cross-attention`, `--disable-pinned-memory`,
+    `--disable-comfy-compiler`, `--preview-method auto`, allocateur extensible (mesures Klein du 14/11) ;
+  - jamais `--fast` ni `COMFYUI_ENABLE_MIOPEN`.
+- Survit à une mise à jour du worker : le nouveau worker reprend le processus en marche, et le travail en cours n'est pas
+  coupé. Le fichier `STOP` l'arrête avec le worker.
+
+**Partage de la carte (16 Go) : un seul calcul à la fois, l'atelier d'abord**
+- Le worker lit la file de l'atelier (`/queue`) toutes les 3 s. Tant qu'elle n'est pas vide :
+  - il ne prend aucun travail du hub, ni GPU ni RE-USE ;
+  - il arrête les moteurs résidents des travaux ;
+  - un essai à distance attend.
+- Avant chaque travail GPU du hub, il envoie `POST /free` à l'atelier et attend que sa mémoire retombe.
+- Un travail GPU en cours quand l'atelier se met à calculer est arrêté et rendu à la file sans compter l'essai
+  (`release`). Il reprend quand l'atelier a fini.
+- Après 10 minutes sans calcul, l'atelier rend sa mémoire vidéo (`/free`) sans s'arrêter.
+- Le créneau des agents est inchangé. L'atelier reste allumé hors créneau, sauf si `atelier_window_only` est vrai.
+- Conséquence : des agents qui envoient des graphes sans arrêt bloquent les travaux du hub tout ce temps (voulu).
+
+**Allumer, éteindre, voir l'état** (jeton admin RE-USE)
+```bash
+H=https://hub.example.com/api/reuse/workers/gpu-box; A="Authorization: Bearer $HUB_REUSE_ADMIN_TOKEN"; J='Content-Type: application/json'
+curl -H "$A" -H "$J" -d '{"on":true}' $H/atelier    # ou {"on":false} ; journalisé comme tout réglage
+curl -H "$A" $H/atelier
+```
+- La réponse donne `state` (en marche, préparation, en échec, éteint), `listen` (demandé) et `listening` (vu par netstat
+  sur le PC).
+- Elle donne aussi :
+  - `firewall` (prêt, ou ce qui manque) et `allowed_from` (l'adresse autorisée) ;
+  - `busy`, `queue` (en cours + en attente) ;
+  - `vram_free_mib`, `vram_atelier_mib` ;
+  - `manager`, `files_gb`, `error`.
+- Délai : l'ordre est pris au prochain échange du worker, et l'état revient à l'échange suivant (une minute au plus).
+- La première mise en marche clone l'environnement, en quelques minutes. Il faut que le ComfyUI des travaux soit installé
+  (essai `comfyui`).
+
+Réglages (`POST $H/settings`, `null` remet la valeur du PC) :
+- `atelier_enabled` ;
+- `atelier_window_only` (faux) ;
+- `atelier_idle_free_s` (600, 0 = jamais) ;
+- `atelier_keep_days` (7) et `atelier_files_max_gb` (20) : ménage des sorties (`output`) et des images envoyées
+  (`input`), au-delà de 7 jours puis les plus anciennes tant que le total dépasse 20 Go. Toutes les 10 minutes et à
+  chaque démarrage.
+
+Seulement dans `reuse-worker.config.json` du PC :
+- `atelier_port` ;
+- `atelier_listen_ip` (adresse imposée, jamais 0.0.0.0) ;
+- `atelier_require_firewall: false` (à éviter) ;
+- `atelier_manager: false` ;
+- `atelier_cors_origin`.
+
+**Pare-feu : la commande à coller une fois sur le PC GPU** (PowerShell en administrateur)
+```powershell
+$DevPc = 'desktop-example'   # nom Tailscale du poste client (Windows : DESKTOP-EXAMPLE) ou son IP 100.x.y.z
+$Py = 'C:\reuse-worker\atelier\python\python.exe'
+$ts = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source; if (-not $ts) { $ts = "$env:ProgramFiles\Tailscale\tailscale.exe" }
+$Dev = if ($DevPc -match '^\d+(\.\d+){3}$') { $DevPc } else { & $ts ip -4 $DevPc 2>$null | Select-Object -First 1 }
+if ("$Dev" -notmatch '^100\.') { & $ts status; throw "IP Tailscale du poste client introuvable pour '$DevPc' : mettre dans `$DevPc son nom ou son IP (liste ci-dessus)" }
+if (-not (Test-Path $Py)) { Write-Warning "$Py absent : allumer l'atelier une fois (les regles valent quand meme)" }
+function ToInt($ip) { $b = ([ipaddress]$ip).GetAddressBytes(); [array]::Reverse($b); [BitConverter]::ToUInt32($b, 0) }
+function ToIp([uint32]$n) { $b = [BitConverter]::GetBytes($n); [array]::Reverse($b); ([ipaddress]::new([byte[]]$b)).ToString() }
+$n = ToInt $Dev
+$rest = @("0.0.0.0-$(ToIp ($n - 1))", "$(ToIp ($n + 1))-126.255.255.255", '128.0.0.0-255.255.255.255')
+Get-NetFirewallRule -Group 'ComfyUI atelier' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+New-NetFirewallRule -Group 'ComfyUI atelier' -DisplayName 'ComfyUI atelier : poste client' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8188 -RemoteAddress $Dev -Program $Py -Profile Any | Out-Null
+New-NetFirewallRule -Group 'ComfyUI atelier' -DisplayName 'ComfyUI atelier : tout le reste' -Direction Inbound -Action Block -RemoteAddress $rest -Program $Py -Profile Any | Out-Null
+Get-NetFirewallRule -Group 'ComfyUI atelier' | Format-Table DisplayName, Action, Enabled -AutoSize
+"poste client autorise : $Dev. L'atelier passe sur Tailscale dans les 2 minutes (s'il ne calcule pas)."
+```
+- Deux règles pour le seul Python de l'atelier :
+  - une autorisation : TCP 8188 depuis l'IP Tailscale du poste client ;
+  - un blocage : tout le reste de l'IPv4, sur tous les ports, boucle locale mise à part.
+- Un blocage l'emporte sur toute autorisation, même une règle posée plus tard. Un nœud additionnel qui ouvrirait son
+  propre port reste donc fermé aux autres appareils du réseau local et du tailnet.
+- La commande peut être recollée : elle remplace les deux règles.
+- Le worker lit ces règles sans droits administrateur, toutes les 2 minutes tant qu'elles manquent, puis toutes les
+  10 minutes. Il refuse une autorisation « Any », hors tailnet ou à plusieurs adresses, ainsi qu'un blocage qui laisse un
+  trou ou qui couvre aussi le poste client.
+
+**Vérifier que seul le poste client y accède**
+1. Hub : `curl -H "$A" $H/atelier`. Il faut `listening` = `["127.0.0.1:8188", "100.x.y.z:8188"]` (ni `0.0.0.0` ni
+   `::`), `firewall: "prêt"` et `allowed_from` = l'IP du poste client.
+2. poste client : `curl.exe -s http://100.x.y.z:8188/system_stats` répond, et le navigateur ouvre `http://100.x.y.z:8188`.
+3. Un autre appareil (téléphone sur le tailnet, autre PC du réseau local, sur l'IP Tailscale ou l'IP locale du PC GPU) :
+   délai dépassé.
+   - `Test-NetConnection 100.x.y.z -Port 8188` donne `TcpTestSucceeded : False`.
+4. PC GPU, si besoin : `netstat -ano | findstr :8188`.
+
+**API pour les agents du poste client**
+- C'est l'API native complète de ComfyUI : `/prompt`, `/queue`, `/history/{id}`, `/view`, `/upload/image`, `/object_info`,
+  `/models`, `/models/{dossier}`, `/system_stats`, `/free`, `/interrupt`, `/ws`.
+- Pas de jeton : l'accès est fermé par le réseau (Tailscale et pare-feu).
+- CORS n'est pas utile :
+  - ni pour curl ou Python ;
+  - ni pour l'interface, servie par l'atelier lui-même.
+  Seule une page web d'une autre origine en aurait besoin : `atelier_cors_origin` dans la config du PC, une origine
+  précise, jamais `*`.
+
+Client prêt à l'emploi, bibliothèque standard seulement : `scripts/comfy-atelier.py`.
+```bash
+set COMFY_ATELIER=http://100.x.y.z:8188
+python comfy-atelier.py status                       # carte, mémoire, file
+python comfy-atelier.py models loras                 # fichiers d'un dossier de modèles
+python comfy-atelier.py nodes KSampler               # définition d'un nœud (/object_info)
+python comfy-atelier.py run graphe_api.json --image 12=photo.png --set 6.text="a red mug on oak" --set 3.seed=42 --out sorties
+```
+`run` :
+1. envoie `photo.png` (`/upload/image`, sous-dossier `agents`) et pose son nom dans `inputs.image` du nœud 12 ;
+2. remplace les valeurs `--set` ;
+3. poste le graphe (`/prompt`) et suit `/history/{id}` ;
+4. télécharge chaque fichier produit (`/view`) ;
+5. écrit un résumé JSON : `ok`, `prompt_id`, `seconds`, `files` (ou `error`, le refus de `/prompt` avec ses `node_errors`).
+
+Code de sortie : 0 réussi, 1 refusé ou raté, 2 délai dépassé. Le graphe doit être au format API (Workflow, puis
+Export (API)).
+
+Le même appel sans le client :
+```bash
+U=http://100.x.y.z:8188
+curl -s -F image=@photo.png -F subfolder=agents -F overwrite=true $U/upload/image   # {"name":"photo.png","subfolder":"agents","type":"input"}
+jq '."12".inputs.image="agents/photo.png" | ."6".inputs.text="a red mug on oak"' graphe_api.json \
+  | jq '{prompt: ., client_id: "agent-42"}' | curl -s -H 'Content-Type: application/json' -d @- $U/prompt   # {"prompt_id":"…"}
+curl -s $U/history/<prompt_id>   # vide tant que ça calcule ; puis outputs.<nœud>.images[] = {filename, subfolder, type}
+curl -s -o out.png "$U/view?filename=ComfyUI_00001_.png&subfolder=&type=output"
+```
+
+**Nœuds additionnels et modèles, depuis le hub** (jeton admin)
+- Chaque tâche est journalisée dans `history` des réglages, réversible, et exécutée par le worker dans un fil à part,
+  même hors créneau.
+- Rien n'est effacé : ce qu'une tâche remplace ou retire part dans `atelier\trash\<jour>\` pour 30 jours.
+```bash
+T=$H/atelier/tasks
+# pack de nœuds : archive GitHub de ce commit exact, requirements.txt dans le Python de l'atelier (torch épinglé)
+curl -H "$A" -H "$J" -d '{"action":"install_nodes","url":"https://github.com/OliverCrosby/ComfyUI-Universal-Seamless-Tiles","commit":"<40 caractères>"}' $T
+# modèle : téléchargement repris en cas de coupure, empreinte vérifiée avant de le poser (size facultatif)
+curl -H "$A" -H "$J" -d '{"action":"download_model","url":"https://huggingface.co/<dépôt>/resolve/<commit>/x.safetensors","sha256":"<64>","folder":"loras"}' $T
+curl -H "$A" -H "$J" -d '{"action":"remove_nodes","name":"ComfyUI-Universal-Seamless-Tiles"}' $T
+curl -H "$A" -H "$J" -d '{"action":"remove_model","folder":"loras","name":"x.safetensors"}' $T
+curl -H "$A" -H "$J" -d '{"action":"undo","task":12}' $T      # défait la tâche 12
+curl -H "$A" $T ; curl -H "$A" $T/12 ; curl -H "$A" -X POST $T/12/cancel
+```
+- `install_nodes` :
+  - le résultat donne `archive_sha256`, et `pip` : paquets ajoutés et retirés, d'après `pip freeze` avant et après,
+    gardé dans `atelier\journal\` ;
+  - `install.py` n'est jamais exécuté (signalé) ;
+  - si pip échoue, le pack est retiré et l'ancienne version remise ;
+  - l'atelier est relancé pour charger le pack, dès qu'il ne calcule plus.
+- `undo` ne défait pas les paquets pip, partagés entre packs : l'état d'avant est dans le journal.
+- `folder` :
+  - un dossier de modèles ComfyUI (`loras`, `upscale_models`, `model_patches`, `checkpoints`, `controlnet`…), avec un
+    sous-dossier facultatif ;
+  - extensions acceptées : safetensors, sft, gguf, pt, pth, bin, ckpt, onnx.
+- Seuls les dépôts GitHub sont acceptés pour les packs, au commit complet. Le hub et le worker vérifient les mêmes règles.
+
+**Ce qui reste supposé (pas encore vu sur gpu-box)**
+- Une session Task Scheduler laisse vivre un processus enfant après la sortie du worker. C'est ce qui permet la reprise
+  après une mise à jour. Sinon, l'atelier est simplement relancé.
+- `Get-NetFirewallRule` est lisible sans droits administrateur.
+- Les liens physiques fonctionnent sur ce disque NTFS. Sinon, l'environnement est copié, avec 5,5 Go et un contrôle de
+  place.
+- ComfyUI-Manager accepte des installations quand l'écoute n'est pas seulement locale. Sinon, son niveau de sécurité est
+  à régler dans `atelier\data\user\__manager\config.ini`. Les tâches du hub, elles, ne passent pas par lui.
+
 ## Côté hub
 
 - **Activation** : les générations sont actives quand la file RE-USE l'est (`HUB_REUSE_*`) et que
@@ -389,6 +580,10 @@ Pour tout retirer : essai `comfyui_remove`, ou supprimer le dossier `gpu\comfyui
   Une machine qui n'annonce rien (ancienne version du worker) ne reçoit jamais de travail GPU.
 - **Pilotage à distance** : réglages et essais GPU d'une machine (voir plus haut). Tables `reuse_worker_settings`,
   `reuse_worker_events` (journal), `reuse_worker_tests` ; route du worker `POST /api/reuse/worker/tests/:id`.
+- **Atelier** : état dans `info.atelier` de chaque échange. Tâches dans la table `reuse_atelier_tasks`, données dans
+  `orders.atelier_task` seulement à une version qui annonce l'action (`info.atelier.tasks`), rapport sur
+  `POST /api/reuse/worker/atelier-tasks/:id`. `orders.in_window` sert à `atelier_window_only`.
+- **Travail rendu sans essai compté** : `POST /api/gpu/jobs/:id/fail {"release": true}` (l'atelier a pris la carte).
 - **Contrôle des résultats** : le hub vérifie ce qu'il reçoit. Une image doit être un PNG de la taille demandée,
   un modèle 3D un GLB 2.0 dont l'en-tête annonce la bonne longueur. Sinon il répond 422, l'essai compte, et après
   deux essais le travail passe en échec.

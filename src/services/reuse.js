@@ -12,6 +12,7 @@ import {
   workerSettings, patchWorkerSettings, workerEvents, pendingTest, createTest, listTests, getTest, cancelTest, reportTest,
   noteTestOutput, testOutput, TEST_OUTPUT_EXT
 } from './worker-control.js';
+import { pendingAtelierTask, createAtelierTask, listAtelierTasks, getAtelierTask, cancelAtelierTask, reportAtelierTask } from './atelier-tasks.js';
 
 // ---------------------------------------------------------------------------
 // RE-USE cleaning queue (speech enhancement done by remote GPU workers)
@@ -331,8 +332,33 @@ export function workerOrders(name, now = Date.now()) {
     update: w?.update_requested || 0,
     worker_version: workerManifest().version,
     settings: workerSettings(name),
+    in_window: workerInWindow(name, now),   // read by the ComfyUI workshop when atelier_window_only is set
+    // A workshop task (nodes, model file), any time of day, only to a worker that says it runs that action
+    atelier_task: announcedAtelierTask(w, name, now),
     gpu_test: !paused && workerInWindow(name, now) ? pendingTest(name, now) : null
   };
+}
+
+function announcedAtelierTask(w, name, now) {
+  const t = pendingAtelierTask(name, now);
+  return t && String(parseParams(w?.info).atelier?.tasks || '').split(',').includes(t.action) ? t : null;
+}
+
+/** What a worker says about its ComfyUI workshop (info.atelier): flat object, known keys, short scalars only. */
+const ATELIER_KEYS = ['enabled', 'state', 'pid', 'port', 'listen', 'listening', 'tailscale_ip', 'firewall', 'allowed_from', 'busy', 'queue',
+  'vram_free_mib', 'vram_total_mib', 'vram_atelier_mib', 'freed', 'manager', 'started_at', 'files_gb', 'error', 'note', 'port_taken_by',
+  'task', 'tasks'];
+function cleanAtelier(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return undefined;
+  const out = {};
+  for (const k of ATELIER_KEYS) {
+    const v = a[k];
+    if (v == null) continue;
+    if (typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) out[k] = v;
+    else if (Array.isArray(v)) out[k] = v.slice(0, 16).map(x => String(x).slice(0, 80));
+    else out[k] = String(v).slice(0, 300);
+  }
+  return out;
 }
 
 /** Record a poll (last seen + what the worker says about itself) and return its standing orders. */
@@ -341,6 +367,8 @@ export function noteReusePoll(name, info = {}) {
   for (const k of ['version', 'backend', 'device', 'os', 'state', 'job', 'rolled_back_from', 'last_error', 'host', 'update_ack', 'gpu', 'gpu_state', 'tests', 'gpu_models']) {
     if (info && info[k] != null) kept[k] = String(info[k]).slice(0, 200);
   }
+  const atelier = cleanAtelier(info?.atelier);
+  if (atelier) kept.atelier = atelier;
   if (info && typeof info === 'object') q.touch.run(name, Date.now(), JSON.stringify(kept));
   else q.seen.run(name, Date.now());
   // A forced update is a one-shot order: fulfilled when the worker, restarted, echoes its id (no clocks involved,
@@ -547,6 +575,41 @@ export const setWorkerSettings = (name, patch) => onWorker(name, () => {
   const r = patchWorkerSettings(name, patch);
   return r.ok ? { ...r, worker: name } : r;
 });
+
+/** ComfyUI workshop of one machine: the hub's settings for it and what the worker said at its last poll (admin). */
+export function getAtelier(name, now = Date.now()) {
+  return onWorker(name, () => {
+    const w = q.worker.get(name);
+    const s = workerSettings(name);
+    return {
+      ok: true, worker: name,
+      settings: Object.fromEntries(['atelier_enabled', 'atelier_window_only', 'atelier_idle_free_s', 'atelier_keep_days', 'atelier_files_max_gb']
+        .map(k => [k, s[k] ?? null])),
+      online: Boolean(w?.last_poll_at) && now - w.last_poll_at < 90 * 1000,
+      age_s: w?.last_poll_at ? Math.round((now - w.last_poll_at) / 1000) : null,
+      atelier: parseParams(w?.info).atelier || null   // null: worker version without the workshop, or never seen
+    };
+  });
+}
+
+export const requestAtelierTask = (name, body) => onWorker(name, () => {
+  const r = createAtelierTask(name, body);
+  if (r.ok && !String(parseParams(q.worker.get(name)?.info).atelier?.tasks || '').split(',').includes(r.task.action)) {
+    r.warning = 'this worker version does not announce workshop tasks yet: the task waits until it does';
+  }
+  return r;
+});
+export const atelierTasks = (name, limit) => onWorker(name, () => ({ ok: true, worker: name, tasks: listAtelierTasks(name, limit) }));
+export const atelierTask = (name, id) => onWorker(name, () => getAtelierTask(name, id));
+export const stopAtelierTask = (name, id) => onWorker(name, () => cancelAtelierTask(name, id));
+export const reportFromWorkerAtelierTask = (name, id, body) => reportAtelierTask(name, id, body || {});
+
+/** Turn the workshop on or off: {on: true|false} sets atelier_enabled (journaled like any setting). */
+export function switchAtelier(name, body) {
+  if (typeof body?.on !== 'boolean') return err(400, 'Expected {on: true|false}');
+  const r = setWorkerSettings(name, { atelier_enabled: body.on });
+  return r.ok ? { ...getAtelier(name), changed: r.changed } : r;
+}
 /** Does this worker say (info.tests, at its last poll) it runs this kind of remote test? */
 function announcesTest(name, kind) {
   return String(parseParams(q.worker.get(name)?.info).tests || '').split(',').includes(kind);

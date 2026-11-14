@@ -125,6 +125,9 @@ const q = {
   renew: db.prepare('UPDATE gpu_jobs SET lease_until = ?, progress = COALESCE(?, progress), stage = COALESCE(?, stage) WHERE id = ?'),
   engine: db.prepare('UPDATE gpu_jobs SET engine = ? WHERE id = ?'),
   fail: db.prepare('UPDATE gpu_jobs SET status = ?, error = ?, lease_until = NULL, done_at = ? WHERE id = ?'),
+  // Given back unrun (the card was taken by the machine's ComfyUI workshop): pending again, the attempt not counted
+  release: db.prepare(`UPDATE gpu_jobs SET status = 'pending', error = ?, lease_until = NULL, progress = NULL, stage = NULL,
+                       attempts = MAX(attempts - 1, 0) WHERE id = ?`),
   done: db.prepare(`UPDATE gpu_jobs SET status = 'done', out_sha256 = ?, out_size = ?, out_ext = ?, out_meta = ?, compute_s = ?, backend = ?,
                     error = NULL, progress = 1, stage = NULL, lease_until = NULL, done_at = ? WHERE id = ?`),
   cancel: db.prepare(`UPDATE gpu_jobs SET status = 'cancelled', lease_until = NULL, done_at = ? WHERE id = ? AND status IN ('pending', 'claimed')`),
@@ -619,10 +622,19 @@ function recordFailure(j, name, reason, now, final = false) {
   return retry;
 }
 
-/** final: the worker says the same job would fail the same way (too slow for the cap, image broken twice): no retry. */
-export function failGpu(id, name, { error, final } = {}, now = Date.now()) {
+/**
+ * final: the worker says the same job would fail the same way (too slow for the cap, image broken twice): no retry.
+ * release: the worker gives the job back without having failed it (Alice's ComfyUI workshop took the card): back to
+ * pending, attempt not counted.
+ */
+export function failGpu(id, name, { error, final, release } = {}, now = Date.now()) {
   const r = heldBy(id, name);
   if (!r.ok) return r;
+  if (release === true) {
+    q.release.run(`${name}: ${String(error || 'given back').slice(0, 300)}`, r.job.id);
+    logger.info('GPU job given back unrun', { id: r.job.id, worker: name, reason: error });
+    return { ok: true, retry: true, released: true };
+  }
   return { ok: true, retry: recordFailure(r.job, name, error || 'no reason given', now, final === true) };
 }
 

@@ -15,6 +15,7 @@ import argparse
 import base64
 import array
 import hashlib
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -753,7 +754,7 @@ def build_command(template, values):
     return args
 
 
-def download_resume(url, dest, expected_sha256, size, what, stop=None, progress=None):
+def download_resume(url, dest, expected_sha256, size, what, stop=None, progress=None, tries=8):
     """Gros fichier : reprend là où un essai précédent s'est arrêté (en-tête Range), vérifie l'empreinte à la fin.
     Un fichier déjà vérifié porte un témoin <fichier>.ok (taille, date) : pas de re-hachage de 7 Go à chaque job."""
     dest = Path(dest)
@@ -769,7 +770,7 @@ def download_resume(url, dest, expected_sha256, size, what, stop=None, progress=
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(dest) + '.part')
     delay = 5
-    for attempt in range(1, 9):
+    for attempt in range(1, tries + 1):
         try:
             have = tmp.stat().st_size if tmp.exists() else 0
             if have > size:
@@ -804,7 +805,7 @@ def download_resume(url, dest, expected_sha256, size, what, stop=None, progress=
             return dest
         except (OSError, ValueError) as e:
             log.warning('Téléchargement de %s : essai %d raté (%s)', what, attempt, e)
-            if attempt == 8:
+            if attempt == tries:
                 raise RuntimeError('impossible de télécharger %s : %s' % (what, e))
             time.sleep(delay)
             delay = min(delay * 2, 120)
@@ -1709,6 +1710,9 @@ class Worker:
         self.version = (self.app / 'version.txt').read_text().strip() if (self.app / 'version.txt').exists() else 'dev'
         self.engine = Engine(base, self.config)
         self.gpu = Gpu(base, self.config, self.app, self.engine)
+        self.atelier = Atelier(base, self.config, self.app, self.gpu)
+        self.card_lock = threading.Lock()   # un travail du hub qui démarre / l'atelier qui fait vider la carte des moteurs résidents
+        self.job_active = False
         self.work = base / 'work'
         self.state = {'state': 'démarrage', 'job': None, 'last_error': None}
         self.paused_logged = False
@@ -1733,6 +1737,7 @@ class Worker:
             'gpu_state': self.gpu.describe() or None,
             'gpu_models': ','.join(self.gpu.models()) or None,   # modèles qui demandent plus que le moteur du type (ComfyUI)
             'tests': ','.join(GPU_TEST_KINDS),         # essais GPU que cette version sait faire sur ordre du hub
+            'atelier': self.atelier.describe(),         # ComfyUI de Alice : état, écoute réelle, pare-feu, mémoire vidéo
         }
 
     def set_state(self, state, job=None):
@@ -1965,10 +1970,17 @@ class Worker:
         def progress(frac, stage):
             now.update(progress=round(max(0.0, min(1.0, frac)), 3), stage=stage)
 
+        preempted = {}
+
         def beat():
             # Plus fréquent qu'un nettoyage : l'avancement se voit côté client et une annulation arrête la carte vite
             period = max(5, min(15, job.get('lease_s', 600) // 5))
             while True:
+                if not preempted and self.atelier.busy():
+                    # Alice a lancé un calcul dans l'atelier : il passe d'abord, ce travail repart dans la file du hub
+                    preempted['why'] = 'atelier ComfyUI en calcul : travail rendu à la file, il reprendra plus tard'
+                    log.info('Job %s : %s.', label, preempted['why'])
+                    stop.set()
                 try:
                     status, _ = self.hub.request('POST', '%s%d/heartbeat' % (route, jid), body=self.gpu_beat(now), timeout=30)
                     if status in (404, 409):
@@ -2054,8 +2066,11 @@ class Worker:
             self.state['last_error'] = None
             rmtree(jobdir)
         except JobLost as e:
-            log.warning('Job %s abandonné : le hub l\'a repris ou annulé (%s).', label, e)
             rmtree(jobdir)
+            if preempted:
+                self.release(jid, preempted['why'], route)
+            else:
+                log.warning('Job %s abandonné : le hub l\'a repris ou annulé (%s).', label, e)
         except Refused as e:
             log.error('Job %s : %s.', label, e)
             self.state['last_error'] = 'job %s : %s' % (label, e)
@@ -2066,10 +2081,13 @@ class Worker:
             log.error('Job %s en attente : %s. Le travail fait est gardé dans %s.', label, e, jobdir)
             self.state['last_error'] = 'job %s : %s' % (label, e)
         except (RuntimeError, ValueError, KeyError) as e:
+            rmtree(jobdir)
+            if preempted:   # moteur arrêté en plein calcul : pas une panne
+                self.release(jid, preempted['why'], route)
+                return
             log.error('Job %s raté : %s', label, e)
             self.state['last_error'] = 'job %s : %s' % (label, e)
             self.gpu.status[kind] = 'échec : %s' % str(e)[:120]
-            rmtree(jobdir)
             self.final_beat(route, jid, now)
             self.give_back(jid, e, route)
         finally:
@@ -2092,6 +2110,50 @@ class Worker:
             self.hub.request('POST', '%s%d/heartbeat' % (route, jid), body=self.gpu_beat(now), timeout=30)
         except OSError:
             pass
+
+    def release(self, jid, reason, route):
+        """Rend un travail au hub sans compter l'essai (release) : il n'a pas échoué, la carte était prise par l'atelier."""
+        log.info('Travail %s rendu au hub sans compter l\'essai : %s.', jid, reason)
+        try:
+            self.hub.request('POST', '%s%d/fail' % (route, jid), body={'error': str(reason)[:300], 'release': True}, timeout=30)
+        except OSError:
+            pass
+
+    def post_atelier_task(self, tid, body):
+        status, answer = self.hub.request('POST', '/api/reuse/worker/atelier-tasks/%d' % tid, body=body, timeout=30)
+        if status in (404, 409):
+            return {'ok': False, 'cancel': True}
+        return answer or {}
+
+    def atelier_hold(self):
+        """Atelier en calcul : signe de vie au hub (ordres et réglages reçus, dont l'arrêt de l'atelier), sans réclamer de travail."""
+        if self.state['state'] != 'atelier en calcul':
+            log.info('L\'atelier ComfyUI calcule : aucun travail du hub tant que sa file n\'est pas vide.')
+        try:
+            status, body = self.hub.request('POST', '/api/reuse/worker/status', body={'info': self.info()}, timeout=30)
+            if status == 200 and body:
+                self.apply_orders(body.get('orders') or {}, tests=False)
+        except OSError:
+            pass
+        if self.atelier.busy():
+            self.set_state('atelier en calcul')
+            self.atelier.stopping.wait(10)
+
+    def atelier_loop(self):
+        """Fil de l'atelier : le mène (tick) et, quand il calcule entre deux travaux du hub, arrête les moteurs résidents des
+        travaux (jusqu'à 11 Go gardés 10 minutes) : la carte est à Alice."""
+        while not self.atelier.stopping.is_set():
+            try:
+                self.atelier.tick()
+                if self.atelier.busy() and (self.gpu.server or self.gpu.comfy):
+                    with self.card_lock:
+                        if not self.job_active:
+                            self.gpu.stop_server('atelier ComfyUI en calcul')
+                            self.gpu.stop_comfy('atelier ComfyUI en calcul')
+            except Exception as e:   # le fil ne meurt jamais : l'erreur est dite au hub
+                log.exception('Atelier : %s', e)
+                self.atelier.error = 'surveillance : %s' % str(e)[:200]
+            self.atelier.stopping.wait(ATELIER_TICK_S)
 
     def give_back(self, jid, reason, route='/api/reuse/jobs/'):
         """Rend le job au hub en comptant l'essai (au bout du dernier, le hub le déclare en échec). Un échec Final n'est pas
@@ -2155,22 +2217,31 @@ class Worker:
         for t, why in sorted(skipped.items()):
             log.info('Génération %s non proposée ici : %s.', t, why)
         (self.app / '.ok').write_text(time.strftime('%Y-%m-%d %H:%M:%S'))   # cette version démarre : le lanceur ne reviendra pas en arrière
+        threading.Thread(target=self.atelier_loop, name='atelier', daemon=True).start()
         self.set_state('en attente')
         job = None
         orders = {}
         errors = 0
         while True:
-            self.gpu.idle()
+            with self.card_lock:
+                self.gpu.idle()
             if (self.base / 'STOP').exists():
                 self.gpu.stop_server('arrêt du worker')
                 self.gpu.stop_comfy('arrêt du worker')
+                self.atelier.shutdown('arrêt du worker')
                 log.info('Fichier STOP présent : arrêt. Le supprimer pour relancer.')
                 return EXIT_STOP
             if job:
-                if job.get('kind', 'reuse') == 'reuse':
-                    self.process(job)
-                else:
-                    self.process_gpu(job)
+                with self.card_lock:
+                    self.job_active = True
+                try:
+                    if job.get('kind', 'reuse') == 'reuse':
+                        self.process(job)
+                    else:
+                        self.atelier.free('travail %s %s du hub' % (job.get('kind'), job.get('id')))
+                        self.process_gpu(job)
+                finally:
+                    self.job_active = False
                 job = None
                 # Ordres reçus avec ce job (mise à jour publiée ou forcée) : appliqués entre deux jobs, sinon une
                 # file jamais vide retarderait indéfiniment un correctif du worker
@@ -2182,6 +2253,9 @@ class Worker:
                     log.warning('%d échec(s) de calcul de suite : pause de %s avant le prochain job.', self.engine_failures, fmt_duration(pause))
                     self.set_state('pause après échec')
                     time.sleep(pause)
+                continue
+            if self.atelier.busy():
+                self.atelier_hold()   # Alice calcule : aucun travail du hub tant que la file de l'atelier n'est pas vide
                 continue
             t0 = time.time()
             try:
@@ -2202,6 +2276,10 @@ class Worker:
             orders = body.get('orders') or {}
             job = body.get('job')
             self.note_pause(orders)
+            if job and job.get('kind', 'reuse') != 'reuse' and self.atelier.busy(live=True):
+                # L'atelier s'est mis à calculer pendant l'attente : le travail GPU repart dans la file, essai non compté
+                self.release(job['id'], 'atelier ComfyUI en marche sur la carte', '/api/gpu/jobs/')
+                job = None
             if job:
                 continue           # une mise à jour attendra la fin du job
             self.apply_orders(orders)
@@ -2217,6 +2295,10 @@ class Worker:
 
     def apply_orders(self, orders, tests=True):
         self.note_pause(orders)
+        if isinstance(orders.get('in_window'), bool):
+            self.atelier.in_window = orders['in_window']   # atelier_window_only : l'atelier suit le créneau de la machine
+        if isinstance(orders.get('atelier_task'), dict):
+            self.atelier.submit(orders['atelier_task'], self.post_atelier_task)   # dans son propre fil : jamais bloquant
         self.apply_settings(orders.get('settings'))
         order = int(orders.get('update') or 0)
         acked = (read_json(self.base / 'update-ack.json', {}) or {}).get('order')
@@ -2253,6 +2335,8 @@ class Worker:
         Avancement envoyé toutes les 20 s (le hub peut annuler), rapport final remonté et écrit dans logs/gpu-test.json."""
         tid, kind = int(test['id']), str(test.get('kind'))
         route = '/api/reuse/worker/tests/%d' % tid
+        if self.atelier.busy(live=True):
+            return   # l'essai reste en attente sur le hub : redonné au prochain échange, quand l'atelier aura fini
         now = {'progress': 0.0, 'stage': 'préparation'}
         stop, finished = threading.Event(), threading.Event()
         why = {}
@@ -2279,6 +2363,9 @@ class Worker:
         self.set_state('essai %s' % kind, 'essai %d' % tid)
         self.gpu.stop_server('essai GPU demandé')   # la carte entière pour l'essai
         self.gpu.stop_comfy('essai GPU demandé')
+        self.atelier.free('essai GPU %d' % tid)
+        with self.card_lock:
+            self.job_active = True
 
         def progress(frac, stage):
             now.update(progress=round(max(0.0, min(1.0, frac)), 3), stage=str(stage)[:200])
@@ -2300,6 +2387,7 @@ class Worker:
                                      bundled if kind == '3d' and bundled.exists() else None, stop, progress)
         finally:
             finished.set()
+            self.job_active = False
         report['test_id'] = tid
         write_json(self.base / 'logs' / 'gpu-test.json', report)
         log.info('ESSAI GPU %d %s : %s', tid, 'REUSSI' if report.get('ok') else 'RATE', json.dumps(report, ensure_ascii=False)[:2000])
@@ -2481,7 +2569,9 @@ def write_pth(python_dir, src_dir):
     lines = [l for l in lines if l != 'import site' and not (os.path.basename(l.rstrip('/\\')).startswith('ComfyUI-') and l != rel)]
     if rel not in lines:
         lines.append(rel)
-    pth.write_text('\n'.join(lines + ['import site']) + '\n')
+    tmp = pth.with_name(pth.name + '.new')   # remplacé, jamais réécrit en place : un ._pth lié ailleurs ne bouge pas
+    tmp.write_text('\n'.join(lines + ['import site']) + '\n')
+    os.replace(tmp, pth)
     return pth
 
 
@@ -3049,10 +3139,1130 @@ def comfy_test_report(base, config, kind, params, stop, progress, report):
 
 # Essais GPU : en local (--gpu-test, worker arrêté) ou demandés par le hub (ordre gpu_test, worker en marche, entre deux
 # travaux). Même code, même rapport (logs/gpu-test.json), remonté au hub dans le second cas.
+# ---- Atelier ComfyUI : l'instance de Alice, à côté de celle des travaux -----------------------------------------
+# Une seconde instance de ComfyUI, pour un humain : nœuds additionnels et ComfyUI-Manager permis, port fixe, écoute sur
+# 127.0.0.1 et sur l'adresse Tailscale du PC (jamais 0.0.0.0), modèles des travaux partagés en lecture. Lancée et surveillée
+# par le worker, sans fenêtre, allumée ou éteinte depuis le hub (réglage atelier_enabled). Un seul calcul à la fois sur la
+# carte : tant que l'atelier calcule ou a une file, le worker ne prend aucun travail du hub ; avant un travail GPU du hub,
+# il vide la carte de l'atelier (POST /free) ; l'atelier rend sa mémoire vidéo après 10 minutes sans calcul.
+ATELIER_PORT = 8188
+ATELIER_IDLE_FREE_S = 600        # carte rendue par l'atelier après ce temps sans calcul (réglable : atelier_idle_free_s, 0 = jamais)
+ATELIER_TICK_S = 3.0             # surveillance : file de l'atelier lue toutes les 3 s (requête locale)
+ATELIER_FW_GROUP = 'ComfyUI atelier'   # groupe des règles de pare-feu créées par la commande administrateur (GPU.md)
+ATELIER_TS_RETRY_S = 120         # Tailscale pas prêt ou pare-feu absent : nouveau regard toutes les 2 minutes
+ATELIER_TS_RECHECK_S = 600       # adresse Tailscale et pare-feu relus toutes les 10 minutes une fois bons
+ATELIER_NET_S = 60               # adresses d'écoute réelles (netstat) relues toutes les minutes
+ATELIER_FREE_DONE_MIB = 1024     # mémoire gardée par le PyTorch de l'atelier sous laquelle la carte est rendue
+ATELIER_KEEP_DAYS = 7            # sorties et images envoyées gardées 7 jours (réglable : atelier_keep_days)
+ATELIER_FILES_MAX_GB = 20.0      # et 20 Go au plus à elles deux, les plus anciennes d'abord (réglable : atelier_files_max_gb)
+ATELIER_PURGE_S = 600            # ménage toutes les 10 minutes
+TAILNET = ipaddress.ip_network('100.64.0.0/10')
+LOOPBACK = ipaddress.ip_network('127.0.0.0/8')
+
+
+def atelier_layout(base, spec):
+    root = base / 'atelier'   # hors de gpu\ : ni compté dans gpu_max_gb, ni touché par le ménage du catalogue
+    return {'root': root, 'python': root / 'python', 'src': root / spec['source']['root'], 'data': root / 'data',
+            'tmp': root / 'tmp', 'cache': root / 'cache', 'logs': root / 'logs', 'state': root / 'atelier.json',
+            'extra': root / 'extra_model_paths.yaml', 'exe': root / 'python' / ('python.exe' if IS_WINDOWS else 'bin/python3'),
+            'jobs': comfy_layout(base, spec)}
+
+
+def link_tree(src, dst, copy_names=r'.*\._pth|pyvenv\.cfg'):
+    """Copie d'un dossier par liens physiques : rien de plus sur le disque. pip et Python remplacent un fichier (nouveau
+    fichier, puis renommage) au lieu de l'écrire en place : les deux copies restent indépendantes. Les fichiers que le worker
+    réécrit lui-même (._pth) sont copiés. Copie classique si le lien est refusé. -> (liés, copiés)."""
+    src, dst = Path(src), Path(dst)
+    linked = copied = 0
+    for d, dirs, files in os.walk(src):
+        rel = Path(d).relative_to(src)
+        (dst / rel).mkdir(parents=True, exist_ok=True)
+        for name in list(dirs):
+            if (Path(d) / name).is_symlink():
+                os.symlink(os.readlink(Path(d) / name), dst / rel / name, target_is_directory=True)
+                dirs.remove(name)
+        for name in files:
+            s, t = Path(d) / name, dst / rel / name
+            if s.is_symlink():
+                os.symlink(os.readlink(s), t)
+                continue
+            if not re.fullmatch(copy_names, name):
+                try:
+                    os.link(s, t)
+                    linked += 1
+                    continue
+                except OSError:
+                    pass
+            shutil.copy2(s, t)
+            copied += 1
+    return linked, copied
+
+
+def can_hardlink(folder):
+    folder = Path(folder)
+    a, b = folder / '.link-probe-a', folder / '.link-probe-b'
+    try:
+        a.write_bytes(b'x')
+        os.link(a, b)
+        return True
+    except OSError:
+        return False
+    finally:
+        a.unlink(missing_ok=True)
+        b.unlink(missing_ok=True)
+
+
+def listen_ip_ok(text):
+    """Adresse d'écoute en plus de 127.0.0.1 : une adresse IPv4 précise, jamais 0.0.0.0, une diffusion ou une boucle."""
+    try:
+        ip = ipaddress.ip_address(str(text).strip())
+    except ValueError:
+        return None
+    if ip.version != 4 or ip.is_unspecified or ip.is_multicast or ip.is_loopback or ip == ipaddress.ip_address('255.255.255.255'):
+        return None
+    return str(ip)
+
+
+def parse_tailscale_ip(text):
+    """Première adresse du tailnet (100.64.0.0/10) dans la sortie de « tailscale ip -4 »."""
+    for tok in re.findall(r'(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])', text or ''):
+        try:
+            ip = ipaddress.ip_address(tok)
+        except ValueError:
+            continue
+        if ip in TAILNET:
+            return str(ip)
+    return None
+
+
+def tailscale_exe():
+    exe = shutil.which('tailscale')
+    if exe or not IS_WINDOWS:
+        return exe
+    for root in (os.environ.get('ProgramFiles'), os.environ.get('ProgramW6432'), r'C:\Program Files'):
+        p = Path(root or r'C:\Program Files') / 'Tailscale' / 'tailscale.exe'
+        if p.exists():
+            return str(p)
+    return None
+
+
+def quiet_run(args, timeout=30):
+    """Commande courte sans fenêtre -> (code, sortie texte)."""
+    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=timeout,
+                       creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0)
+    return r.returncode, r.stdout.decode('utf-8', 'replace')
+
+
+def tailscale_ip():
+    """-> (adresse IPv4 Tailscale de ce PC, None si inconnue ; raison lisible si inconnue)."""
+    exe = tailscale_exe()
+    if not exe:
+        return None, 'tailscale introuvable sur ce PC'
+    try:
+        code, out = quiet_run([exe, 'ip', '-4'], timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, 'tailscale ip -4 : %s' % e
+    ip = parse_tailscale_ip(out)
+    return ip, None if ip else ('tailscale pas prêt : %s' % (out.strip()[:160] or 'code %s' % code))
+
+
+def parse_netstat(text):
+    """Sockets TCP en écoute de « netstat -ano » -> [(adresse locale, port, pid)]. Une ligne d'écoute a pour adresse distante
+    0.0.0.0:0 ou [::]:0 (la colonne d'état est traduite selon la langue de Windows)."""
+    out = []
+    for line in (text or '').splitlines():
+        p = line.split()
+        if len(p) < 4 or p[0].upper() != 'TCP' or p[2] not in ('0.0.0.0:0', '[::]:0', '*:*'):
+            continue
+        host, _, port = p[1].rpartition(':')
+        try:
+            out.append((host.strip('[]'), int(port), int(p[-1])))
+        except ValueError:
+            continue
+    return out
+
+
+def process_exe(pid):
+    """Chemin du programme du processus pid ('' s'il n'existe pas ou n'est pas lisible)."""
+    try:
+        if IS_WINDOWS:
+            shell = shutil.which('powershell') or shutil.which('pwsh')
+            if not shell:
+                return ''
+            return quiet_run([shell, '-NoProfile', '-NonInteractive', '-Command',
+                              '(Get-Process -Id %d -ErrorAction SilentlyContinue).Path' % int(pid)], timeout=60)[1].strip()
+        return os.readlink('/proc/%d/exe' % int(pid))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ''
+
+
+def pid_alive(pid):
+    """Ce processus tourne-t-il ? Appel système direct, sans lancer PowerShell (lu toutes les 3 s)."""
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            k.CloseHandle(h)
+            return bool(ok) and code.value == 259     # STILL_ACTIVE
+        return Path('/proc/%d/stat' % int(pid)).read_text().split(' ')[2] != 'Z'
+    except (OSError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def same_file(a, b):
+    try:
+        return bool(a) and bool(b) and os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+    except OSError:
+        return False
+
+
+def ip_ranges(entries):
+    """Adresses distantes d'une règle de pare-feu Windows (« Any », 1.2.3.4, 1.2.3.0/24, 1.2.3.0/255.255.255.0, a-b)
+    -> [(début, fin)] en entiers IPv4 ; les adresses IPv6 et les mots-clés (LocalSubnet…) sont écartés. None : « Any »."""
+    out = []
+    for e in entries or []:
+        e = str(e).strip()
+        if e.lower() in ('any', '*'):
+            return None
+        try:
+            if '-' in e:
+                a, b = (ipaddress.ip_address(x.strip()) for x in e.split('-', 1))
+                if a.version == 4 and b.version == 4:
+                    out.append((int(a), int(b)))
+            else:
+                n = ipaddress.ip_network(e, strict=False)
+                if n.version == 4:
+                    out.append((int(n.network_address), int(n.broadcast_address)))
+        except ValueError:
+            continue
+    return out
+
+
+def atelier_firewall_check(rules, exe):
+    """Les règles du groupe « ComfyUI atelier » protègent-elles l'atelier ? rules : [{name, action, direction, enabled, remote,
+    program}] lues par PowerShell. Il faut, pour le Python de l'atelier, une règle entrante qui autorise des adresses du
+    tailnet seulement, et une règle entrante qui bloque tout le reste de l'IPv4 (boucle locale mise à part) : un blocage
+    l'emporte sur toute autorisation, même une règle posée ailleurs. -> {ok, allow_from, problem}."""
+    mine = [r for r in rules or [] if str(r.get('enabled')).lower() == 'true' and str(r.get('direction')).lower() == 'inbound'
+            and same_file(os.path.expandvars(str(r.get('program') or '')), exe)]
+    allow = [r for r in mine if str(r.get('action')).lower() == 'allow']
+    block = [r for r in mine if str(r.get('action')).lower() == 'block']
+    allowed = []
+    for r in allow:
+        ranges = ip_ranges(r.get('remote'))
+        if ranges is None:
+            return {'ok': False, 'allow_from': ['Any'], 'problem': 'règle « %s » ouverte à toute adresse' % r.get('name')}
+        for a, b in ranges:
+            if not (ipaddress.ip_address(a) in TAILNET and ipaddress.ip_address(b) in TAILNET):
+                return {'ok': False, 'allow_from': [str(ipaddress.ip_address(a))], 'problem': 'règle « %s » ouverte hors du tailnet' % r.get('name')}
+            allowed.append((a, b))
+    if not allowed:
+        return {'ok': False, 'allow_from': [], 'problem': 'aucune règle « %s » n\'autorise le poste client' % ATELIER_FW_GROUP}
+    shown = sorted({str(ipaddress.ip_address(a)) if a == b else '%s-%s' % (ipaddress.ip_address(a), ipaddress.ip_address(b)) for a, b in allowed})
+    if len(allowed) > 1 or allowed[0][0] != allowed[0][1]:
+        return {'ok': False, 'allow_from': shown, 'problem': 'plus d\'une adresse autorisée (une seule attendue : le poste client)'}
+    blocked = []
+    for r in block:
+        ranges = ip_ranges(r.get('remote'))
+        blocked += [(0, 2 ** 32 - 1)] if ranges is None else ranges
+    if any(c <= allowed[0][0] <= d for c, d in blocked):   # un blocage l'emporte sur une autorisation
+        return {'ok': False, 'allow_from': shown, 'problem': 'le poste client est bloqué aussi par la règle de blocage'}
+    # Ce qui doit être bloqué : tout l'IPv4 sauf la boucle locale et l'adresse autorisée
+    holes = sorted(allowed + [(int(LOOPBACK.network_address), int(LOOPBACK.broadcast_address))])
+    need, start = [], 0
+    for a, b in holes:
+        if a > start:
+            need.append((start, a - 1))
+        start = max(start, b + 1)
+    if start <= 2 ** 32 - 1:
+        need.append((start, 2 ** 32 - 1))
+    for a, b in need:
+        pos = a
+        for c, d in sorted(blocked):
+            if c <= pos <= d:
+                pos = d + 1
+            if pos > b:
+                break
+        if pos <= b:
+            return {'ok': False, 'allow_from': shown, 'problem': 'le reste des adresses n\'est pas bloqué (dès %s)' % ipaddress.ip_address(pos)}
+    return {'ok': True, 'allow_from': shown, 'problem': None}
+
+
+FIREWALL_READ = ("$o=@(); foreach($r in @(Get-NetFirewallRule -Group '%s' -ErrorAction SilentlyContinue)){"
+                 "$a=$r|Get-NetFirewallAddressFilter; $p=$r|Get-NetFirewallApplicationFilter;"
+                 "$o+=[pscustomobject]@{name=$r.DisplayName; action=\"$($r.Action)\"; direction=\"$($r.Direction)\"; enabled=\"$($r.Enabled)\";"
+                 " remote=@($a.RemoteAddress); program=$p.Program}}; ConvertTo-Json -InputObject @($o) -Compress -Depth 3") % ATELIER_FW_GROUP
+
+
+def read_firewall_rules():
+    """Règles du groupe de l'atelier (lecture seule, sans droits administrateur). -> (liste, erreur)."""
+    shell = shutil.which('powershell') or shutil.which('pwsh')
+    if not IS_WINDOWS or not shell:
+        return None, 'pare-feu Windows absent ici'
+    try:
+        code, out = quiet_run([shell, '-NoProfile', '-NonInteractive', '-Command', FIREWALL_READ], timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
+    text = out.strip()
+    try:
+        rules = json.loads(text[text.index('['):]) if '[' in text else []
+    except ValueError:
+        return None, 'lecture du pare-feu : %s' % text[:160]
+    return [r for r in rules if isinstance(r, dict)], None
+
+
+def purge_files(folders, keep_days, max_bytes, now=None):
+    """Ménage de l'atelier : fichiers plus vieux que keep_days, puis les plus anciens tant que le total dépasse max_bytes.
+    Les noms cachés (.xxx) et les fichiers témoins de ComfyUI sont laissés. -> (fichiers retirés, octets retirés, octets restants)."""
+    now = time.time() if now is None else now
+    files = []
+    for root in folders:
+        for d, dirs, names in os.walk(root):
+            dirs[:] = [x for x in dirs if not x.startswith('.')]
+            for n in names:
+                if n.startswith('.') or n.startswith('_') and n.endswith('_here'):
+                    continue
+                p = Path(d) / n
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                files.append((st.st_mtime, st.st_size, p))
+    files.sort()
+    total = sum(f[1] for f in files)
+    removed = freed = 0
+    for mtime, size, p in files:
+        if now - mtime <= keep_days * 86400 and total <= max_bytes:
+            break
+        try:
+            p.unlink()
+        except OSError:
+            continue
+        removed, freed, total = removed + 1, freed + size, total - size
+    for root in folders:   # sous-dossiers vidés
+        for d, dirs, names in sorted(os.walk(root), key=lambda x: -len(x[0])):
+            if Path(d) != Path(root) and not os.listdir(d):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+    return removed, freed, total
+
+
+def atelier_extra_paths(models_dir):
+    """extra_model_paths.yaml : les poids des travaux (gpu\\comfyui\\data\\models), en plus de ceux de l'atelier."""
+    base = str(models_dir).replace('\\', '/').replace("'", "''")
+    lines = ['# Écrit par le worker à chaque démarrage de l\'atelier : modèles des travaux du hub, partagés.',
+             'reuse_jobs:', "    base_path: '%s'" % base]
+    names = sorted(p.name for p in Path(models_dir).iterdir() if p.is_dir()) if Path(models_dir).is_dir() else []
+    for name in names:
+        if re.fullmatch(r'[\w.-]+', name):
+            lines.append('    %s: %s' % (name, name))
+    return '\n'.join(lines) + '\n'
+
+
+def atelier_args(spec, atelier, port, listen, data, extra, manager):
+    args = build_command(atelier['args'], {'port': port, 'listen': listen, 'base': str(data), 'extra': str(extra)})
+    if manager:
+        args += [a for a in atelier.get('manager_args') or [] if a not in args]
+    if '0.0.0.0' in ','.join(args) or '::' in [x.strip() for x in listen.split(',')]:
+        raise RuntimeError('écoute sur toutes les adresses refusée')
+    return args
+
+
+# ---- Tâches d'atelier données par le hub : packs de nœuds et fichiers de modèle, journalisés et réversibles -------------
+ATELIER_TASK_ACTIONS = ('install_nodes', 'remove_nodes', 'download_model', 'remove_model', 'undo')
+ATELIER_TRASH_DAYS = 30          # ce qu'une tâche a remplacé ou retiré reste 30 jours dans atelier\trash (undo possible)
+GITHUB_REPO = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?')
+SAFE_PART = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.() +-]{0,119}')
+MODEL_EXT = re.compile(r'.+\.(safetensors|sft|gguf|pt|pth|bin|ckpt|onnx)', re.I)
+
+
+def check_atelier_task(action, p):
+    """Mêmes règles que le hub (src/services/atelier-tasks.js), revérifiées ici : rien d'autre n'atteint le disque ou pip.
+    -> paramètres nettoyés ; ValueError si refusés."""
+    p = p if isinstance(p, dict) else {}
+    if action not in ATELIER_TASK_ACTIONS:
+        raise ValueError('action inconnue : %r' % action)
+    if action == 'install_nodes':
+        m = GITHUB_REPO.fullmatch(str(p.get('url') or ''))
+        if not m or not re.fullmatch(r'[0-9a-f]{40}', str(p.get('commit') or '')):
+            raise ValueError('install_nodes : url https://github.com/<compte>/<dépôt> et commit (40 caractères hexadécimaux) attendus')
+        name = str(p.get('name') or m.group(2))
+        if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}', name):
+            raise ValueError('nom de pack refusé : %r' % name)
+        return {'url': 'https://github.com/%s/%s' % (m.group(1), m.group(2)), 'owner': m.group(1), 'repo': m.group(2),
+                'commit': p['commit'], 'name': name, 'pip': p.get('pip') is not False}
+    if action == 'remove_nodes':
+        name = str(p.get('name') or '')
+        if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}', name):
+            raise ValueError('nom de pack refusé : %r' % name)
+        return {'name': name}
+    if action in ('download_model', 'remove_model'):
+        folder = str(p.get('folder') or '')
+        if not re.fullmatch(r'[a-z][a-z0-9_]{1,40}(/[A-Za-z0-9_][A-Za-z0-9_.-]{0,59})?', folder):
+            raise ValueError('dossier de modèle refusé : %r (ex. loras, upscale_models, model_patches)' % folder)
+        url = str(p.get('url') or '')
+        name = str(p.get('name') or urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit('/', 1)[-1]))
+        if not SAFE_PART.fullmatch(name) or not MODEL_EXT.fullmatch(name) or '..' in name:
+            raise ValueError('nom de fichier refusé : %r (safetensors, gguf, pt, pth, bin, ckpt, onnx)' % name)
+        if action == 'remove_model':
+            return {'folder': folder, 'name': name}
+        if not re.fullmatch(r'https://\S{1,2000}', url) or not re.fullmatch(r'[0-9a-f]{64}', str(p.get('sha256') or '')):
+            raise ValueError('download_model : url https et sha256 (64 caractères hexadécimaux) attendus')
+        size = p.get('size')
+        if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size <= 0):
+            raise ValueError('size : nombre d\'octets attendu')
+        return {'url': url, 'sha256': p['sha256'], 'folder': folder, 'name': name, 'size': size}
+    task = p.get('task')
+    if not isinstance(task, int) or isinstance(task, bool) or task <= 0:
+        raise ValueError('undo : numéro de tâche attendu')
+    return {'task': task}
+
+
+def fetch_file(url, dest, stop=None, timeout=120):
+    """Téléchargement simple (archive d'un commit GitHub) -> empreinte SHA-256 de ce qui a été reçu."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'reuse-worker'}), timeout=timeout) as r, open(dest, 'wb') as f:
+        for block in iter(lambda: r.read(1 << 20), b''):
+            if stop is not None and stop.is_set():
+                raise JobLost('téléchargement interrompu')
+            f.write(block)
+            h.update(block)
+    return h.hexdigest()
+
+
+def remote_size(url, timeout=60):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'reuse-worker'}), timeout=timeout) as r:
+            n = r.headers.get('Content-Length')
+            return int(n) if n and int(n) > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def pip_freeze(py, env, log_path, stop=None):
+    out = run_logged([py, '-s', '-m', 'pip', 'freeze', '--all'], log_path, env, 300, stop, what='état de pip')
+    return sorted({l.strip() for l in out.splitlines() if re.match(r'^[A-Za-z0-9_.-]+(==| @ )', l.strip())})
+
+
+def pip_changes(before, after):
+    b, a = set(before), set(after)
+    return {'added': sorted(a - b)[:60], 'removed': sorted(b - a)[:60]}
+
+
+class Atelier:
+    """Cycle de vie de l'atelier, mené par un fil du worker toutes les ATELIER_TICK_S secondes (tick) : préparer, lancer,
+    surveiller, relancer, arrêter, et dire au hub ce qu'il en est (describe, dans info.atelier)."""
+
+    def __init__(self, base, config, app, gpu):
+        self.base, self.config, self.app, self.gpu = base, config, app, gpu
+        self.proc = None            # Popen si ce worker l'a lancé ; None si repris d'un worker précédent (pid seulement)
+        self.pid = None
+        self.port = None
+        self.listen = None
+        self.started_at = None
+        self.state = 'éteint'
+        self.error = None
+        self.busy_flag = False
+        self.queue = None           # (en cours, en attente)
+        self.queue_errors = 0
+        self.last_busy = time.time()
+        self.freed = True
+        self.next_try = 0.0
+        self.failures = 0
+        self.in_window = None       # donné par le hub (orders.in_window) ; None : inconnu
+        self.ts = {'ip': None, 'error': None, 'at': 0.0}
+        self.fw = {'ok': None, 'at': 0.0}
+        self.net = {'listening': None, 'at': 0.0}
+        self.vram = {}
+        self.vram_at = 0.0
+        self.purge_at = 0.0
+        self.files_gb = None
+        self.looked_for_orphan = False
+        self.manager = None
+        self.env_note = None
+        self.stopping = threading.Event()
+        self.lock = threading.RLock()   # tick (fil de l'atelier) et free / shutdown (fil principal)
+        self.env_lock = threading.Lock()   # environnement Python : préparation (clone, Manager) ou pip d'une tâche, jamais les deux
+        self.tasks_seen = set()
+        self.task_thread = None
+        self.last_task = None
+        self.restart_wanted = False     # nœuds ajoutés ou retirés : relance dès que l'atelier ne calcule plus
+
+    # ---- réglages ----
+    def spec(self):
+        spec = comfy_spec(self.app)
+        if not spec.get('atelier'):
+            raise RuntimeError('atelier absent du catalogue publié')
+        return spec
+
+    def enabled(self):
+        return self.config.get('atelier_enabled') is True
+
+    def wanted(self):
+        if not self.enabled() or self.stopping.is_set() or self.config.get('gpu') is False:
+            return False
+        if not IS_WINDOWS and not self.config.get('comfyui_any_os'):
+            return False
+        return not (self.config.get('atelier_window_only') is True and self.in_window is False)
+
+    def idle_free_s(self):
+        try:
+            return max(0.0, float(self.config.get('atelier_idle_free_s', ATELIER_IDLE_FREE_S)))
+        except (TypeError, ValueError):
+            return float(ATELIER_IDLE_FREE_S)
+
+    def purge(self, now):
+        """Sorties (output) et images envoyées (input) de l'atelier : les agents en envoient beaucoup, le disque ne doit pas
+        se remplir. Gardées atelier_keep_days jours et atelier_files_max_gb Go au plus."""
+        self.purge_at = now
+        try:
+            days = max(0.0, float(self.config.get('atelier_keep_days', ATELIER_KEEP_DAYS)))
+            cap = max(0.1, float(self.config.get('atelier_files_max_gb', ATELIER_FILES_MAX_GB))) * 1e9
+        except (TypeError, ValueError):
+            days, cap = ATELIER_KEEP_DAYS, ATELIER_FILES_MAX_GB * 1e9
+        lay = atelier_layout(self.base, self.spec())
+        data = lay['data']
+        removed, freed, left = purge_files([data / 'output', data / 'input'], days, cap, now)
+        trash = lay['root'] / 'trash'
+        if trash.is_dir():   # corbeille des tâches : un dossier par jour (AAAAMMJJ)
+            limit = time.strftime('%Y%m%d', time.localtime(now - ATELIER_TRASH_DAYS * 86400))
+            for d in trash.iterdir():
+                if d.is_dir() and re.fullmatch(r'\d{8}', d.name) and d.name < limit:
+                    rmtree(d)
+        self.files_gb = round(left / 1e9, 2)
+        if removed:
+            log.info('Atelier : ménage, %d fichiers retirés (%.1f Go), %.1f Go gardés.', removed, freed / 1e9, left / 1e9)
+
+    def port_wanted(self, atelier):
+        try:
+            return int(self.config.get('atelier_port') or atelier.get('port') or ATELIER_PORT)
+        except (TypeError, ValueError):
+            return ATELIER_PORT
+
+    def running(self):
+        if self.proc is not None:
+            return self.proc.poll() is None
+        return bool(self.pid) and pid_alive(self.pid)   # repris d'un worker précédent : son identité a été vérifiée à la reprise
+
+    # ---- réseau : Tailscale, pare-feu, écoute réelle ----
+    def remote_ip(self, now):
+        """Adresse d'écoute en plus de 127.0.0.1, ou None (alors écoute locale seulement, et la raison dans self.ts['error'])."""
+        forced = self.config.get('atelier_listen_ip')
+        if forced:
+            ip = listen_ip_ok(forced)
+            self.ts.update(ip=ip, error=None if ip else 'atelier_listen_ip refusée : %r' % forced, at=now)
+        elif now - self.ts['at'] >= (ATELIER_TS_RECHECK_S if self.ts['ip'] else ATELIER_TS_RETRY_S):
+            ip, why = tailscale_ip()
+            if ip != self.ts['ip']:
+                log.info('Atelier : adresse Tailscale %s.', ip or 'inconnue (%s)' % why)
+            self.ts.update(ip=ip, error=why, at=now)
+        if not self.ts['ip']:
+            return None
+        if self.config.get('atelier_require_firewall', True) is False:
+            self.fw.update(ok=None, problem='vérification coupée (atelier_require_firewall)')
+            return self.ts['ip']
+        if now - self.fw['at'] >= (ATELIER_TS_RECHECK_S if self.fw.get('ok') else ATELIER_TS_RETRY_S):
+            rules, why = read_firewall_rules()
+            check = atelier_firewall_check(rules, atelier_layout(self.base, self.spec())['exe']) if rules is not None \
+                else {'ok': False, 'allow_from': [], 'problem': why}
+            if check['ok'] != self.fw.get('ok'):
+                log.info('Atelier : pare-feu %s.', 'prêt (poste client %s)' % ', '.join(check['allow_from']) if check['ok']
+                         else 'pas prêt : %s, écoute locale seulement' % check['problem'])
+            self.fw = dict(check, at=now)
+        return self.ts['ip'] if self.fw.get('ok') else None
+
+    def look_net(self, now, force=False):
+        if not IS_WINDOWS or not self.pid or (not force and now - self.net['at'] < ATELIER_NET_S):
+            return
+        try:
+            code, out = quiet_run(['netstat', '-ano'], timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.net = {'listening': None, 'error': str(e)[:120], 'at': now}
+            return
+        rows = parse_netstat(out)
+        mine = sorted({'%s:%d' % (h, p) for h, p, pid in rows if pid == self.pid})
+        others = sorted({'%s:%d (pid %d)' % (h, p, pid) for h, p, pid in rows if p == self.port and pid != self.pid})
+        wide = [a for a in mine if a.rpartition(':')[0] in ('0.0.0.0', '::') and a.rpartition(':')[2] == str(self.port)]
+        self.net = {'listening': mine, 'port_taken_by': others or None, 'at': now}
+        if wide:
+            log.error('Atelier : écoute sur toutes les adresses (%s) : arrêté.', ', '.join(wide))
+            self.stop('écoute sur toutes les adresses')
+            self.error = 'écoute sur toutes les adresses (%s) : arrêté' % ', '.join(wide)
+            self.next_try = now + 3600
+
+    # ---- préparation : environnement cloné de celui des travaux, source, Manager ----
+    def prepare(self, spec, lay):
+        jobs = lay['jobs']
+        if not all(comfy_done(jobs, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')):
+            raise RuntimeError('ComfyUI des travaux pas encore installé ici (essai comfyui d\'abord) : l\'atelier en clone l\'environnement')
+        root = lay['root']
+        root.mkdir(parents=True, exist_ok=True)
+        for d in ('data', 'logs'):
+            lay[d].mkdir(parents=True, exist_ok=True)
+        want = comfy_marker(spec, 'requirements')
+        mark = root / '.ok-env'
+        if not mark.exists():
+            self.state = 'préparation : environnement Python'
+            part = root / 'python.part'
+            rmtree(part)
+            rmtree(lay['python'])
+            if not can_hardlink(root):
+                need = folder_bytes(jobs['python'])
+                free = shutil.disk_usage(str(root)).free
+                if need + self.gpu.keep_free_bytes() > free:
+                    raise RuntimeError('liens physiques impossibles et disque trop plein pour copier l\'environnement (%.1f Go, %.1f Go libres)'
+                                       % (need / 1e9, free / 1e9))
+            t0 = time.time()
+            linked, copied = link_tree(jobs['python'], part)
+            os.replace(part, lay['python'])
+            mark.write_text(want)
+            log.info('Atelier : environnement Python cloné de celui des travaux en %s (%d liens physiques, %d copies).',
+                     fmt_duration(time.time() - t0), linked, copied)
+        self.env_note = None if mark.read_text().strip() == want else \
+            'environnement cloné d\'une version précédente du catalogue (gardé : supprimer atelier\\python pour le refaire)'
+        if not (lay['src'] / 'main.py').exists():
+            self.state = 'préparation : ComfyUI'
+            archive = download(spec['source']['url'], jobs['downloads'] / ('comfyui-' + spec['source']['sha256'][:12] + '.zip'),
+                               spec['source']['sha256'], 'ComfyUI (atelier)')
+            part = root / 'src.part'
+            rmtree(part)
+            safe_extract(archive, part)
+            if not (part / spec['source']['root'] / 'main.py').exists():
+                raise RuntimeError('archive ComfyUI sans %s/main.py' % spec['source']['root'])
+            rmtree(lay['src'])
+            os.replace(part / spec['source']['root'], lay['src'])
+            rmtree(part)
+        if IS_WINDOWS or list(lay['python'].glob('python3*._pth')):
+            write_pth(lay['python'], lay['src'])   # ._pth copié, jamais lié : celui des travaux ne bouge pas
+        self.manager = self.install_manager(spec, lay)
+        lay['extra'].write_text(atelier_extra_paths(jobs['data'] / 'models'), encoding='utf-8')
+
+    def install_manager(self, spec, lay):
+        """ComfyUI-Manager (paquet pip épinglé par ComfyUI : manager_requirements.txt). Un échec n'empêche pas l'atelier."""
+        if self.config.get('atelier_manager') is False:
+            return 'coupé (atelier_manager)'
+        req = lay['src'] / 'manager_requirements.txt'
+        if not req.exists():
+            return 'absent de cette version de ComfyUI'
+        want = hashlib.sha256(req.read_bytes()).hexdigest()[:16]
+        mark = lay['root'] / '.ok-manager'
+        if mark.exists() and mark.read_text().strip() == want:
+            return True
+        failed = lay['root'] / '.manager-failed'
+        if failed.exists() and time.time() - failed.stat().st_mtime < 3600:
+            return 'échec de l\'installation (nouvel essai dans l\'heure) : %s' % failed.read_text()[:160]
+        self.state = 'préparation : ComfyUI-Manager'
+        pins = [re.sub(r'\[[^\]]*\]', '', p) for p in spec['torch']['packages']]   # torch reste celui d'AMD
+        (lay['root'] / 'constraints.txt').write_text('\n'.join(pins) + '\n')
+        try:
+            run_logged([lay['exe'], '-s', '-m', 'pip', 'install', '--no-warn-script-location', '-r', req, '-c', lay['root'] / 'constraints.txt'],
+                       lay['logs'] / 'atelier-install.log', comfy_env(lay, spec['atelier']), 1800, self.stopping,
+                       what='installation de ComfyUI-Manager')
+        except (RuntimeError, OSError, JobLost) as e:
+            failed.write_text(str(e)[:300])
+            log.warning('Atelier : ComfyUI-Manager non installé (%s) ; l\'atelier démarre sans lui.', e)
+            return 'échec de l\'installation : %s' % str(e)[:160]
+        failed.unlink(missing_ok=True)
+        mark.write_text(want)
+        return True
+
+    # ---- marche, arrêt ----
+    def adopt(self, lay):
+        """Atelier resté en marche pendant la mise à jour ou le redémarrage du worker : repris tel quel (le travail de Alice
+        n'est pas coupé), seulement si ce numéro est bien le Python de l'atelier."""
+        st = read_json(lay['state'], {}) or {}
+        pid = st.get('pid')
+        if not pid or not same_file(process_exe(pid), lay['exe']):
+            lay['state'].unlink(missing_ok=True)
+            return False
+        self.proc, self.pid, self.port, self.listen = None, int(pid), int(st.get('port') or ATELIER_PORT), st.get('listen')
+        self.started_at = st.get('started_at')
+        log.info('Atelier repris en marche (pid %d, %s port %d).', self.pid, self.listen, self.port)
+        return True
+
+    def start(self, now):
+        spec = self.spec()
+        atelier = spec['atelier']
+        lay = atelier_layout(self.base, spec)
+        with self.env_lock:
+            self.prepare(spec, lay)
+        port = self.port_wanted(atelier)
+        try:   # quelque chose répond déjà sur ce port (une connexion, pas un bind : nos requêtes passées laissent des TIME_WAIT)
+            socket.create_connection(('127.0.0.1', port), timeout=2).close()
+            raise RuntimeError('port %d déjà pris sur ce PC (un autre ComfyUI ?)' % port)
+        except OSError:
+            pass
+        ip = self.remote_ip(now)
+        listen = '127.0.0.1' + (',' + ip if ip else '')
+        manager = self.manager is True
+        args = [str(lay['exe']), '-s', str(lay['src'] / 'main.py')] + atelier_args(spec, atelier, port, listen, lay['data'], lay['extra'], manager)
+        env = comfy_env(lay, atelier)
+        cors = self.config.get('atelier_cors_origin')
+        if cors:   # seulement pour une page web d'une autre origine ; ni l'interface de l'atelier ni curl n'en ont besoin
+            if isinstance(cors, str) and re.fullmatch(r'https?://[A-Za-z0-9.-]+(:\d+)?', cors):
+                args += ['--enable-cors-header', cors]
+            else:
+                log.warning('Atelier : atelier_cors_origin ignoré (une origine précise, http(s)://hôte[:port], jamais *) : %r', cors)
+        if self.gpu.hip_device:
+            env['HIP_VISIBLE_DEVICES'] = self.gpu.hip_device
+        flags, kwargs = self.gpu.spawn_options()
+        if IS_WINDOWS:
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        logf = lay['logs'] / 'atelier.log'
+        if logf.exists():
+            os.replace(logf, lay['logs'] / 'atelier.previous.log')
+        # Journal dans un fichier, pas dans un tube : l'atelier survit à un redémarrage du worker sans perdre sa sortie
+        with open(logf, 'wb') as out:
+            out.write(('# %s\n' % ' '.join(args[2:])).encode('utf-8', 'replace'))
+            out.flush()
+            self.proc = subprocess.Popen(args, cwd=str(lay['src']), stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                         env=env, creationflags=flags, **kwargs)
+        self.pid, self.port, self.listen, self.started_at = self.proc.pid, port, listen, time.strftime('%Y-%m-%d %H:%M:%S')
+        write_json(lay['state'], {'pid': self.pid, 'port': port, 'listen': listen, 'started_at': self.started_at})
+        self.state = 'démarrage'
+        log.info('Atelier ComfyUI lancé (pid %d) : %s port %d%s.', self.pid, listen, port, ', avec ComfyUI-Manager' if manager else '')
+        deadline = time.time() + float(atelier.get('start_timeout_s') or 600)
+        while True:
+            if self.stopping.is_set():
+                self.stop('arrêt du worker')
+                return
+            if self.proc.poll() is not None:
+                tail = log_tail(logf, 6)
+                self.forget(lay)
+                raise RuntimeError('ComfyUI s\'est arrêté au démarrage (code %s) : %s' % (self.proc.returncode, ' | '.join(tail)[-400:]))
+            if time.time() > deadline:
+                self.stop('pas prêt à temps')
+                raise RuntimeError('atelier pas prêt après %s' % fmt_duration(deadline - now))
+            try:
+                if comfy_local(port, 'GET', '/queue', timeout=5)[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(2)
+        self.state = 'en marche'
+        self.failures = 0
+        self.error = None
+        self.last_busy, self.freed = time.time(), False
+        self.look_net(time.time(), force=True)
+        self.purge(time.time())
+        log.info('Atelier prêt en %s : %s.', fmt_duration(time.time() - now), ', '.join(self.net.get('listening') or [listen]))
+
+    def forget(self, lay=None):
+        self.proc, self.pid, self.busy_flag, self.queue, self.vram, self.listen = None, None, False, None, {}, None
+        self.net = {'listening': None, 'at': 0.0}
+        try:
+            (lay or atelier_layout(self.base, self.spec()))['state'].unlink(missing_ok=True)
+        except (RuntimeError, OSError):
+            pass
+
+    def stop(self, why):
+        with self.lock:
+            if self.proc is not None and self.proc.poll() is None:
+                if IS_WINDOWS:   # avec ses enfants (un nœud additionnel peut lancer son propre processus)
+                    try:
+                        quiet_run(['taskkill', '/PID', str(self.proc.pid), '/T', '/F'], timeout=30)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                if self.proc.poll() is None:
+                    self.proc.kill()
+                try:
+                    self.proc.wait(30)
+                except subprocess.TimeoutExpired:
+                    pass
+            elif self.proc is None and self.pid:
+                try:
+                    lay = atelier_layout(self.base, self.spec())
+                    if same_file(process_exe(self.pid), lay['exe']):
+                        if IS_WINDOWS:
+                            quiet_run(['taskkill', '/PID', str(self.pid), '/T', '/F'], timeout=30)
+                        else:
+                            os.kill(self.pid, 9)
+                        deadline = time.time() + 15
+                        while process_exe(self.pid) and time.time() < deadline:
+                            time.sleep(0.2)
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    pass
+            if self.pid:
+                log.info('Atelier ComfyUI arrêté (%s).', why)
+            self.forget()
+            self.state = 'éteint'
+
+    def shutdown(self, why):
+        self.stopping.set()
+        self.stop(why)
+
+    # ---- file, mémoire vidéo ----
+    def poll(self):
+        """File de l'atelier -> occupé (calcul en cours ou en attente). Trois lectures ratées de suite : réputé occupé (un
+        ComfyUI qui calcule fort peut répondre lentement) jusqu'à ce qu'il réponde ou s'arrête."""
+        try:
+            code, q = comfy_local(self.port, 'GET', '/queue', timeout=5)
+            if code != 200 or not isinstance(q, dict):
+                raise OSError('HTTP %s' % code)
+            self.queue = (len(q.get('queue_running') or []), len(q.get('queue_pending') or []))
+            self.queue_errors = 0
+            self.busy_flag = sum(self.queue) > 0
+        except (OSError, ValueError):
+            self.queue_errors += 1
+            if self.queue_errors >= 3:
+                self.busy_flag = True
+        return self.busy_flag
+
+    def busy(self, live=False):
+        """Sans verrou : le fil principal n'attend jamais un démarrage de l'atelier (installation, jusqu'à quelques minutes)."""
+        if not self.pid or self.state != 'en marche':
+            return False
+        return self.poll() if live else self.busy_flag
+
+    def read_vram(self):
+        try:
+            dev = (((comfy_local(self.port, 'GET', '/system_stats', timeout=10)[1] or {}).get('devices') or [{}])[0])
+        except (OSError, ValueError):
+            return self.vram
+        mib = lambda v: int(v / 1048576) if isinstance(v, (int, float)) else None
+        self.vram = {'free_mib': mib(dev.get('vram_free')), 'total_mib': mib(dev.get('vram_total')),
+                     'atelier_mib': mib(dev.get('torch_vram_total'))}
+        return self.vram
+
+    def free(self, why, wait_s=COMFY_FREE_WAIT_S):
+        """Carte rendue par l'atelier (POST /free : modèles déchargés, cache vidé), sans l'arrêter : Alice garde sa page et
+        ses réglages. Attend que la mémoire gardée par son PyTorch retombe. -> Mio gardés après (None : inconnu)."""
+        if not self.pid or self.state != 'en marche':
+            return None
+        try:
+            comfy_local(self.port, 'POST', '/free', {'unload_models': True, 'free_memory': True}, timeout=10)
+        except (OSError, ValueError) as e:
+            log.warning('Atelier : POST /free a échoué (%s).', e)
+            return None
+        held, deadline = None, time.time() + wait_s
+        while True:
+            held = self.read_vram().get('atelier_mib')
+            if held is None or held <= ATELIER_FREE_DONE_MIB or time.time() > deadline:
+                break
+            time.sleep(1)
+        self.freed = True
+        log.info('Atelier : carte rendue (%s)%s.', why, '' if held is None else ', %d Mio gardés par son PyTorch' % held)
+        return held
+
+    # ---- tâches données par le hub (fil à part : un téléchargement de 6 Go ne bloque pas la surveillance) ----
+    def submit(self, task, post):
+        """Tâche reçue dans les ordres du hub. post(route_body) -> réponse du hub ({cancel}). Une à la fois ; une tâche déjà
+        vue n'est pas refaite (le hub la redonne tant qu'elle attend)."""
+        tid = task.get('id') if isinstance(task, dict) else None
+        if not isinstance(tid, int) or tid in self.tasks_seen or (self.task_thread and self.task_thread.is_alive()):
+            return
+        self.tasks_seen.add(tid)
+        self.task_thread = threading.Thread(target=self.run_task, args=(task, post), name='atelier-task', daemon=True)
+        self.task_thread.start()
+
+    def run_task(self, task, post):
+        tid, action = task['id'], str(task.get('action'))
+        now = {'stage': 'préparation', 'progress': 0.0}
+        stop, finished = threading.Event(), threading.Event()
+
+        def send(body):
+            try:
+                answer = post(tid, body) or {}
+                if answer.get('cancel'):
+                    stop.set()
+                return answer
+            except OSError:
+                return {}
+
+        def beat():
+            while not finished.wait(30):
+                send({'status': 'running', 'stage': now['stage'], 'progress': now['progress']})
+        answer = send({'status': 'running', 'stage': 'préparation', 'progress': 0})
+        if answer.get('ok') is False or answer.get('cancel'):
+            return
+        threading.Thread(target=beat, daemon=True).start()
+        progress = lambda frac, stage=None: now.update(progress=round(max(0.0, min(1.0, frac)), 3), **({'stage': str(stage)[:200]} if stage else {}))
+        result = {'ok': False, 'action': action}
+        t0 = time.time()
+        try:
+            params = check_atelier_task(action, task.get('params'))
+            log.info('Atelier : tâche %d (%s) %s', tid, action, json.dumps(params, ensure_ascii=False))
+            result.update(getattr(self, 'task_' + action)(tid, params, stop, progress))
+            result['ok'] = True
+        except (RuntimeError, OSError, ValueError, KeyError, JobLost, subprocess.SubprocessError) as e:
+            result['error'] = ('annulée : %s' % e) if stop.is_set() else str(e)[:600]
+            log.warning('Atelier : tâche %d (%s) ratée : %s', tid, action, result['error'])
+        finally:
+            finished.set()
+        result['elapsed_s'] = round(time.time() - t0, 1)
+        if result['ok']:
+            log.info('Atelier : tâche %d (%s) faite : %s', tid, action, json.dumps(result, ensure_ascii=False)[:600])
+        self.last_task = {'id': tid, 'action': action, 'ok': result['ok']}
+        for _ in range(5):
+            try:
+                post(tid, {'status': 'done' if result['ok'] else 'failed', 'result': result})
+                break
+            except OSError:
+                time.sleep(10)
+
+    def task_layout(self, need_env=False):
+        spec = self.spec()
+        lay = atelier_layout(self.base, spec)
+        if need_env and not ((lay['root'] / '.ok-env').exists() and lay['exe'].exists()):
+            raise RuntimeError('environnement de l\'atelier pas encore préparé : l\'allumer une fois d\'abord (atelier_enabled)')
+        for d in ('trash', 'journal'):
+            (lay['root'] / d).mkdir(parents=True, exist_ok=True)
+        return spec, lay
+
+    def to_trash(self, lay, path, tid, tag):
+        """Déplacé (jamais effacé) dans atelier\\trash : défaisable 30 jours. -> chemin dans la corbeille."""
+        day = lay['root'] / 'trash' / time.strftime('%Y%m%d')   # un dossier par jour : purgé après ATELIER_TRASH_DAYS
+        day.mkdir(parents=True, exist_ok=True)
+        dest = day / ('%s.%s%d' % (Path(path).name, tag, tid))
+        os.replace(path, dest)
+        mark = Path(str(path) + '.ok')
+        if mark.exists():
+            os.replace(mark, Path(str(dest) + '.ok'))
+        return dest
+
+    @staticmethod
+    def from_trash(src, dest):
+        """Remis à sa place, avec son témoin .ok (fichier déjà vérifié : pas re-haché)."""
+        os.replace(src, dest)
+        if Path(str(src) + '.ok').exists():
+            os.replace(str(src) + '.ok', str(dest) + '.ok')
+
+    def write_task_journal(self, lay, tid, entry):
+        write_json(lay['root'] / 'journal' / ('%d.json' % tid), dict(entry, at=time.strftime('%Y-%m-%d %H:%M:%S')))
+
+    def task_install_nodes(self, tid, p, stop, progress):
+        spec, lay = self.task_layout(need_env=p['pip'])
+        nodes = lay['data'] / 'custom_nodes'
+        nodes.mkdir(parents=True, exist_ok=True)
+        dest = nodes / p['name']
+        work = lay['tmp'] / ('pack-%d' % tid)
+        rmtree(work)
+        progress(0.05, 'téléchargement de %s au commit %s' % (p['url'], p['commit'][:12]))
+        archive = work / 'pack.zip'
+        digest = fetch_file('https://github.com/%s/%s/archive/%s.zip' % (p['owner'], p['repo'], p['commit']), archive, stop)
+        safe_extract(archive, work / 'x')
+        tops = [d for d in (work / 'x').iterdir() if d.is_dir()]
+        if len(tops) != 1:
+            raise RuntimeError('archive inattendue (%d dossiers à la racine)' % len(tops))
+        top = tops[0]
+        out = {'name': p['name'], 'path': str(dest), 'commit': p['commit'], 'archive_sha256': digest,
+               'install_py': 'présent, non exécuté (à lire avant de le lancer à la main)' if (top / 'install.py').exists() else None}
+        write_json(top / '.atelier-pack.json', {'url': p['url'], 'commit': p['commit'], 'archive_sha256': digest, 'task': tid,
+                                                'installed_at': time.strftime('%Y-%m-%d %H:%M:%S')})
+        displaced = self.to_trash(lay, dest, tid, 'remplace') if dest.exists() else None
+        os.replace(top, dest)
+        rmtree(work)
+        entry = {'action': 'install_nodes', 'installed': str(dest), 'displaced': str(displaced) if displaced else None, 'params': p}
+        self.write_task_journal(lay, tid, entry)
+        req = dest / 'requirements.txt'
+        if p['pip'] and req.exists():
+            progress(0.4, 'dépendances pip de %s' % p['name'])
+            env = comfy_env(lay, spec['atelier'])
+            tlog = lay['logs'] / ('task-%d.log' % tid)
+            pins = [re.sub(r'\[[^\]]*\]', '', x) for x in spec['torch']['packages']]
+            (lay['root'] / 'constraints.txt').write_text('\n'.join(pins) + '\n')   # torch reste celui d'AMD
+            with self.env_lock:
+                before = pip_freeze(lay['exe'], env, tlog, stop)
+                (lay['root'] / 'journal' / ('%d.pip-before.txt' % tid)).write_text('\n'.join(before) + '\n')
+                try:
+                    run_logged([lay['exe'], '-s', '-m', 'pip', 'install', '--no-warn-script-location', '-r', req, '-c', lay['root'] / 'constraints.txt'],
+                               tlog, env, 3600, stop, what='dépendances de %s' % p['name'])
+                except (RuntimeError, JobLost) as e:
+                    after = pip_freeze(lay['exe'], env, tlog)
+                    self.to_trash(lay, dest, tid, 'rate')   # pas de pack à moitié installé au prochain démarrage
+                    if displaced:
+                        self.from_trash(displaced, dest)
+                    entry.update(installed=None, displaced=None, failed=str(e)[:300], pip=pip_changes(before, after))
+                    self.write_task_journal(lay, tid, entry)
+                    raise RuntimeError('%s ; pack retiré, changements pip : %s' % (e, json.dumps(entry['pip'], ensure_ascii=False)[:300]))
+                after = pip_freeze(lay['exe'], env, tlog, stop)
+            (lay['root'] / 'journal' / ('%d.pip-after.txt' % tid)).write_text('\n'.join(after) + '\n')
+            out['pip'] = entry['pip'] = pip_changes(before, after)
+            self.write_task_journal(lay, tid, entry)
+        elif req.exists():
+            out['pip'] = 'requirements.txt présent, non installé (pip: false)'
+        out['replaced'] = str(displaced) if displaced else None
+        self.restart_wanted = True
+        out['restart'] = 'atelier relancé dès qu\'il ne calcule plus' if self.pid else 'chargé au prochain démarrage'
+        return {k: v for k, v in out.items() if v is not None}
+
+    def task_remove_nodes(self, tid, p, stop, progress):
+        spec, lay = self.task_layout()
+        dest = lay['data'] / 'custom_nodes' / p['name']
+        if not dest.exists():
+            raise RuntimeError('pas de pack %s dans custom_nodes' % p['name'])
+        trash = self.to_trash(lay, dest, tid, 'retire')
+        self.write_task_journal(lay, tid, {'action': 'remove_nodes', 'installed': None, 'displaced': str(trash), 'restore_to': str(dest)})
+        self.restart_wanted = True
+        return {'name': p['name'], 'trash': str(trash), 'note': 'paquets pip gardés (communs à d\'autres packs)'}
+
+    def task_download_model(self, tid, p, stop, progress):
+        spec, lay = self.task_layout()
+        folder = lay['data'] / 'models' / Path(*p['folder'].split('/'))
+        dest = folder / p['name']
+        size = p['size'] or remote_size(p['url'])
+        if not size:
+            raise RuntimeError('taille inconnue (pas de Content-Length) : donner size en octets')
+        free = shutil.disk_usage(str(lay['root'])).free
+        if size + self.gpu.keep_free_bytes() > free:
+            raise RuntimeError('disque : %.1f Go à poser, %.1f Go libres, %.0f Go à laisser libres' % (size / 1e9, free / 1e9, self.gpu.keep_free_bytes() / 1e9))
+        displaced = None
+        if dest.exists():
+            st = dest.stat()
+            if st.st_size == size and sha256_file(dest) == p['sha256']:
+                return {'path': str(dest), 'sha256': p['sha256'], 'size': size, 'note': 'déjà présent, identique'}
+            displaced = self.to_trash(lay, dest, tid, 'remplace')
+        progress(0.01, 'téléchargement de %s (%.2f Go)' % (p['name'], size / 1e9))
+        try:
+            # Deux essais : une empreinte fausse au bout de 6 Go ne se corrige pas en retéléchargeant huit fois
+            download_resume(p['url'], dest, p['sha256'], size, '%s (atelier)' % p['name'], stop,
+                            lambda frac: progress(0.01 + 0.98 * frac, 'téléchargement de %s : %d %%' % (p['name'], 100 * frac)), tries=2)
+        except BaseException:
+            if displaced and not dest.exists():
+                self.from_trash(displaced, dest)
+            raise
+        self.write_task_journal(lay, tid, {'action': 'download_model', 'installed': str(dest), 'displaced': str(displaced) if displaced else None, 'params': p})
+        out = {'path': str(dest), 'sha256': p['sha256'], 'size': size}
+        if displaced:
+            out['replaced'] = str(displaced)
+        return out
+
+    def task_remove_model(self, tid, p, stop, progress):
+        spec, lay = self.task_layout()
+        dest = lay['data'] / 'models' / Path(*p['folder'].split('/')) / p['name']
+        if not dest.exists():
+            raise RuntimeError('pas de fichier %s/%s dans les modèles de l\'atelier' % (p['folder'], p['name']))
+        trash = self.to_trash(lay, dest, tid, 'retire')
+        self.write_task_journal(lay, tid, {'action': 'remove_model', 'installed': None, 'displaced': str(trash), 'restore_to': str(dest)})
+        return {'trash': str(trash)}
+
+    def task_undo(self, tid, p, stop, progress):
+        """Défait une tâche : ce qu'elle a posé part à la corbeille, ce qu'elle avait remplacé ou retiré revient. Les paquets
+        pip ne sont pas défaits (l'état avant est dans journal\\<n>.pip-before.txt)."""
+        spec, lay = self.task_layout()
+        j = read_json(lay['root'] / 'journal' / ('%d.json' % p['task']))
+        if not j:
+            raise RuntimeError('tâche %d inconnue de cet atelier (pas de journal)' % p['task'])
+        if j.get('undone'):
+            raise RuntimeError('tâche %d déjà défaite (tâche %s)' % (p['task'], j['undone']))
+        installed, displaced = j.get('installed'), j.get('displaced')
+        back_to = j.get('restore_to') or installed
+        out = {'task': p['task'], 'action': j.get('action')}
+        if displaced and not Path(displaced).exists():
+            raise RuntimeError('ce que la tâche %d avait déplacé n\'est plus dans la corbeille (plus de %d jours ?)' % (p['task'], ATELIER_TRASH_DAYS))
+        if installed and Path(installed).exists():
+            out['trash'] = str(self.to_trash(lay, Path(installed), tid, 'defait'))
+        if displaced:
+            if Path(back_to).exists():
+                raise RuntimeError('%s existe déjà : rien remis à sa place' % back_to)
+            self.from_trash(displaced, back_to)
+            out['restored'] = back_to
+        j['undone'] = tid
+        write_json(lay['root'] / 'journal' / ('%d.json' % p['task']), j)
+        self.write_task_journal(lay, tid, {'action': 'undo', 'of': p['task'], 'installed': None, 'displaced': None})
+        if j.get('action') in ('install_nodes', 'remove_nodes'):
+            self.restart_wanted = True
+            if j.get('pip'):
+                out['pip_not_undone'] = j['pip']
+        return out
+
+    # ---- boucle ----
+    def tick(self, now=None):
+        now = time.time() if now is None else now
+        with self.lock:
+            if not self.looked_for_orphan:   # resté en marche pendant un redémarrage du worker : repris (ou arrêté s'il est éteint)
+                self.looked_for_orphan = True
+                try:
+                    lay = atelier_layout(self.base, self.spec())
+                    if lay['state'].exists() and self.adopt(lay):
+                        self.state = 'en marche'
+                        self.freed = False
+                except RuntimeError:
+                    pass
+            if not self.wanted():
+                if self.pid:
+                    self.stop('éteint depuis le hub' if not self.enabled() else 'hors du créneau (atelier_window_only)')
+                self.state = 'éteint'
+                self.error = None if not self.enabled() else self.error
+                return
+            if not self.pid:
+                if now < self.next_try:
+                    return
+                try:
+                    self.start(now)
+                except (RuntimeError, OSError, ValueError, KeyError) as e:
+                    self.failures += 1
+                    pause = min(1800, 30 * 2 ** (self.failures - 1))
+                    self.next_try = now + pause
+                    self.error = str(e)[:300]
+                    self.state = 'en échec'
+                    log.warning('Atelier : %s (nouvel essai dans %s).', e, fmt_duration(pause))
+                return
+            if not self.running():
+                code = self.proc.returncode if self.proc is not None else '?'
+                self.forget()
+                self.error = 'arrêté de lui-même (code %s)' % code
+                self.state = 'en échec'
+                self.failures += 1
+                self.next_try = now + min(1800, 30 * 2 ** (self.failures - 1))
+                log.warning('Atelier ComfyUI arrêté de lui-même (code %s) : relance dans %s.', code, fmt_duration(self.next_try - now))
+                return
+            busy = self.poll()
+            if self.restart_wanted and not busy:
+                self.restart_wanted = False
+                self.stop('nœuds ajoutés ou retirés : relance')
+                self.next_try = 0.0
+                return
+            if busy:
+                self.last_busy, self.freed = now, False
+            elif not self.freed and self.idle_free_s() > 0 and now - self.last_busy >= self.idle_free_s():
+                self.free('%s sans calcul' % fmt_duration(self.idle_free_s()), wait_s=0)
+            self.look_net(now)
+            if now - self.purge_at >= ATELIER_PURGE_S:
+                self.purge(now)
+            if now - self.vram_at >= 30:
+                self.vram_at = now
+                self.read_vram()
+            # Tailscale prêt après coup, adresse changée, pare-feu posé ou retiré : relance (seulement sans calcul en cours)
+            ip = self.remote_ip(now)
+            want = '127.0.0.1' + (',' + ip if ip else '')
+            if want != self.listen and not busy:
+                self.stop('adresse d\'écoute à changer : %s -> %s' % (self.listen, want))
+                self.next_try = 0.0
+
+    def describe(self):
+        d = {'enabled': self.enabled(), 'state': self.state, 'pid': self.pid, 'port': self.port, 'listen': self.listen,
+             'listening': self.net.get('listening'), 'tailscale_ip': self.ts.get('ip'),
+             'firewall': None if not (self.enabled() or self.pid) else 'prêt' if self.fw.get('ok') else (
+                 self.fw.get('problem') or ('à vérifier' if self.fw.get('ok') is None else 'pas prêt')),
+             'allowed_from': ','.join(self.fw.get('allow_from') or []) or None,
+             'busy': self.busy_flag if self.pid else None, 'queue': '%d+%d' % self.queue if self.queue else None,
+             'vram_free_mib': self.vram.get('free_mib'), 'vram_total_mib': self.vram.get('total_mib'),
+             'vram_atelier_mib': self.vram.get('atelier_mib'), 'freed': self.freed if self.pid else None,
+             'manager': self.manager if self.manager is not None else None, 'started_at': self.started_at, 'files_gb': self.files_gb,
+             'error': self.error or (self.ts.get('error') if self.pid and not self.ts.get('ip') else None), 'note': self.env_note,
+             'task': ('%(id)d %(action)s %(ok)s' % dict(self.last_task, ok='ok' if self.last_task['ok'] else 'raté')) if self.last_task else None,
+             'tasks': ','.join(ATELIER_TASK_ACTIONS)}   # ce que cette version sait faire : le hub ne donne de tâche qu'à elle
+        if self.net.get('port_taken_by'):
+            d['port_taken_by'] = ', '.join(self.net['port_taken_by'])
+        return {k: v for k, v in d.items() if v is not None}
+
+
 GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove')
 GPU_TEST_OBJECT = 'gpu-test-object.png'   # entrée de l'essai 3D demandé par le hub (512x512, fond blanc)
 # Réglages que le hub peut poser sur cette machine (POST /api/reuse/workers/:nom/settings), avec leurs types. Aucun autre.
-REMOTE_SETTINGS = {'enable_3d': (bool,), 'gpu_max_gb': (int, float), 'gpu_keep_loaded_s': (int, float)}
+REMOTE_SETTINGS = {'enable_3d': (bool,), 'gpu_max_gb': (int, float), 'gpu_keep_loaded_s': (int, float),
+                   'atelier_enabled': (bool,), 'atelier_window_only': (bool,), 'atelier_idle_free_s': (int, float),
+                   'atelier_keep_days': (int, float), 'atelier_files_max_gb': (int, float)}
 LOG_TAIL_LINES = 60
 
 

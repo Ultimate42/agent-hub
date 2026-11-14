@@ -80,6 +80,17 @@
                "--use-quad-cross-attention", "--disable-pinned-memory", "--log-stdout",
                "--base-directory", "{base}"],
       "env": { "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "MIOPEN_FIND_MODE": "2", "HF_HUB_OFFLINE": "1", "DO_NOT_TRACK": "1" },
+      "atelier": {
+        "notes": "Atelier de Alice (GPU.md) : seconde instance, environnement Python clone par liens physiques de celui-ci, noeuds additionnels et ComfyUI-Manager permis, ecoute 127.0.0.1 + adresse Tailscale (jamais 0.0.0.0, ajoutee seulement quand les regles de pare-feu du groupe 'ComfyUI atelier' sont en place). Allocateur extensible et compilateur coupe : 18 s par etape au lieu de 111 sur Klein (14/11).",
+        "port": 8188,
+        "start_timeout_s": 600,
+        "args": ["--listen", "{listen}", "--port", "{port}", "--disable-auto-launch", "--use-quad-cross-attention", "--disable-pinned-memory",
+                 "--disable-comfy-compiler", "--preview-method", "auto", "--log-stdout",
+                 "--base-directory", "{base}", "--extra-model-paths-config", "{extra}"],
+        "manager_args": ["--enable-manager"],
+        "env": { "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "MIOPEN_FIND_MODE": "2", "DO_NOT_TRACK": "1",
+                 "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True", "PYTORCH_ALLOC_CONF": "expandable_segments:True" }
+      },
       "reference": { "engine": "stable-diffusion.cpp Vulkan, Z-Image Turbo Q8_0, 1024x1024, encodeur texte sur CPU (mesure du 12/11, job 15)", "s_per_step": 13.2 },
       "workflow_source": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/benchmarks/image_z_image_turbo.json (30/09/2026)",
       "workflow": {
