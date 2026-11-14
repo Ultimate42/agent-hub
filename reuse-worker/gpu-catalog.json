@@ -263,7 +263,7 @@
              "min": 0.25,
              "max": 1.0,
              "default": 1.0,
-             "admin": true,
+             "admin": false,
              "notes": "Taille des références dans le modèle (1,0 = 1024x1024 environ, 4096 jetons par référence). 0,5 divise par deux les jetons ajoutés."
             },
             "vram_mode": {
