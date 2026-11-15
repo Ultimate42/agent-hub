@@ -265,7 +265,7 @@
             },
             "dynamic_vram": {
              "type": "bool",
-             "default": false,
+             "default": true,
              "admin": true,
              "notes": "Chargement dynamique de ComfyUI (comfy-aimdo). Coupé par défaut : sous Windows ROCm sans mémoire épinglée, il relit les poids qui ne tiennent pas en mémoire vidéo à chaque étape. Coupé, ComfyUI estime la place et charge tout d'un coup."
             },
@@ -284,7 +284,7 @@
               "normal",
               "low"
              ],
-             "default": "high",
+             "default": "normal",
              "admin": true,
              "notes": "Mode mémoire de ComfyUI. normal : il réserve pour l'échantillonnage une estimation prudente (0,15 Mo par unité de surface avec l'attention quad, environ 9 Go à 1024 avec une référence) et ne charge que le reste du DiT. Job 53 du 13/11 : « loaded partially; 6403 MB usable, 6241 loaded, 4341 offloaded », 260 s par étape. high (défaut) : le DiT de 11,1 Go est chargé en entier (--highvram). low : --lowvram."
             },
