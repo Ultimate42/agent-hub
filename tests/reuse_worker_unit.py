@@ -2288,6 +2288,36 @@ class AutoRepairWorkerTest(unittest.TestCase):
         self.assertIn('[auto-réparation : déjà tentée à', str(c.exception))
         self.assertEqual(self.events()[-1][0], 'repair_skipped')
 
+    def test_a_native_crash_with_sound_files_replays_with_a_safe_memory_profile_and_says_so(self):
+        self.file.write_bytes(self.data)
+        seen = []
+        def fake_run(job, src, workdir, stop, progress):
+            seen.append(dict(job.get('params') or {}))
+            if len(seen) == 1:
+                raise RuntimeError(self.CRASH)
+            return Path('out.png'), 1.0, {}
+        self.worker.gpu.run = fake_run
+        job = dict(self.job, params={'vram_mode': 'high', 'dynamic_vram': False, 'text_encoder': 'cpu'})
+        out, secs, meta = self.worker.run_gpu(job, None, self.base, threading.Event(), lambda f, st: None)
+        self.assertEqual(seen[0], {'vram_mode': 'high', 'dynamic_vram': False, 'text_encoder': 'cpu'})
+        self.assertEqual(seen[1], {'vram_mode': 'normal', 'dynamic_vram': True, 'text_encoder': 'cpu'})
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(job['params']['vram_mode'], 'high', 'the caller job is left untouched')
+        self.assertEqual(meta['repair_profile']['vram_mode'], {'job': 'high', 'safe': 'normal'})
+        self.assertIn('profil mémoire sûr', meta['repair'])
+        ev = dict(self.events())
+        self.assertEqual(ev['repair_safe_profile_ok']['profile']['dynamic_vram'], {'job': False, 'safe': True})
+        self.assertEqual(ev['repair_replay']['safe_profile'], {'vram_mode': 'normal', 'dynamic_vram': True})
+        # Une panne de fichier (poids faux) : mêmes paramètres au rejeu, pas de profil sûr
+        self.worker.repairs.clear()
+        seen.clear()
+        broken = bytearray(self.data)
+        broken[10] ^= 0xFF
+        self.file.write_bytes(bytes(broken))
+        out, secs, meta = self.worker.run_gpu(job, None, self.base, threading.Event(), lambda f, st: None)
+        self.assertEqual(seen[0], seen[1])
+        self.assertNotIn('repair_profile', meta)
+
     def test_an_ordinary_failure_is_not_repaired_until_it_happens_twice_in_a_row_on_the_same_model(self):
         self.file.write_bytes(self.data)
         with self.assertRaises(RuntimeError):

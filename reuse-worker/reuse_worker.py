@@ -2235,7 +2235,7 @@ class Worker:
         if last and now - last['at'] < REPAIR_EVERY_S:
             note = 'déjà tentée à %s : %s' % (time.strftime('%H:%M', time.localtime(last['at'])), last['summary'])
             self.event('repair_skipped', model=model, job=jid, reason=why, last=note[:400])
-            return False, note
+            return False, note, False
         self.event('repair_started', model=model, job=jid, reason=why, error=str(error)[:300])
         self.gpu.stop_comfy('auto-réparation')
         self.gpu.stop_server('auto-réparation')
@@ -2250,6 +2250,7 @@ class Worker:
             replay = bool(bad) and not stuck
             extra = []
             env = None
+            sound = False   # crash natif, fichiers et environnement sains : le profil mémoire devient le suspect
             spec = (self.gpu.catalog.get('benchmarks') or {}).get('comfyui')
             engine = (((self.gpu.catalog.get('types') or {}).get(job.get('kind')) or {}).get('models') or {}).get(model, {}).get('engine')
             if engine == 'comfyui' and spec and not stuck:
@@ -2282,6 +2283,7 @@ class Worker:
                     self.event('repair_caches', model=model, job=jid, freed_mb=round(freed / 1e6, 1))
                     extra.append('caches de calcul vidés (%.0f Mo)' % (freed / 1e6))
                     replay = True
+                    sound = True
             summary = ' ; '.join([verify_summary(files, env)] + extra)
             if not stuck:   # un fichier impossible à retirer (atelier en calcul) : nouvel essai au prochain échec, sans attendre 6 h
                 self.repairs[model] = {'at': now, 'summary': summary[:300]}
@@ -2289,12 +2291,24 @@ class Worker:
             if not bad and not (env and env['bad_count']):
                 summary += ' : cause ailleurs que dans les fichiers'
             self.event('repair_finished', model=model, job=jid, replay=replay, summary=summary[:600])
-            return replay, summary
+            return replay, summary, sound
         except (RuntimeError, OSError, ValueError, KeyError) as e:
             self.event('repair_failed', model=model, job=jid, error=str(e)[:300])
-            return False, 'ratée : %s' % str(e)[:200]
+            return False, 'ratée : %s' % str(e)[:200], False
         finally:
             self.atelier.unhold()
+
+    def safe_memory_profile(self, job):
+        """Réglages mémoire plus sûrs que ceux du travail, parmi ceux que le catalogue donne à ce modèle : vram_mode normal et
+        dynamic_vram vrai (text_encoder inchangé). -> {réglage: (valeur du travail, valeur sûre)}, vide si rien à changer."""
+        model = (((self.gpu.catalog.get('types') or {}).get(job.get('kind')) or {}).get('models') or {}).get(job.get('model')) or {}
+        defs, given, changes = model.get('params') or {}, job.get('params') or {}, {}
+        for name, safe in SAFE_MEMORY_PROFILE.items():
+            if name in defs:
+                now = given.get(name, defs[name].get('default'))
+                if now != safe:
+                    changes[name] = (now, safe)
+        return changes
 
     def run_gpu(self, job, src, jobdir, stop, progress):
         """Gpu.run, puis, si l'échec le justifie (repair_reason), auto-réparation et un seul nouvel essai sur place."""
@@ -2316,10 +2330,14 @@ class Worker:
             why = self.repair_reason(job, e)
             if not why:
                 raise
-            replay, summary = self.auto_repair(job, why, e, stop, progress)
+            replay, summary, sound = self.auto_repair(job, why, e, stop, progress)
             if not replay:
                 raise RuntimeError('%s [auto-réparation : %s]' % (str(e)[:150], summary[:140]))
-            self.event('repair_replay', model=model, job=job.get('id'))
+            safe = self.safe_memory_profile(job) if sound else {}
+            if safe:   # rien de faux dans les fichiers ni l'environnement : rejeu avec un profil mémoire sûr, une seule fois
+                job = dict(job, params=dict(job.get('params') or {}, **{k: v[1] for k, v in safe.items()}))
+                summary += ' ; rejeu avec un profil mémoire sûr (%s)' % ', '.join('%s %s -> %s' % (k, v[0], v[1]) for k, v in safe.items())
+            self.event('repair_replay', model=model, job=job.get('id'), safe_profile={k: v[1] for k, v in safe.items()} or None)
             progress(0.0, 'nouvel essai après auto-réparation')
             try:
                 out, compute_s, meta = once()
@@ -2328,8 +2346,12 @@ class Worker:
                 raise type(e2)('%s [après auto-réparation : %s]' % (str(e2)[:150], summary[:140])) if isinstance(e2, Final) else \
                     RuntimeError('%s [après auto-réparation : %s]' % (str(e2)[:150], summary[:140]))
             self.event('repair_replay_ok', model=model, job=job.get('id'), summary=summary[:300])
+            if safe:   # l'admin voit que le profil par défaut de ce modèle pose problème sur ce PC
+                self.event('repair_safe_profile_ok', model=model, job=job.get('id'), reason=why,
+                           profile={k: {'job': v[0], 'safe': v[1]} for k, v in safe.items()})
+                meta = dict(meta, repair_profile={k: {'job': v[0], 'safe': v[1]} for k, v in safe.items()})
             self.model_failures[model] = 0
-            return out, compute_s, dict(meta, repair=summary[:200])
+            return out, compute_s, dict(meta, repair=summary[:240])
         self.model_failures[model] = 0
         return result
 
@@ -4810,6 +4832,7 @@ CRASH_TEXT = re.compile(r'access violation|Windows fatal exception|Fatal Python 
 FILE_ERROR_TEXT = re.compile(r'HeaderTooLarge|MetadataIncompleteBuffer|InvalidHeader|Error while deserializing|invalid load key|'
                              r'PytorchStreamReader failed|unexpected EOF|file (?:is )?(?:corrupt|truncated)|failed to (?:read|load) (?:tensor|model)|'
                              r'gguf_init|invalid magic|checksum mismatch|safetensors_rust', re.I)
+SAFE_MEMORY_PROFILE = {'vram_mode': 'normal', 'dynamic_vram': True}   # rejeu après un plantage natif sans fichier faux
 REPAIR_STATE = 'auto-repair.json'   # dernières réparations et réinstallation : gardées d'un démarrage à l'autre
 REPAIR_EVERY_S = 6 * 3600       # une même réparation automatique au plus toutes les 6 h par modèle (pas de boucle)
 ENV_REPAIR_EVERY_S = 24 * 3600  # réinstallation automatique de l'environnement ComfyUI : au plus une fois par jour
