@@ -1945,6 +1945,9 @@ class AutoRepairTest(unittest.TestCase):
         self.assertEqual(w.crash_kind('sd-cli a échoué (code 139)'), 'SIGSEGV')
         self.assertIsNotNone(w.crash_kind('   13s Windows fatal exception: access violation'))
         self.assertIsNone(w.crash_kind('sd-cli a échoué (code 1) : out of memory'))
+        # exit(-1) sous Windows (4294967295) ou tué par SIGKILL/SIGTERM : pas des exceptions Windows
+        for code in ('-1', '4294967295', '-9', '-15'):
+            self.assertIsNone(w.crash_kind('ComfyUI s\'est arrêté pendant le calcul (code %s) : x' % code), code)
         self.assertIsNone(w.crash_kind('génération trop lent : 115.8 s par étape'))
         self.assertIsNotNone(w.file_error('Error while deserializing header: HeaderTooLarge'))
         self.assertIsNotNone(w.file_error('safetensors_rust.SafetensorError: MetadataIncompleteBuffer'))
@@ -2007,6 +2010,20 @@ class AutoRepairTest(unittest.TestCase):
         self.assertNotIn('action', by['never.safetensors'], 'a file never installed is left to the next job (cap and disk checked there)')
         self.assertEqual(stages[-1], (1.0, 'vérification finie'))
         self.assertIn('te.safetensors : empreinte -> effacé ; retéléchargé et vérifié', w.verify_summary(res))
+
+    def test_a_known_link_is_removed_only_while_it_is_still_the_same_file(self):
+        good = b'a' * 300
+        e = self.entry('ae.safetensors', good)
+        (self.dir / 'ae.safetensors').write_bytes(b'b' * 300)
+        other = self.dir / 'engine-ae.safetensors'
+        other.write_bytes(good)   # l'autre nom a déjà été retéléchargé à part (plus haut dans la même vérification)
+        Path(str(other) + '.ok').write_text('x')
+        e['links'] = [str(other)]
+        res = w.verify_files([e], repair=True)
+        self.assertEqual(res[0]['state'], 'empreinte')
+        self.assertFalse((self.dir / 'ae.safetensors').exists())
+        self.assertEqual(other.read_bytes(), good, 'no longer the same file: kept')
+        self.assertTrue(Path(str(other) + '.ok').exists())
 
     def test_a_file_held_open_is_released_once_then_removed(self):
         data = b'x' * 100
@@ -2074,7 +2091,7 @@ class AutoRepairTest(unittest.TestCase):
         p.write_bytes(b'x')
         self.assertEqual([e['name'] for e in gpu.model_entries(None, installed_only=True)], [klein[1]['name']])
 
-    def test_environment_reset_keeps_the_weights_and_asks_the_workshop_to_reclone(self):
+    def test_environment_reset_keeps_the_weights_and_the_workshop_environment(self):
         spec = w.comfy_spec(Path(w.__file__).resolve().parent)
         lay = w.comfy_layout(self.dir, spec)
         for d in (lay['python'] / 'Lib', lay['src'], lay['data'] / 'models' / 'vae', lay['cache'] / 'miopen'):
@@ -2093,7 +2110,8 @@ class AutoRepairTest(unittest.TestCase):
         self.assertFalse(lay['python'].exists() or lay['src'].exists())
         self.assertFalse(any(w.comfy_done(lay, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')))
         self.assertTrue((lay['data'] / 'models' / 'vae' / 'ae.safetensors').exists(), 'weights kept')
-        self.assertFalse((at['root'] / '.ok-env').exists(), 'the workshop clones the new environment at its next start')
+        # L'atelier n'est pas recloné : son Python porte les paquets pip de ses nœuds (install_nodes, Manager)
+        self.assertTrue((at['root'] / '.ok-env').exists(), 'the workshop keeps its own environment')
 
     def test_remote_verify_models_reports_files_and_environment(self):
         r = w.gpu_test_report(self.dir, {}, 'verify_models', {'model': 'nope'})
@@ -2201,6 +2219,28 @@ class AutoRepairWorkerTest(unittest.TestCase):
         self.runs = []
         self.job = {'id': 187, 'kind': 'image', 'model': 'flux3-klein'}
 
+    def restart(self):
+        """Le worker redémarre (mise à jour au merge, PC relancé) : seul ce qui est sur le disque reste."""
+        self.worker = w.Worker(self.base, None)
+        self.worker.hub = FakeHub(200)
+        self.worker.gpu.model_entries = lambda model=None, installed_only=False: self.entries
+
+    def test_the_6_hour_guard_survives_a_restart_and_a_broken_state_file_never_stops_the_worker(self):
+        self.file.write_bytes(self.data)
+        with self.assertRaises(RuntimeError):
+            self.run_with([RuntimeError(self.CRASH), RuntimeError(self.CRASH)])
+        self.assertTrue((self.base / w.REPAIR_STATE).exists())
+        self.restart()
+        self.runs.clear()
+        with self.assertRaises(RuntimeError) as c:
+            self.run_with([RuntimeError(self.CRASH)])
+        self.assertEqual(len(self.runs), 1, 'no second repair nor replay after a restart')
+        self.assertIn('[auto-réparation : déjà tentée à', str(c.exception))
+        for broken in ('[1, 2]', '{"repairs": [1], "env_reset_at": "x"}', '{"repairs": {"m": 3}}', 'pas du json'):
+            (self.base / w.REPAIR_STATE).write_text(broken)
+            self.restart()
+            self.assertEqual((self.worker.repairs, self.worker.env_reset_at), ({}, 0.0), broken)
+
     def run_with(self, outcomes):
         def fake_run(job, src, workdir, stop, progress):
             self.runs.append(job['id'])
@@ -2293,7 +2333,10 @@ class AutoRepairWorkerTest(unittest.TestCase):
             env = dict(self.events())['repair_env']
             self.assertEqual(env['bad'][0]['file'], 'torch/c10.dll')
             self.assertIn('environnement ComfyUI refait', meta['repair'])
-            # Même panne le lendemain matin (moins de 24 h) : pas de seconde réinstallation automatique
+            # Même panne le lendemain matin (moins de 24 h), worker redémarré entre-temps : pas de seconde réinstallation
+            self.restart()
+            self.worker.atelier.hold = lambda why: held.append(why) or False
+            self.assertGreater(self.worker.env_reset_at, 0, 'kept on disk')
             self.worker.repairs.clear()
             (sp / 'torch-2.13.0.dist-info').mkdir(parents=True)
             (sp / 'torch').mkdir()

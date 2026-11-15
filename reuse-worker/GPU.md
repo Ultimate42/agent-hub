@@ -299,7 +299,7 @@ Ce que fait un essai :
   - `comfyui` (width, height, steps, seed, runs) ;
   - `comfyui_remove` ;
   - `comfyui_reinstall` : Python, torch, dépendances et source de ComfyUI des travaux refaits (25 min environ), poids
-    gardés ; l'atelier est arrêté pendant ce temps (refusé s'il calcule), puis recloné à son redémarrage ;
+    gardés ; l'atelier est arrêté pendant ce temps (refusé s'il calcule), puis reparti avec son propre environnement (paquets de ses nœuds gardés) ;
   - `verify_models` (model, repair, env) : voir « Auto-réparation » ci-dessous.
 - Le worker le lance entre deux travaux, dans son créneau horaire et hors pause. Il n'y a qu'un essai ouvert à la fois
   par machine. Tant qu'un essai attend, la machine ne reçoit pas de nouveau travail, mais seulement si sa version
@@ -345,11 +345,13 @@ revérifiés. Désormais :
      puis retéléchargé et vérifié. S'il est tenu ouvert (atelier qui l'a chargé), l'atelier est arrêté s'il ne calcule
      pas, puis repart seul.
   3. ComfyUI : chaque fichier de son Python comparé à l'empreinte inscrite par pip (`RECORD`). S'il est abîmé,
-     l'environnement est refait aussitôt, poids gardés (25 min environ, une fois par jour au plus). L'atelier, qui en
-     est un clone par liens physiques, reste éteint pendant ce temps puis se reclone à son redémarrage.
+     l'environnement est refait aussitôt, poids gardés (25 min environ, une fois par jour au plus, même après un redémarrage du worker). L'atelier, qui en
+     est un clone par liens physiques, reste éteint pendant ce temps puis repart avec son propre environnement, qui
+     garde les paquets pip de ses nœuds (supprimer `atelier\python` pour le recloner à la main).
   4. Rien de faux après un plantage natif : caches de calcul vidés (MIOpen, torch, temporaires).
   5. Le travail est rejoué une fois. Échec : raison d'origine plus « [après auto-réparation : …] ».
-- Une même réparation au plus toutes les 6 h par modèle : un nouvel échec dit « déjà tentée à HH:MM : … ».
+- Une même réparation au plus toutes les 6 h par modèle : un nouvel échec dit « déjà tentée à HH:MM : … » Ces deux délais sont
+  gardés dans `auto-repair.json` (dossier du worker) : une mise à jour ou un redémarrage ne les rouvre pas.
 - Chaque étape est envoyée au hub (`POST /api/reuse/worker/events`) et lisible dans le journal du worker
   (`GET /api/reuse/workers/<nom>/settings`, `history`) : `repair_started` (raison, erreur), `repair_file` (fichier,
   état sain | taille | empreinte | absent | illisible, action), `repair_env` (paquets, fichiers, fichiers abîmés),

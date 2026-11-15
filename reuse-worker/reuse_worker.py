@@ -1801,8 +1801,14 @@ class Worker:
         self.refused_version = None
         self.engine_failures = 0
         self.model_failures = {}   # modèle -> échecs de suite (remis à zéro au premier succès)
-        self.repairs = {}          # modèle -> {at, summary} de la dernière auto-réparation (au plus une par REPAIR_EVERY_S)
-        self.env_reset_at = 0.0    # dernière réinstallation automatique de l'environnement ComfyUI
+        # Gardés sur le disque (auto-repair.json) : un redémarrage (mise à jour au merge, PC relancé) ne rouvre ni une
+        # réparation de moins de 6 h, ni une réinstallation de l'environnement (25 min, plusieurs Go) de moins de 24 h
+        saved = read_json(base / REPAIR_STATE, {})
+        saved = saved if isinstance(saved, dict) else {}
+        self.repairs = {str(k): v for k, v in (saved.get('repairs') or {}).items()
+                        if isinstance(v, dict) and isinstance(v.get('at'), (int, float))} if isinstance(saved.get('repairs'), dict) else {}
+        at = saved.get('env_reset_at')
+        self.env_reset_at = float(at) if isinstance(at, (int, float)) else 0.0   # dernière réinstallation automatique de l'environnement ComfyUI
 
     # ---- état lisible ---------------------------------------------------------------------
     def bad_versions(self):
@@ -2178,6 +2184,12 @@ class Worker:
             self.set_state('en attente')
 
     # ---- auto-diagnostic et auto-réparation (GPU.md, « Auto-réparation ») ----
+    def save_repairs(self):
+        try:
+            write_json(self.base / REPAIR_STATE, {'repairs': self.repairs, 'env_reset_at': self.env_reset_at})
+        except OSError as e:
+            log.warning('Auto-réparation : état non écrit (%s).', e)
+
     def event(self, what, **detail):
         """Étape d'un diagnostic ou d'une réparation : écrite dans worker.log et envoyée au hub (journal du worker,
         GET /api/reuse/workers/<nom>/settings). Un hub plus ancien (404) ou injoignable ne bloque rien."""
@@ -2254,10 +2266,11 @@ class Worker:
                     elif self.atelier.busy(live=True, sure=True):
                         extra.append('réinstallation de l\'environnement remise : l\'atelier calcule')
                         replay = False
-                    else:   # l'atelier clone cet environnement : gardé éteint, puis recloné à son redémarrage
+                    else:   # l'atelier tient ces fichiers (liens physiques) : gardé éteint, puis reparti avec son propre environnement
                         self.atelier.hold('environnement ComfyUI des travaux refait (auto-réparation)')
                         freed = comfy_reset_env(self.base, spec)
                         self.env_reset_at = now
+                        self.save_repairs()
                         self.event('repair_env_reset', model=model, job=jid, freed_gb=round(freed / 1e9, 2))
                         t1 = time.time()
                         comfy_install(self.base, spec, self.gpu, stop, lambda f, st: progress(0.3 * f, 'auto-réparation : %s' % st), {}, files=[])
@@ -2272,6 +2285,7 @@ class Worker:
             summary = ' ; '.join([verify_summary(files, env)] + extra)
             if not stuck:   # un fichier impossible à retirer (atelier en calcul) : nouvel essai au prochain échec, sans attendre 6 h
                 self.repairs[model] = {'at': now, 'summary': summary[:300]}
+                self.save_repairs()
             if not bad and not (env and env['bad_count']):
                 summary += ' : cause ailleurs que dans les fichiers'
             self.event('repair_finished', model=model, job=jid, replay=replay, summary=summary[:600])
@@ -2618,7 +2632,7 @@ class Worker:
         # 3D : image d'objet livrée avec le worker (tasse rendue maison, sans licence tierce) : l'essai ne dépend pas du moteur image
         bundled = self.app / GPU_TEST_OBJECT
         try:
-            if kind == 'comfyui_reinstall':   # l'atelier clone cet environnement : gardé éteint, puis recloné à son redémarrage
+            if kind == 'comfyui_reinstall':   # l'atelier tient ces fichiers (liens physiques) : gardé éteint, puis reparti tel quel
                 self.atelier.hold('réinstallation de l\'environnement ComfyUI des travaux (essai %d)' % tid)
             report = gpu_test_report(self.base, dict(self.config), kind, test.get('params') or {},
                                      bundled if kind == '3d' and bundled.exists() else None, stop, progress, unlock=self.unlock_for_repair)
@@ -4796,6 +4810,7 @@ CRASH_TEXT = re.compile(r'access violation|Windows fatal exception|Fatal Python 
 FILE_ERROR_TEXT = re.compile(r'HeaderTooLarge|MetadataIncompleteBuffer|InvalidHeader|Error while deserializing|invalid load key|'
                              r'PytorchStreamReader failed|unexpected EOF|file (?:is )?(?:corrupt|truncated)|failed to (?:read|load) (?:tensor|model)|'
                              r'gguf_init|invalid magic|checksum mismatch|safetensors_rust', re.I)
+REPAIR_STATE = 'auto-repair.json'   # dernières réparations et réinstallation : gardées d'un démarrage à l'autre
 REPAIR_EVERY_S = 6 * 3600       # une même réparation automatique au plus toutes les 6 h par modèle (pas de boucle)
 ENV_REPAIR_EVERY_S = 24 * 3600  # réinstallation automatique de l'environnement ComfyUI : au plus une fois par jour
 VERIFY_REPORT_MAX = 30          # fichiers abîmés listés au plus dans un rapport
@@ -4812,7 +4827,7 @@ def crash_kind(message):
         if 128 < n < 192 and n - 128 in SIGNAL_NAMES:
             return SIGNAL_NAMES[n - 128]
         u = n & 0xFFFFFFFF
-        if u >= 0xC0000000:
+        if 0xC0000000 <= u <= 0xCFFFFFFF:
             return '%s (0x%08X)' % (NTSTATUS_NAMES.get(u, 'exception Windows'), u)
     m = CRASH_TEXT.search(text)
     return m.group(0) if m else None
@@ -4892,7 +4907,12 @@ def verify_files(entries, repair=False, stop=None, progress=None, unlock=None, f
         if not r['ok'] and r['state'] != 'absent' and repair:
             doomed = [path, Path(str(path) + '.ok')]
             for link in e.get('links') or []:
-                doomed += [Path(link), Path(str(link) + '.ok')]
+                try:   # encore le même fichier ? (déjà retéléchargé à part, plus haut dans la liste : gardé)
+                    same = os.path.samefile(link, path)
+                except OSError:
+                    same = False
+                if same:
+                    doomed += [Path(link), Path(str(link) + '.ok')]
             left = remove_with_retry(doomed, unlock)
             if left:
                 r['action'] = 'retrait impossible : %s' % left[:200]
@@ -4978,16 +4998,15 @@ def verify_python_env(python_dir, stop=None, progress=None, limit=VERIFY_REPORT_
 
 def comfy_reset_env(base, spec):
     """Environnement Python et source de ComfyUI des travaux retirés (poids gardés) : refaits à la prochaine installation
-    (essai comfyui ou premier travail, 25 min environ). Le clone de l'atelier est marqué à refaire : il venait du même
-    environnement, par liens physiques. -> octets libérés."""
+    (essai comfyui ou premier travail, 25 min environ). Le clone de l'atelier n'est pas touché : copie indépendante par
+    liens physiques, il porte en plus les paquets pip de ses nœuds (install_nodes, Manager), qu'un reclonage effacerait
+    (supprimer atelier\\python pour le refaire à la main). -> octets libérés."""
     lay = comfy_layout(base, spec)
     freed = sum(folder_bytes(p) for p in (lay['python'], lay['src']) if p.exists())
     for step in ('python', 'pip', 'source', 'torch', 'requirements'):
         (lay['root'] / ('.ok-' + step)).unlink(missing_ok=True)
     rmtree(lay['python'])
     rmtree(lay['src'])
-    if spec.get('atelier'):
-        (atelier_layout(base, spec)['root'] / '.ok-env').unlink(missing_ok=True)
     for p in (lay['python'], lay['src']):
         if p.exists():
             raise RuntimeError('%s n\'a pas pu être supprimé entièrement (fichier ouvert ?)' % p)
