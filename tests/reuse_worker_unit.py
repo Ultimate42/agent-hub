@@ -880,10 +880,10 @@ class KleinJobTest(unittest.TestCase):
             self.assertTrue(meta2.get('server_reused'))
             self.assertEqual(gpu.comfy['h']['proc'].pid, pid)
             self.assertNotIn('images.image0', json.loads((lay['data'] / 'last-workflow.json').read_text())['refs']['inputs'])
-            # Réglages par défaut : demi-précision, chargement estimé (pas dynamique), une seule attention ; et le diagnostic
+            # Réglages par défaut (15/11 : Klein en mémoire normale et dynamique) : demi-précision, une seule attention ; et le diagnostic
             cmd = (base / 'gpu' / 'logs' / 'comfyui.log').read_text().splitlines()[0]
             self.assertIn('--fp16-unet', cmd)
-            self.assertIn('--disable-dynamic-vram', cmd)
+            self.assertNotIn('--disable-dynamic-vram', cmd)
             self.assertEqual(sum(cmd.count(f) for f in w.ATTENTION_FLAGS), 1)
             self.assertEqual((meta['weight_dtype'], meta['compute_dtype']), ('float16', 'float16'))
             self.assertTrue(meta['load'].startswith('loaded completely'))
@@ -891,7 +891,7 @@ class KleinJobTest(unittest.TestCase):
             self.assertTrue(meta['te_load'].startswith('loaded completely; 15000'), meta)
             self.assertGreaterEqual(meta['before_dit_s'], 0.3)
             self.assertIn('vram_free_min_mib', meta)
-            self.assertIn('--highvram', cmd)
+            self.assertNotIn('--highvram', cmd)
             self.assertEqual(meta['text_encoder'], 'gpu')
             self.assertEqual(meta['vram_state'], 'NORMAL_VRAM')
             self.assertEqual(meta['unet_dtype'], 'fp16')
