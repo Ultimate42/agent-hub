@@ -297,7 +297,10 @@ Ce que fait un essai :
   - `image` (512 par défaut ; paramètres width, height, steps, seed) ;
   - `3d` (res, steps, seed, texture) ;
   - `comfyui` (width, height, steps, seed, runs) ;
-  - `comfyui_remove`.
+  - `comfyui_remove` ;
+  - `comfyui_reinstall` : Python, torch, dépendances et source de ComfyUI des travaux refaits (25 min environ), poids
+    gardés ; l'atelier est arrêté pendant ce temps (refusé s'il calcule), puis recloné à son redémarrage ;
+  - `verify_models` (model, repair, env) : voir « Auto-réparation » ci-dessous.
 - Le worker le lance entre deux travaux, dans son créneau horaire et hors pause. Il n'y a qu'un essai ouvert à la fois
   par machine. Tant qu'un essai attend, la machine ne reçoit pas de nouveau travail, mais seulement si sa version
   annonce ce type d'essai (`info.tests`). Sinon elle continue ses travaux, et le `warning` du test dit pourquoi il attend.
@@ -326,6 +329,44 @@ Réglages que le hub peut poser, et aucun autre :
   (0 à 86400), `atelier_keep_days` (0,5 à 365), `atelier_files_max_gb` (1 à 500).
 
 Ils sont envoyés à chaque échange. Le worker les pose sur sa config en mémoire, sans réécrire le fichier du PC.
+
+## Auto-réparation : fichiers de modèle et environnement revérifiés sans geste humain
+
+Le témoin `<fichier>.ok` (empreinte, taille, date) évite de re-hacher 20 Go à chaque travail, mais il ne voit pas un
+fichier changé en place sans que sa date bouge (secteur abîmé, écriture par projection mémoire, lien physique réécrit).
+Panne du 15/11 : jobs Klein 187 à 192 plantés en code natif (0xC0000005 dans `torch\lib\c10.dll`), fichiers jamais
+revérifiés. Désormais :
+- Déclencheurs, pour tout modèle : un plantage en code natif (code de sortie Windows 0xC…, signal POSIX, « fatal
+  exception » dans le journal), un message de poids illisible (safetensors, GGUF), ou deux échecs de suite sur le même
+  modèle. Pas après un échec `Final` (trop lent, image noire) ni un travail repris par l'atelier.
+- Étapes, sur place, pendant le travail :
+  1. ComfyUI et le moteur résident arrêtés.
+  2. Chaque fichier du modèle (liste du catalogue) re-haché en entier ; un fichier faux (taille ou SHA-256) est effacé
+     puis retéléchargé et vérifié. S'il est tenu ouvert (atelier qui l'a chargé), l'atelier est arrêté s'il ne calcule
+     pas, puis repart seul.
+  3. ComfyUI : chaque fichier de son Python comparé à l'empreinte inscrite par pip (`RECORD`). S'il est abîmé,
+     l'environnement est refait aussitôt, poids gardés (25 min environ, une fois par jour au plus). L'atelier, qui en
+     est un clone par liens physiques, reste éteint pendant ce temps puis se reclone à son redémarrage.
+  4. Rien de faux après un plantage natif : caches de calcul vidés (MIOpen, torch, temporaires).
+  5. Le travail est rejoué une fois. Échec : raison d'origine plus « [après auto-réparation : …] ».
+- Une même réparation au plus toutes les 6 h par modèle : un nouvel échec dit « déjà tentée à HH:MM : … ».
+- Chaque étape est envoyée au hub (`POST /api/reuse/worker/events`) et lisible dans le journal du worker
+  (`GET /api/reuse/workers/<nom>/settings`, `history`) : `repair_started` (raison, erreur), `repair_file` (fichier,
+  état sain | taille | empreinte | absent | illisible, action), `repair_env` (paquets, fichiers, fichiers abîmés),
+  `repair_env_reset`, `repair_env_reinstalled`, `repair_caches`, `repair_finished` (rejoué ou non, résumé), `repair_replay`, `repair_replay_ok`
+  ou `repair_replay_failed`, `repair_skipped`, `repair_failed`. Un travail réussi après réparation porte `repair` dans
+  ses mesures.
+- Plantage natif de ComfyUI : la pile Python du fil fautif (faulthandler) est gardée ; la raison donne
+  `(code …, violation d'accès (0xC0000005)) dans <fichier.py>:<ligne> <fonction>`.
+
+À la main, depuis le hub (admin), sans toucher au PC :
+```bash
+curl -H "$A" -H "$J" -d '{"kind":"verify_models","params":{"model":"flux3-klein"}}' $H/tests   # repair et env : vrai par défaut
+curl -H "$A" $H/tests/<id>        # result.files (état, action), result.env, result.summary ; result.next si l'environnement est abîmé
+curl -H "$A" -H "$J" -d '{"kind":"comfyui_reinstall"}' $H/tests                                   # si result.env l'indique
+```
+Sans `model` : tous les modèles posés sur la machine. `"repair":false` : constat seul. `"env":false` : poids seulement.
+Re-hacher les 20 Go de Klein prend une à trois minutes.
 
 ## ComfyUI : banc d'essai seulement
 
@@ -589,7 +630,8 @@ curl -H "$A" $T ; curl -H "$A" $T/12 ; curl -H "$A" -X POST $T/12/cancel
 
   Une machine qui n'annonce rien (ancienne version du worker) ne reçoit jamais de travail GPU.
 - **Pilotage à distance** : réglages et essais GPU d'une machine (voir plus haut). Tables `reuse_worker_settings`,
-  `reuse_worker_events` (journal), `reuse_worker_tests` ; route du worker `POST /api/reuse/worker/tests/:id`.
+  `reuse_worker_events` (journal), `reuse_worker_tests` ; routes du worker `POST /api/reuse/worker/tests/:id` et
+  `POST /api/reuse/worker/events` (étapes de l'auto-réparation : `what` en `repair_*` ou `verify_*`, détail coupé à 4 Ko).
 - **Atelier** : état dans `info.atelier` de chaque échange. Tâches dans la table `reuse_atelier_tasks`, données dans
   `orders.atelier_task` seulement à une version qui annonce l'action (`info.atelier.tasks`), rapport sur
   `POST /api/reuse/worker/atelier-tasks/:id`. `orders.in_window` sert à `atelier_window_only`.

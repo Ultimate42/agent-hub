@@ -131,6 +131,38 @@ describe('RE-USE worker remote control', () => {
     assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${old.data.test.id}`, { token: ADMIN })).status, 404, 'tests are per worker');
   });
 
+  test('auto-repair: verify_models and comfyui_reinstall validated; the worker journals its repair steps, the admin reads them', async () => {
+    const bad = [{ model: '../x' }, { model: 'Flux' }, { model: 7 }, { repair: 'yes' }, { env: 1 }, { path: 'C:/' }];
+    for (const params of bad) assert.strictEqual((await ask('gpu-box', { kind: 'verify_models', params })).status, 400, JSON.stringify(params));
+    assert.strictEqual((await ask('gpu-box', { kind: 'comfyui_reinstall', params: { model: 'x' } })).status, 400);
+    const v = await ask('gpu-box', { kind: 'verify_models', params: { model: 'flux3-klein', repair: true, env: false } });
+    assert.strictEqual(v.status, 201);
+    assert.deepStrictEqual(v.data.test.params, { model: 'flux3-klein', repair: true, env: false });
+    assert.match(v.data.warning, /has not announced "verify_models" tests/, 'a worker version without it: the reason is given');
+    assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${v.data.test.id}/cancel`, { method: 'POST', token: ADMIN })).status, 200);
+    const r = await ask('gpu-box', { kind: 'comfyui_reinstall' });
+    assert.strictEqual(r.status, 201);
+    assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${r.data.test.id}/cancel`, { method: 'POST', token: ADMIN })).status, 200);
+
+    // Steps the worker reports on its own: kept in its journal, worker token only, repair_*/verify_* only, detail clipped
+    const ev = (body, token = AMD) => call('/api/reuse/worker/events', { method: 'POST', token, body });
+    assert.strictEqual((await ev({ what: 'repair_file', detail: {} }, ADMIN)).status, 403);
+    assert.strictEqual((await ev({ what: 'settings', detail: {} })).status, 400, 'never an admin event');
+    assert.strictEqual((await ev({ what: 'repair_file', detail: ['x'] })).status, 400);
+    const step = { model: 'flux3-klein', job: 187, file: 'qwen3vl_4b_bf16.safetensors', state: 'empreinte', action: 'effacé ; retéléchargé et vérifié',
+      at: 'forged', what: 'forged' };
+    assert.strictEqual((await ev({ what: 'repair_file', detail: step })).status, 200);
+    assert.strictEqual((await ev({ what: 'repair_finished', detail: { summary: 's'.repeat(20000), replay: true } })).status, 200);
+    const history = (await call('/api/reuse/workers/gpu-box/settings', { token: ADMIN })).data.history;
+    const file = history.find(e => e.what === 'repair_file');
+    assert.strictEqual(file.file, 'qwen3vl_4b_bf16.safetensors');
+    assert.strictEqual(file.state, 'empreinte');
+    assert.notStrictEqual(file.at, 'forged', 'the journal keeps its own time');
+    const fin = history.find(e => e.what === 'repair_finished');
+    assert.ok(JSON.stringify(fin).length < 4500, 'a huge detail is cut, not refused');
+    assert.ok(history.findIndex(e => e.what === 'repair_finished') < history.findIndex(e => e.what === 'repair_file'), 'most recent first');
+  });
+
   test('tests: handed out at once, no new job meanwhile, progress then report readable by the admin', async () => {
     const queued = await call('/api/reuse/jobs?batch=t&name=t_000.flac', { method: 'POST', token: ADMIN, rawBody: fakeFlac('a') });
     assert.strictEqual(queued.status, 201);
@@ -323,6 +355,19 @@ describe('worker-control: expiry (clock passed in)', () => {
       assert.strictEqual(parsed.truncated, true);
       assert.strictEqual(parsed.ok, false);
     }
+  });
+
+  test('worker events: what is checked, detail cut to valid JSON, reserved fields dropped', () => {
+    assert.strictEqual(wc.workerEvent('pc-z', { what: 'repair_' }).status, 400);
+    assert.strictEqual(wc.workerEvent('pc-z', { what: 'repair_X' }).status, 400);
+    assert.strictEqual(wc.workerEvent('pc-z', { what: 'test_finished' }).status, 400);
+    assert.strictEqual(wc.workerEvent('pc-z', { what: 'verify_finished', detail: 'x' }).status, 400);
+    assert.strictEqual(wc.workerEvent('pc-z', { what: 'verify_finished', detail: { ok: true, summary: 'y'.repeat(9000), at: 1 } }).ok, true);
+    const [e] = wc.workerEvents('pc-z');
+    assert.strictEqual(e.what, 'verify_finished');
+    assert.strictEqual(e.ok, true);
+    assert.match(e.at, /^\d{4}-/);
+    assert.ok(e.summary.length <= 2000);
   });
 
   test('a setting of 0 is kept (not mistaken for absent); an unknown test id is a 404', () => {

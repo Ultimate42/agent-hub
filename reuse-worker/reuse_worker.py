@@ -892,6 +892,9 @@ class ServerUnavailable(Exception):
     """Le moteur résident n'a pas pu servir ce travail : le lancement classique (un processus par travail) prend le relais."""
 
 
+FATAL_START = re.compile(r'Windows fatal exception|Fatal Python error|^\s*Segmentation fault', re.I)
+
+
 class EngineTrace:
     """Lit la sortie d'un moteur (stable-diffusion.cpp, trellis.cpp) au fil de l'eau : phases chronométrées, carte et
     plan mémoire réellement choisis, lignes utiles gardées pour le hub. Sans cela, un calcul retombé sur le processeur
@@ -919,6 +922,9 @@ class EngineTrace:
         self.step_rate = None
         self.first_step_at = None
         self.last_step_at = None
+        self.fatal = None          # plantage natif vu : None, 'entête', 'fil' (pile du fil fautif), 'autre'
+        self.fatal_kept = 0
+        self.fatal_native = 0
 
     def feed(self, data):
         text = self.partial + data.decode('utf-8', 'replace')
@@ -945,10 +951,46 @@ class EngineTrace:
             if len(self.lines) > self.MAX_LINES:   # le début (cartes, plan) et la fin (temps) comptent le plus
                 del self.lines[self.MAX_LINES // 2]
 
+    def fatal_line(self, line):
+        """Plantage en code natif (faulthandler de Python) : la pile Python du fil qui a planté dit où (fichier, ligne,
+        fonction). Sans elle, seules les adresses dans une DLL remontaient (jobs 187 à 192 : c10.dll, sans savoir quel
+        code l'appelait). -> True si la ligne a été prise ici."""
+        if FATAL_START.search(line):
+            self.fatal = 'entête'
+            self.meta['crash'] = line.strip()[:120]
+            self.keep(line)
+            return True
+        if not getattr(self, 'fatal', None):
+            return False
+        s = line.strip()
+        if s.startswith('Current thread'):
+            self.fatal = 'fil'
+            self.keep(line)
+            return True
+        if s.startswith('Thread 0x'):
+            self.fatal = 'autre'   # piles des autres fils : écartées (elles noieraient celle du plantage)
+            return True
+        m = re.match(r'File "([^"]+)", line (\d+) in (\S+)', s)
+        if m:
+            if self.fatal == 'fil' and self.fatal_kept < 12:
+                where = '%s:%s %s' % ('/'.join(re.split(r'[\\/]', m.group(1))[-3:]), m.group(2), m.group(3))
+                self.meta.setdefault('crash_at', where[:160])   # appel le plus récent d'abord : là où le code natif a été appelé
+                self.fatal_kept += 1
+                self.keep('  ' + where)
+            return True
+        if re.match(r'0x[0-9A-Fa-f]+,', s) or s.startswith('Exception Code'):   # cadres natifs (Windows) : les 8 premiers
+            if self.fatal_native < 8:
+                self.fatal_native += 1
+                self.keep(line)
+            return True
+        return False
+
     def line(self, line):
         bars = list(self.BAR.finditer(line))
         if bars:
             self.bar(bars[-1])
+            return
+        if self.fatal_line(line):
             return
         if not self.KEEP.search(line):
             return
@@ -1103,6 +1145,43 @@ class Gpu:
                 if need and vram is not None and vram < need * 1e9:
                     continue
                 out.append(mid)
+        return out
+
+    def model_entries(self, model_id=None, installed_only=False):
+        """Fichiers de poids du catalogue et leur chemin sur ce PC : ceux d'un modèle (identifiant du catalogue, ou
+        « comfyui » pour le banc d'essai de ComfyUI), ou de tous (None). installed_only : seulement ceux posés ici (fichier
+        ou témoin présent). Même liste que ensure et comfy_install, donc rien de propre à un modèle. -> [entrée de verify_files]."""
+        out, paths = [], set()
+        spec = (self.catalog.get('benchmarks') or {}).get('comfyui')
+        lay = comfy_layout(self.root.parent, spec) if spec else None
+
+        def add(mid, f, path, links=()):
+            if not safe_file_name(f.get('name') or '') or not f.get('sha256') or not f.get('size') or str(path) in paths:
+                return
+            if installed_only and not (path.exists() or Path(str(path) + '.ok').exists()):
+                return
+            paths.add(str(path))
+            out.append({'model': mid, 'name': f['name'], 'path': str(path), 'size': int(f['size']), 'sha256': f['sha256'],
+                        'url': f.get('url'), 'links': list(links)})
+        for kind, tspec in sorted((self.catalog.get('types') or {}).items()):
+            for mid, m in sorted((tspec.get('models') or {}).items()):
+                if model_id not in (None, mid):
+                    continue
+                for f in m.get('files') or []:
+                    if m.get('engine') == 'comfyui':
+                        if lay is not None:
+                            add(mid, f, lay['data'] / 'models' / f['dir'] / f['name'])
+                    else:
+                        add(mid, f, self.root / 'models' / mid / f['name'])
+        if lay is not None and model_id in (None, 'comfyui'):
+            for f in spec.get('files') or []:
+                path = lay['data'] / 'models' / f['dir'] / f['name']
+                reuse = self.root / 'models' / f['reuse'] if f.get('reuse') else None
+                try:   # même fichier par lien physique que celui du moteur image : abîmé avec lui, effacé avec lui
+                    links = [str(reuse)] if reuse is not None and os.path.samefile(reuse, path) else []
+                except OSError:
+                    links = []
+                add('comfyui', f, path, links)
         return out
 
     def comfy_free(self, h, need_mib, stop):
@@ -1721,6 +1800,9 @@ class Worker:
         self.paused_logged = False
         self.refused_version = None
         self.engine_failures = 0
+        self.model_failures = {}   # modèle -> échecs de suite (remis à zéro au premier succès)
+        self.repairs = {}          # modèle -> {at, summary} de la dernière auto-réparation (au plus une par REPAIR_EVERY_S)
+        self.env_reset_at = 0.0    # dernière réinstallation automatique de l'environnement ComfyUI
 
     # ---- état lisible ---------------------------------------------------------------------
     def bad_versions(self):
@@ -2043,10 +2125,7 @@ class Worker:
                     refs.append(str(dest))
                 job['ref_paths'] = refs
                 log.info('Job %s : %s', label, (job.get('prompt') or '')[:120])
-                try:
-                    out, compute_s, meta = self.gpu.run(job, src, jobdir, stop, progress)
-                except (OSError, subprocess.SubprocessError) as e:
-                    raise RuntimeError('panne locale pendant la génération : %s' % e)
+                out, compute_s, meta = self.run_gpu(job, src, jobdir, stop, progress)
                 done = {'file': out.name, 'sha256': sha256_file(out), 'compute_s': round(compute_s, 1), 'meta': meta}
                 write_json(meta_file, done)
                 log.info('Job %s : calculé en %s.', label, fmt_duration(compute_s))
@@ -2097,6 +2176,148 @@ class Worker:
         finally:
             finished.set()
             self.set_state('en attente')
+
+    # ---- auto-diagnostic et auto-réparation (GPU.md, « Auto-réparation ») ----
+    def event(self, what, **detail):
+        """Étape d'un diagnostic ou d'une réparation : écrite dans worker.log et envoyée au hub (journal du worker,
+        GET /api/reuse/workers/<nom>/settings). Un hub plus ancien (404) ou injoignable ne bloque rien."""
+        detail = {k: v for k, v in detail.items() if v is not None}
+        log.info('Auto-réparation : %s %s', what, json.dumps(detail, ensure_ascii=False)[:800])
+        try:
+            self.hub.request('POST', '/api/reuse/worker/events', body={'what': what, 'detail': detail}, timeout=30)
+        except OSError as e:
+            log.warning('Événement %s non remis au hub (%s).', what, e)
+
+    def unlock_for_repair(self, why):
+        """Un fichier à remplacer est tenu ouvert (Windows) : ComfyUI et moteur résident des travaux arrêtés, l'atelier aussi
+        s'il ne calcule pas (gardé éteint jusqu'à la fin de la réparation, puis reparti seul). -> True si quelque chose a été
+        arrêté."""
+        did = bool(self.gpu.comfy or self.gpu.server)
+        self.gpu.stop_comfy('réparation')
+        self.gpu.stop_server('réparation')
+        if self.atelier.pid and not self.atelier.busy(live=True, sure=True):
+            self.atelier.hold(why)
+            did = True
+        return did
+
+    def repair_reason(self, job, error):
+        """Pourquoi revérifier les fichiers du modèle de ce travail après cet échec, ou None. Rien de propre à un modèle :
+        plantage en code natif, poids illisible, ou deux échecs de suite sur le même modèle."""
+        crash = crash_kind(error)
+        if crash:
+            return 'plantage en code natif : %s' % crash
+        bad = file_error(error)
+        if bad:
+            return 'fichier de poids illisible : %s' % bad
+        n = self.model_failures.get(job.get('model'), 0)
+        if n >= 2:
+            return '%d échecs de suite sur ce modèle' % n
+        return None
+
+    def auto_repair(self, job, why, error, stop, progress):
+        """Fichiers du modèle revérifiés (taille, SHA-256 du catalogue) et retéléchargés s'ils sont faux ; pour ComfyUI,
+        environnement Python contrôlé (RECORD de pip) et refait s'il est abîmé, sinon caches de calcul vidés après un plantage
+        natif. -> (rejouer le travail ?, résumé lisible)."""
+        model, jid, now = job.get('model'), job.get('id'), time.time()
+        last = self.repairs.get(model)
+        if last and now - last['at'] < REPAIR_EVERY_S:
+            note = 'déjà tentée à %s : %s' % (time.strftime('%H:%M', time.localtime(last['at'])), last['summary'])
+            self.event('repair_skipped', model=model, job=jid, reason=why, last=note[:400])
+            return False, note
+        self.event('repair_started', model=model, job=jid, reason=why, error=str(error)[:300])
+        self.gpu.stop_comfy('auto-réparation')
+        self.gpu.stop_server('auto-réparation')
+        try:
+            say = lambda f, st: progress(0.3 * f, 'auto-réparation : %s' % st)
+            files = verify_files(self.gpu.model_entries(model), repair=True, stop=stop, progress=say, unlock=self.unlock_for_repair)
+            for f in files:
+                self.event('repair_file', model=model, job=jid, file=f['file'], state=f['state'], action=f.get('action'),
+                           size=f.get('size'), expected_size=f.get('expected_size'), sha256=f.get('sha256'), error=f.get('error'))
+            bad = [f for f in files if f['state'] not in ('sain', 'absent')]
+            stuck = [f for f in bad if not f['ok']]
+            replay = bool(bad) and not stuck
+            extra = []
+            env = None
+            spec = (self.gpu.catalog.get('benchmarks') or {}).get('comfyui')
+            engine = (((self.gpu.catalog.get('types') or {}).get(job.get('kind')) or {}).get('models') or {}).get(model, {}).get('engine')
+            if engine == 'comfyui' and spec and not stuck:
+                lay = comfy_layout(self.base, spec)
+                if lay['python'].exists():
+                    env = verify_python_env(lay['python'], stop, lambda f, st: progress(0.3, 'auto-réparation : %s' % st))
+                    self.event('repair_env', model=model, job=jid, packages=env['packages'], files=env['files'], bad_count=env['bad_count'],
+                               bad=env['bad'][:10])
+                if env and env['bad_count']:
+                    if now - self.env_reset_at < ENV_REPAIR_EVERY_S:
+                        extra.append('environnement déjà refait à %s : pas de nouvelle réinstallation avant 24 h'
+                                     % time.strftime('%H:%M', time.localtime(self.env_reset_at)))
+                        replay = False
+                    elif self.atelier.busy(live=True, sure=True):
+                        extra.append('réinstallation de l\'environnement remise : l\'atelier calcule')
+                        replay = False
+                    else:   # l'atelier clone cet environnement : gardé éteint, puis recloné à son redémarrage
+                        self.atelier.hold('environnement ComfyUI des travaux refait (auto-réparation)')
+                        freed = comfy_reset_env(self.base, spec)
+                        self.env_reset_at = now
+                        self.event('repair_env_reset', model=model, job=jid, freed_gb=round(freed / 1e9, 2))
+                        t1 = time.time()
+                        comfy_install(self.base, spec, self.gpu, stop, lambda f, st: progress(0.3 * f, 'auto-réparation : %s' % st), {}, files=[])
+                        self.event('repair_env_reinstalled', model=model, job=jid, install_s=round(time.time() - t1))
+                        extra.append('environnement ComfyUI refait')
+                        replay = True
+                elif not bad and crash_kind(error):
+                    freed = clear_compute_caches(self.base, spec)
+                    self.event('repair_caches', model=model, job=jid, freed_mb=round(freed / 1e6, 1))
+                    extra.append('caches de calcul vidés (%.0f Mo)' % (freed / 1e6))
+                    replay = True
+            summary = ' ; '.join([verify_summary(files, env)] + extra)
+            if not stuck:   # un fichier impossible à retirer (atelier en calcul) : nouvel essai au prochain échec, sans attendre 6 h
+                self.repairs[model] = {'at': now, 'summary': summary[:300]}
+            if not bad and not (env and env['bad_count']):
+                summary += ' : cause ailleurs que dans les fichiers'
+            self.event('repair_finished', model=model, job=jid, replay=replay, summary=summary[:600])
+            return replay, summary
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            self.event('repair_failed', model=model, job=jid, error=str(e)[:300])
+            return False, 'ratée : %s' % str(e)[:200]
+        finally:
+            self.atelier.unhold()
+
+    def run_gpu(self, job, src, jobdir, stop, progress):
+        """Gpu.run, puis, si l'échec le justifie (repair_reason), auto-réparation et un seul nouvel essai sur place."""
+        model = job.get('model')
+
+        def once():
+            try:
+                return self.gpu.run(job, src, jobdir, stop, progress)
+            except (OSError, subprocess.SubprocessError) as e:
+                raise RuntimeError('panne locale pendant la génération : %s' % e)
+        try:
+            result = once()
+        except Final:
+            raise   # trop lent, image noire : le même calcul referait la même chose, les fichiers n'y sont pour rien
+        except RuntimeError as e:
+            if stop.is_set():
+                raise
+            self.model_failures[model] = self.model_failures.get(model, 0) + 1
+            why = self.repair_reason(job, e)
+            if not why:
+                raise
+            replay, summary = self.auto_repair(job, why, e, stop, progress)
+            if not replay:
+                raise RuntimeError('%s [auto-réparation : %s]' % (str(e)[:150], summary[:140]))
+            self.event('repair_replay', model=model, job=job.get('id'))
+            progress(0.0, 'nouvel essai après auto-réparation')
+            try:
+                out, compute_s, meta = once()
+            except RuntimeError as e2:
+                self.event('repair_replay_failed', model=model, job=job.get('id'), error=str(e2)[:300])
+                raise type(e2)('%s [après auto-réparation : %s]' % (str(e2)[:150], summary[:140])) if isinstance(e2, Final) else \
+                    RuntimeError('%s [après auto-réparation : %s]' % (str(e2)[:150], summary[:140]))
+            self.event('repair_replay_ok', model=model, job=job.get('id'), summary=summary[:300])
+            self.model_failures[model] = 0
+            return out, compute_s, dict(meta, repair=summary[:200])
+        self.model_failures[model] = 0
+        return result
 
     def gpu_beat(self, now):
         """Corps d'un signe de vie GPU : avancement, étape lisible, et lignes utiles du moteur (carte, plan mémoire, temps)."""
@@ -2363,6 +2584,10 @@ class Worker:
         if kind not in GPU_TEST_KINDS:
             post({'status': 'failed', 'report': {'ok': False, 'error': 'essai %r inconnu de cette version' % kind}})
             return
+        if kind == 'comfyui_reinstall' and self.atelier.busy(live=True, sure=True):
+            post({'status': 'failed', 'report': {'ok': False, 'error': 'l\'atelier ComfyUI calcule : réinstallation refusée, la redemander '
+                                                                        'quand sa file est vide'}})
+            return
         if kind in ('comfyui', 'comfyui_remove') and self.atelier.pid:
             spec = comfy_spec(self.app)
             lay = comfy_layout(self.base, spec)
@@ -2393,11 +2618,19 @@ class Worker:
         # 3D : image d'objet livrée avec le worker (tasse rendue maison, sans licence tierce) : l'essai ne dépend pas du moteur image
         bundled = self.app / GPU_TEST_OBJECT
         try:
+            if kind == 'comfyui_reinstall':   # l'atelier clone cet environnement : gardé éteint, puis recloné à son redémarrage
+                self.atelier.hold('réinstallation de l\'environnement ComfyUI des travaux (essai %d)' % tid)
             report = gpu_test_report(self.base, dict(self.config), kind, test.get('params') or {},
-                                     bundled if kind == '3d' and bundled.exists() else None, stop, progress)
+                                     bundled if kind == '3d' and bundled.exists() else None, stop, progress, unlock=self.unlock_for_repair)
         finally:
             finished.set()
             self.job_active = False
+            self.atelier.unhold()
+        if kind == 'verify_models':
+            for f in report.get('files') or []:
+                if f.get('state') != 'sain':
+                    self.event('verify_file', test=tid, model=f.get('model'), file=f.get('file'), state=f.get('state'), action=f.get('action'))
+            self.event('verify_finished', test=tid, ok=bool(report.get('ok')), summary=str(report.get('summary') or report.get('error'))[:600])
         report['test_id'] = tid
         write_json(self.base / 'logs' / 'gpu-test.json', report)
         log.info('ESSAI GPU %d %s : %s', tid, 'REUSSI' if report.get('ok') else 'RATE', json.dumps(report, ensure_ascii=False)[:2000])
@@ -3017,7 +3250,12 @@ def comfy_prompt(h, wf, steps, stop, progress, timeout, label='calcul'):
         if stop is not None and stop.is_set():
             raise JobLost('calcul interrompu')
         if proc.poll() is not None:
-            raise RuntimeError('ComfyUI s\'est arrêté pendant le calcul (code %s) : %s' % (proc.returncode, ' | '.join(h['box']['all'].lines[-4:])[-400:]))
+            h['th'].join(5)   # fin du journal (pile du plantage) lue avant d'écrire la raison
+            seen = h['box']['all']
+            kind = crash_kind('code %s' % proc.returncode)
+            where = seen.meta.get('crash_at')
+            raise RuntimeError('ComfyUI s\'est arrêté pendant le calcul (code %s%s)%s : %s' % (
+                proc.returncode, ', %s' % kind if kind else '', ' dans %s' % where if where else '', ' | '.join(seen.lines[-4:])[-400:]))
         if time.time() - t1 > timeout:
             raise Final('%s trop long (plus de %s)' % (label, fmt_duration(timeout)))
         # Dès trois étapes : si le rythme établi (la première étape mise à part, elle porte les frais d'une fois) ne tient pas
@@ -3133,6 +3371,8 @@ def comfy_test_report(base, config, kind, params, stop, progress, report):
                 raise RuntimeError('%s n\'a pas pu être supprimé entièrement (fichier ouvert ?)' % lay['root'])
             report.update(ok=True, freed_gb=round(freed / 1e9, 2), removed=str(lay['root']))
             return report
+        if kind == 'comfyui_reinstall':   # environnement abîmé : Python, pip, torch, dépendances et source refaits, poids gardés
+            report['reinstall_freed_gb'] = round(comfy_reset_env(base, spec) / 1e9, 2)
         values = dict(spec.get('defaults') or {})
         values.update({k: v for k, v in params.items() if k in ('width', 'height', 'steps', 'seed')})
         runs = int(params.get('runs') or values.pop('runs', 2) or 2)
@@ -3742,6 +3982,7 @@ class Atelier:
         self.task_thread = None
         self.last_task = None
         self.restart_wanted = False     # nœuds ajoutés ou retirés : relance dès que l'atelier ne calcule plus
+        self.held = None                # raison d'une réparation en cours qui le garde éteint (hold / unhold)
 
     # ---- réglages ----
     def spec(self):
@@ -3754,7 +3995,7 @@ class Atelier:
         return self.config.get('atelier_enabled') is True
 
     def wanted(self):
-        if not self.enabled() or self.stopping.is_set() or self.config.get('gpu') is False:
+        if not self.enabled() or self.stopping.is_set() or self.config.get('gpu') is False or self.held:
             return False
         if not IS_WINDOWS and not self.config.get('comfyui_any_os'):
             return False
@@ -4057,6 +4298,26 @@ class Atelier:
                 log.info('Atelier ComfyUI arrêté (%s).', why)
             self.forget()
             self.state = 'éteint'
+
+    def hold(self, why):
+        """Arrêté et gardé éteint le temps d'une réparation (environnement des travaux refait, fichier de modèle tenu
+        ouvert par lui) ; unhold le laisse repartir seul, tout de suite. -> True s'il tournait."""
+        with self.lock:
+            was = bool(self.pid)
+            self.held = str(why)[:200]
+            if was:
+                self.stop('réparation : %s' % self.held)
+            self.state = 'suspendu : %s' % self.held[:120]
+            return was
+
+    def unhold(self):
+        with self.lock:
+            if self.held:
+                self.held = None
+                self.next_try = 0.0
+                self.failures = 0
+                if self.state.startswith('suspendu'):
+                    self.state = 'éteint'
 
     def shutdown(self, why):
         self.stopping.set()
@@ -4408,8 +4669,9 @@ class Atelier:
                     pass
             if not self.wanted():
                 if self.pid:
-                    self.stop('éteint depuis le hub' if not self.enabled() else 'hors du créneau (atelier_window_only)')
-                self.state = 'éteint'
+                    self.stop('éteint depuis le hub' if not self.enabled() else
+                              'réparation : %s' % self.held if self.held else 'hors du créneau (atelier_window_only)')
+                self.state = 'suspendu : %s' % self.held[:120] if self.held else 'éteint'
                 self.error = None if not self.enabled() else self.error
                 return
             if not self.pid:
@@ -4491,7 +4753,7 @@ class Atelier:
         return {k: v for k, v in d.items() if v is not None}
 
 
-GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove')
+GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove', 'comfyui_reinstall', 'verify_models')
 GPU_TEST_OBJECT = 'gpu-test-object.png'   # entrée de l'essai 3D demandé par le hub (512x512, fond blanc)
 # Réglages que le hub peut poser sur cette machine (POST /api/reuse/workers/:nom/settings), avec leurs types. Aucun autre.
 REMOTE_SETTINGS = {'enable_3d': (bool,), 'gpu_max_gb': (int, float), 'gpu_keep_loaded_s': (int, float),
@@ -4517,15 +4779,294 @@ def log_tail(path, lines=LOG_TAIL_LINES, width=300):
     return out[-lines:]
 
 
-def gpu_test_report(base, config, kind, params=None, input_path=None, stop=None, progress=None):
+# ---- Auto-diagnostic et auto-réparation des modèles (GPU.md, « Auto-réparation ») -------------------------------------
+# Un poids abîmé sur le disque (secteur défectueux, écriture interrompue, fichier modifié en place par un autre programme)
+# ne se voit pas au témoin .ok (empreinte, taille, date) : la date ne bouge pas toujours. Après un plantage en code natif,
+# ou deux échecs de suite sur le même modèle, le worker revérifie taille et SHA-256 de chaque fichier du modèle contre le
+# catalogue, retélécharge ceux qui sont faux, contrôle l'environnement Python contre les empreintes inscrites par pip
+# (RECORD), le réinstalle s'il est abîmé, vide les caches de calcul, puis rejoue le travail une fois. Chaque étape est
+# envoyée au hub (journal du worker), avec la raison, le fichier et le résultat.
+NTSTATUS_NAMES = {0xC0000005: 'violation d\'accès', 0xC0000006: 'erreur de lecture d\'une page projetée (disque ?)',
+                  0xC000001D: 'instruction illégale', 0xC00000FD: 'débordement de pile', 0xC0000409: 'arrêt d\'urgence (pile corrompue)',
+                  0xC0000374: 'tas corrompu', 0xC0000096: 'instruction privilégiée'}
+SIGNAL_NAMES = {4: 'SIGILL', 6: 'SIGABRT', 7: 'SIGBUS', 11: 'SIGSEGV'}
+CRASH_TEXT = re.compile(r'access violation|Windows fatal exception|Fatal Python error|Segmentation fault|in page error|Bus error|'
+                        r'illegal instruction|core dumped', re.I)
+# Messages d'un fichier de poids illisible ou tronqué (safetensors, pickle de torch, GGUF)
+FILE_ERROR_TEXT = re.compile(r'HeaderTooLarge|MetadataIncompleteBuffer|InvalidHeader|Error while deserializing|invalid load key|'
+                             r'PytorchStreamReader failed|unexpected EOF|file (?:is )?(?:corrupt|truncated)|failed to (?:read|load) (?:tensor|model)|'
+                             r'gguf_init|invalid magic|checksum mismatch|safetensors_rust', re.I)
+REPAIR_EVERY_S = 6 * 3600       # une même réparation automatique au plus toutes les 6 h par modèle (pas de boucle)
+ENV_REPAIR_EVERY_S = 24 * 3600  # réinstallation automatique de l'environnement ComfyUI : au plus une fois par jour
+VERIFY_REPORT_MAX = 30          # fichiers abîmés listés au plus dans un rapport
+
+
+def crash_kind(message):
+    """-> courte raison si le message d'échec dit un plantage en code natif (DLL, pilote, mémoire, disque), sinon None.
+    Codes de sortie Windows (NTSTATUS 0xC…, en signé ou non) et signaux POSIX ; à défaut, le texte du journal."""
+    text = str(message or '')
+    for m in re.finditer(r'code (-?\d+)', text):
+        n = int(m.group(1))
+        if -64 < n < 0 and -n in SIGNAL_NAMES:
+            return SIGNAL_NAMES[-n]
+        if 128 < n < 192 and n - 128 in SIGNAL_NAMES:
+            return SIGNAL_NAMES[n - 128]
+        u = n & 0xFFFFFFFF
+        if u >= 0xC0000000:
+            return '%s (0x%08X)' % (NTSTATUS_NAMES.get(u, 'exception Windows'), u)
+    m = CRASH_TEXT.search(text)
+    return m.group(0) if m else None
+
+
+def file_error(message):
+    m = FILE_ERROR_TEXT.search(str(message or ''))
+    return m.group(0) if m else None
+
+
+def sha256_progress(path, stop=None, progress=None, block=8 << 20):
+    """SHA-256 d'un gros fichier, avancement (0..1) toutes les 512 Mo, arrêt possible (JobLost)."""
+    h = hashlib.sha256()
+    size = max(1, os.path.getsize(path))
+    done = last = 0
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(block), b''):
+            h.update(chunk)
+            done += len(chunk)
+            if stop is not None and stop.is_set():
+                raise JobLost('vérification interrompue')
+            if progress and done - last >= (512 << 20):
+                last = done
+                progress(done / size)
+    return h.hexdigest()
+
+
+def remove_with_retry(paths, unlock=None):
+    """Efface des fichiers ; un fichier tenu (Windows : projeté par un autre ComfyUI) -> unlock(raison) une fois, puis nouvel
+    essai. -> raison du premier échec restant, ou None (tout est effacé)."""
+    left = remove_files(paths)
+    if left and unlock is not None and unlock('fichier à remplacer tenu ouvert (%s)' % left):
+        time.sleep(1)
+        left = remove_files(paths)
+    return left
+
+
+def verify_files(entries, repair=False, stop=None, progress=None, unlock=None, fetch=True):
+    """Revérifie des fichiers du catalogue sans se fier à leur témoin .ok : présence, taille, puis SHA-256 de tout le contenu.
+    entries : [{'model', 'name', 'path', 'size', 'sha256', 'url', 'links': [autres chemins du même fichier]}].
+    repair : un fichier faux est effacé (avec son témoin et ses liens physiques connus) puis, si fetch, retéléchargé et
+    revérifié tout de suite. -> [{'model', 'file', 'path', 'state', 'action'...}] ; state : sain | absent | taille |
+    empreinte | illisible ; ok (après réparation éventuelle)."""
+    total = float(sum(int(e['size']) for e in entries)) or 1.0
+    seen = [0.0]
+    out = []
+    for e in entries:
+        if stop is not None and stop.is_set():
+            raise JobLost('vérification interrompue')
+        path = Path(e['path'])
+        size = int(e['size'])
+        r = {'model': e.get('model'), 'file': e['name'], 'path': str(path), 'expected_size': size}
+
+        def step(frac, e=e):
+            if progress:
+                progress(min(1.0, (seen[0] + frac * int(e['size'])) / total), 'vérification de %s' % e['name'])
+        step(0.0)
+        try:
+            if not path.exists():
+                r['state'] = 'absent'
+            else:
+                st = path.stat()
+                r['size'] = st.st_size
+                if st.st_size != size:
+                    r['state'] = 'taille'
+                else:
+                    got = sha256_progress(path, stop, step)
+                    r['sha256'] = got[:16]
+                    r['state'] = 'sain' if got == e['sha256'] else 'empreinte'
+                    if r['state'] == 'sain':   # témoin remis à jour : le prochain travail ne re-hache pas
+                        Path(str(path) + '.ok').write_text('%s %d %d' % (e['sha256'], st.st_size, st.st_mtime_ns))
+        except OSError as err:
+            r['state'] = 'illisible'
+            r['error'] = str(err)[:200]
+        seen[0] += size
+        r['ok'] = r['state'] == 'sain'
+        if not r['ok'] and r['state'] != 'absent' and repair:
+            doomed = [path, Path(str(path) + '.ok')]
+            for link in e.get('links') or []:
+                doomed += [Path(link), Path(str(link) + '.ok')]
+            left = remove_with_retry(doomed, unlock)
+            if left:
+                r['action'] = 'retrait impossible : %s' % left[:200]
+            else:
+                r['action'] = 'effacé'
+        if r.get('action') == 'effacé':   # un fichier jamais posé (absent) reste au premier travail : plafond et place vérifiés là
+            if fetch and e.get('url'):
+                try:
+                    download_resume(e['url'], path, e['sha256'], size, '%s (%s)' % (e['name'], e.get('model')), stop,
+                                    lambda frac: step(frac), tries=3)
+                    r['action'] = (r.get('action', '') + ' ; ' if r.get('action') else '') + 'retéléchargé et vérifié'
+                    r['ok'] = True
+                except RuntimeError as err:
+                    r['action'] = (r.get('action', '') + ' ; ' if r.get('action') else '') + 'retéléchargement raté : %s' % str(err)[:160]
+            else:
+                r['action'] = 'effacé : retéléchargé au prochain travail'
+        out.append(r)
+    if progress:
+        progress(1.0, 'vérification finie')
+    return out
+
+
+def record_hash(digest):
+    """Empreinte au format des fichiers RECORD (PEP 376 / 627) : base64 url sans remplissage."""
+    return base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')
+
+
+def site_packages(python_dir):
+    p = Path(python_dir)
+    return [d for d in [p / 'Lib' / 'site-packages'] + sorted(p.glob('lib/python3*/site-packages')) if d.is_dir()]
+
+
+def verify_python_env(python_dir, stop=None, progress=None, limit=VERIFY_REPORT_MAX):
+    """Chaque fichier installé par pip comparé à l'empreinte et à la taille inscrites dans le RECORD de son paquet. Révèle un
+    fichier changé en place (lien physique partagé avec l'atelier et réécrit, disque) dans torch, ses DLL ou une dépendance.
+    -> {'packages', 'files', 'bad': [{'package', 'file', 'why'}], 'bad_count'}."""
+    report = {'packages': 0, 'files': 0, 'bad': [], 'bad_count': 0}
+    records = [r for sp in site_packages(python_dir) for r in sorted(sp.glob('*.dist-info/RECORD'))]
+    for n, rec in enumerate(records):
+        if stop is not None and stop.is_set():
+            raise JobLost('vérification interrompue')
+        if progress:
+            progress(n / max(1, len(records)), 'environnement Python : %s' % rec.parent.name[:60])
+        root = rec.parent.parent
+        report['packages'] += 1
+        try:
+            lines = rec.read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError as e:
+            report['bad'].append({'package': rec.parent.name, 'file': 'RECORD', 'why': 'illisible : %s' % e})
+            report['bad_count'] += 1
+            continue
+        for line in lines:
+            parts = line.rsplit(',', 2)
+            if len(parts) != 3 or not parts[1].startswith('sha256='):
+                continue   # .pyc et RECORD lui-même : sans empreinte
+            rel, want, size = parts[0].strip('"'), parts[1][7:], parts[2]
+            if rel.startswith(('..', '/')) or ':' in rel:
+                continue   # scripts posés hors de site-packages
+            path = root / rel
+            why = None
+            try:
+                st = path.stat()
+                if size.isdigit() and st.st_size != int(size):
+                    why = 'taille %d au lieu de %s' % (st.st_size, size)
+                else:
+                    h = hashlib.sha256()
+                    with open(path, 'rb') as f:
+                        for chunk in iter(lambda: f.read(8 << 20), b''):
+                            h.update(chunk)
+                    if record_hash(h.digest()) != want:
+                        why = 'empreinte différente de celle inscrite par pip'
+            except FileNotFoundError:
+                why = 'absent'
+            except OSError as e:
+                why = 'illisible : %s' % str(e)[:120]
+            report['files'] += 1
+            if why:
+                report['bad_count'] += 1
+                if len(report['bad']) < limit:
+                    report['bad'].append({'package': rec.parent.name[:80], 'file': rel[:160], 'why': why})
+    return report
+
+
+def comfy_reset_env(base, spec):
+    """Environnement Python et source de ComfyUI des travaux retirés (poids gardés) : refaits à la prochaine installation
+    (essai comfyui ou premier travail, 25 min environ). Le clone de l'atelier est marqué à refaire : il venait du même
+    environnement, par liens physiques. -> octets libérés."""
+    lay = comfy_layout(base, spec)
+    freed = sum(folder_bytes(p) for p in (lay['python'], lay['src']) if p.exists())
+    for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+        (lay['root'] / ('.ok-' + step)).unlink(missing_ok=True)
+    rmtree(lay['python'])
+    rmtree(lay['src'])
+    if spec.get('atelier'):
+        (atelier_layout(base, spec)['root'] / '.ok-env').unlink(missing_ok=True)
+    for p in (lay['python'], lay['src']):
+        if p.exists():
+            raise RuntimeError('%s n\'a pas pu être supprimé entièrement (fichier ouvert ?)' % p)
+    return freed
+
+
+def clear_compute_caches(base, spec):
+    """Caches de calcul de ComfyUI des travaux (MIOpen, torch, Triton, temporaires) : refaits seuls au besoin. -> octets."""
+    lay = comfy_layout(base, spec)
+    freed = 0
+    for d in (lay['cache'], lay['tmp']):
+        if d.exists():
+            freed += folder_bytes(d)
+            rmtree(d)
+    return freed
+
+
+def verify_summary(files, env=None):
+    """Une ligne lisible : ce qui était faux et ce qui a été fait."""
+    bad = [f for f in files if f['state'] not in ('sain', 'absent')]
+    parts = []
+    if files:
+        parts.append('%d fichier(s) vérifié(s)' % len(files) + (', sains' if not bad else ''))
+    for f in bad[:4]:
+        parts.append('%s : %s%s' % (f['file'], f['state'], ' -> %s' % f['action'] if f.get('action') else ''))
+    if env is not None:
+        parts.append('environnement Python %s' % ('sain (%d fichiers)' % env['files'] if not env['bad_count'] else
+                                                    'abîmé : %d fichier(s), ex. %s (%s)' % (env['bad_count'], env['bad'][0]['file'], env['bad'][0]['why'])))
+    return ' ; '.join(parts)
+
+
+def verify_report(gpu, params, stop, progress, report, unlock=None):
+    """Essai verify_models : fichiers du modèle demandé (ou de tous les modèles posés sur ce PC) revérifiés, réparés si
+    repair (défaut), environnement Python de ComfyUI contrôlé si env (défaut). -> rapport ; ok si rien de faux ne reste."""
+    model = params.get('model')
+    repair = params.get('repair') is not False
+    entries = gpu.model_entries(model) if model else gpu.model_entries(None, installed_only=True)
+    if model and not entries:
+        raise RuntimeError('modèle %s inconnu du catalogue de cette version' % model)
+    report.update(model=model or 'tous (posés sur ce PC)', repair=repair)
+    t0 = time.time()
+    files = verify_files(entries, repair=repair, stop=stop, progress=lambda f, st: progress(0.8 * f, st), unlock=unlock)
+    report['files'] = files[:VERIFY_REPORT_MAX * 2]
+    env = None
+    spec = (gpu.catalog.get('benchmarks') or {}).get('comfyui')
+    if params.get('env') is not False and spec:
+        lay = comfy_layout(gpu.root.parent, spec)
+        if lay['python'].exists():
+            env = verify_python_env(lay['python'], stop, lambda f, st: progress(0.8 + 0.2 * f, st))
+            report['env'] = env
+    report['verify_s'] = round(time.time() - t0, 1)
+    report['summary'] = verify_summary(files, env)
+    left = [f for f in files if not f['ok'] and f['state'] != 'absent']
+    if left or (env and env['bad_count']):
+        report['error'] = report['summary'][:400]
+        if env and env['bad_count']:
+            report['next'] = 'environnement abîmé : essai comfyui_reinstall (poids gardés, 25 min environ)'
+    else:
+        report['ok'] = True
+    return report
+
+
+def gpu_test_report(base, config, kind, params=None, input_path=None, stop=None, progress=None, unlock=None):
     """Un essai, sans verrou (l'appelant garantit que rien d'autre ne calcule). -> rapport (dict). Ne lève pas."""
     params = dict(params or {})
     progress = progress or (lambda frac, stage: None)
     config = {k: v for k, v in (config or {}).items() if k not in ('token', 'hub_url')}
     report = {'ok': False, 'kind': kind, 'at': time.strftime('%Y-%m-%d %H:%M:%S'),
               'system': '%s %s %s' % (platform.system(), platform.release(), platform.machine())}
-    if kind in ('comfyui', 'comfyui_remove'):
+    if kind in ('comfyui', 'comfyui_remove', 'comfyui_reinstall'):
         return comfy_test_report(base, config, kind, params, stop, progress, report)
+    if kind == 'verify_models':
+        try:
+            verify_report(Gpu(base, config, Path(__file__).resolve().parent), params, stop, progress, report, unlock)
+        except JobLost as e:
+            report['error'] = 'annulé : %s' % e
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            report['error'] = str(e)[:400]
+        return report
     if kind == '3d':
         config['enable_3d'] = True   # l'essai est justement là pour décider d'ouvrir la 3D
     gpu = Gpu(base, config, Path(__file__).resolve().parent)

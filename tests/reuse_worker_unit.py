@@ -12,6 +12,7 @@ import shutil
 import struct
 import sys
 import tarfile
+import threading
 import tempfile
 import time
 import unittest
@@ -766,6 +767,13 @@ def run(pid, wf):
     steps = node('KSampler')['inputs']['steps']
     print('Requested to load Flux3TEModel_', flush=True)
     print('loaded completely; 15000.00 MB usable, 8000.00 MB loaded, full load: True', flush=True)
+    if os.path.exists(os.path.join(base, 'native-crash')):   # plantage en code natif pendant l'encodeur (jobs 187 à 192)
+        print('Windows fatal exception: access violation\n\nThread 0x0000a1b2 (most recent call first):\n'
+              '  File "C:\\py\\threading.py", line 359 in wait\n\nCurrent thread 0x00004c2c (most recent call first):\n'
+              '  File "C:\\gpu\\comfyui\\ComfyUI\\comfy\\text_encoders\\llama.py", line 412 in forward\n'
+              '  File "C:\\gpu\\comfyui\\ComfyUI\\main.py", line 200 in prompt_worker', flush=True)
+        import signal
+        os.kill(os.getpid(), signal.SIGSEGV)
     time.sleep(0.3)
     print('Requested to load Flux3', flush=True)
     print('model weight dtype torch.%s, manual cast: %s' % ('float16' if '--fp16-unet' in a else 'bfloat16', 'None' if '--fp16-unet' in a else 'torch.float32'), flush=True)
@@ -1922,6 +1930,381 @@ class AtelierTaskTest(AtelierBase):
         self.assertNotIn('--fast', flat)
         self.assertNotIn('COMFYUI_ENABLE_MIOPEN', flat)
 
+
+class AutoRepairTest(unittest.TestCase):
+    """Auto-diagnostic et auto-réparation (jobs 187 à 192 : Klein plantait en code natif, fichiers jamais revérifiés)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def test_native_crash_and_file_errors_are_recognised_whatever_the_model(self):
+        self.assertIn('0xC0000005', w.crash_kind("ComfyUI s'est arrêté pendant le calcul (code 3221225477) : x"))
+        self.assertIn('0xC0000005', w.crash_kind('a échoué (code -1073741819)'))
+        self.assertIn('0xC0000006', w.crash_kind('code 3221225478'))
+        self.assertEqual(w.crash_kind('code -11'), 'SIGSEGV')
+        self.assertEqual(w.crash_kind('sd-cli a échoué (code 139)'), 'SIGSEGV')
+        self.assertIsNotNone(w.crash_kind('   13s Windows fatal exception: access violation'))
+        self.assertIsNone(w.crash_kind('sd-cli a échoué (code 1) : out of memory'))
+        self.assertIsNone(w.crash_kind('génération trop lent : 115.8 s par étape'))
+        self.assertIsNotNone(w.file_error('Error while deserializing header: HeaderTooLarge'))
+        self.assertIsNotNone(w.file_error('safetensors_rust.SafetensorError: MetadataIncompleteBuffer'))
+        self.assertIsNone(w.file_error('CUDA out of memory'))
+
+    def test_a_native_crash_keeps_where_python_called_native_code(self):
+        t = w.ComfyTrace()
+        out = ['Windows fatal exception: access violation', '', 'Thread 0x0000a1b2 (most recent call first):',
+               '  File "C:\\py\\Lib\\threading.py", line 359 in wait', '  File "C:\\py\\Lib\\threading.py", line 1012 in run',
+               '', 'Current thread 0x00004c2c (most recent call first):',
+               '  File "C:\\gpu\\comfyui\\ComfyUI-0.45.0\\comfy\\ops.py", line 88 in cast_bias_weight',
+               '  File "C:\\gpu\\comfyui\\ComfyUI-0.45.0\\comfy\\text_encoders\\llama.py", line 412 in forward',
+               '  File "C:\\gpu\\comfyui\\ComfyUI-0.45.0\\main.py", line 200 in prompt_worker']
+        out += ['0x00007FFDEC8095E%d, C:\\x\\torch\\lib\\c10.dll(0x00007FFDEC760000) + 0xA95E0 byte(s), ?_ThrowRuntimeTypeLogicError' % i
+                for i in range(10)]
+        t.feed(('\n'.join(out) + '\n').encode())
+        self.assertEqual(t.meta['crash_at'], 'ComfyUI-0.45.0/comfy/ops.py:88 cast_bias_weight')
+        self.assertEqual(t.meta['crash'], 'Windows fatal exception: access violation')
+        text = '\n'.join(t.lines)
+        self.assertIn('text_encoders/llama.py:412 forward', text)
+        self.assertNotIn('threading.py', text, 'stacks of the other threads are left out')
+        self.assertEqual(sum('c10.dll' in l for l in t.lines), 8, 'native frames bounded')
+
+    def entry(self, name, data, model='m1', url=None, links=()):
+        return {'model': model, 'name': name, 'path': str(self.dir / name), 'size': len(data),
+                'sha256': hashlib.sha256(data).hexdigest(), 'url': url, 'links': list(links)}
+
+    def test_files_are_rehashed_whatever_their_marker_says_and_wrong_ones_redownloaded(self):
+        good, te, vae = b'g' * 4096, b't' * 5000, b'v' * 3000
+        src = self.dir / 'mirror'
+        src.mkdir()
+        (src / 'te.safetensors').write_bytes(te)
+        entries = [self.entry('good.safetensors', good), self.entry('te.safetensors', te, url=(src / 'te.safetensors').as_uri()),
+                   self.entry('vae.safetensors', vae), self.entry('never.safetensors', b'n' * 10)]
+        (self.dir / 'good.safetensors').write_bytes(good)
+        # Même taille, un octet changé, témoin .ok encore valide (date et taille inchangées) : invisible jusqu'ici
+        bad = bytearray(te)
+        bad[2500] ^= 1
+        (self.dir / 'te.safetensors').write_bytes(bytes(bad))
+        st = (self.dir / 'te.safetensors').stat()
+        Path(str(self.dir / 'te.safetensors') + '.ok').write_text('%s %d %d' % (entries[1]['sha256'], st.st_size, st.st_mtime_ns))
+        (self.dir / 'vae.safetensors').write_bytes(vae[:1000])   # tronqué
+        link = self.dir / 'other-copy.safetensors'
+        os.link(self.dir / 'vae.safetensors', link)
+        entries[2]['links'] = [str(link)]
+        stages = []
+        res = w.verify_files(entries, repair=True, progress=lambda f, st: stages.append((f, st)))
+        by = {r['file']: r for r in res}
+        self.assertEqual(by['good.safetensors']['state'], 'sain')
+        self.assertTrue(Path(str(self.dir / 'good.safetensors') + '.ok').exists(), 'a sound file gets a fresh marker')
+        self.assertEqual(by['te.safetensors']['state'], 'empreinte')
+        self.assertEqual(by['te.safetensors']['action'], 'effacé ; retéléchargé et vérifié')
+        self.assertTrue(by['te.safetensors']['ok'])
+        self.assertEqual((self.dir / 'te.safetensors').read_bytes(), te)
+        self.assertEqual(by['vae.safetensors']['state'], 'taille')
+        self.assertEqual(by['vae.safetensors']['action'], 'effacé : retéléchargé au prochain travail', 'no url: the next job downloads it')
+        self.assertFalse((self.dir / 'vae.safetensors').exists())
+        self.assertFalse(link.exists(), 'the other name of the same broken file goes too')
+        self.assertEqual(by['never.safetensors']['state'], 'absent')
+        self.assertNotIn('action', by['never.safetensors'], 'a file never installed is left to the next job (cap and disk checked there)')
+        self.assertEqual(stages[-1], (1.0, 'vérification finie'))
+        self.assertIn('te.safetensors : empreinte -> effacé ; retéléchargé et vérifié', w.verify_summary(res))
+
+    def test_a_file_held_open_is_released_once_then_removed(self):
+        data = b'x' * 100
+        e = self.entry('held.safetensors', data)
+        (self.dir / 'held.safetensors').write_bytes(b'y' * 100)
+        real, calls, unlocked = w.remove_files, [], []
+
+        def flaky(paths):
+            calls.append(1)
+            return 'held.safetensors : [WinError 32] utilisé par un autre processus' if len(calls) == 1 else real(paths)
+        w.remove_files = flaky
+        try:
+            res = w.verify_files([e], repair=True, unlock=lambda why: unlocked.append(why) or True)
+        finally:
+            w.remove_files = real
+        self.assertEqual(len(unlocked), 1)
+        self.assertIn('WinError 32', unlocked[0])
+        self.assertEqual(res[0]['action'], 'effacé : retéléchargé au prochain travail')
+        # Rien ne libère le fichier : dit tel quel, pas réparé
+        (self.dir / 'held.safetensors').write_bytes(b'y' * 100)
+        w.remove_files = lambda paths: 'held.safetensors : tenu'
+        try:
+            res = w.verify_files([e], repair=True, unlock=lambda why: False)
+        finally:
+            w.remove_files = real
+        self.assertEqual(res[0]['action'], 'retrait impossible : held.safetensors : tenu')
+        self.assertFalse(res[0]['ok'])
+
+    def test_python_environment_is_checked_against_pip_records(self):
+        sp = self.dir / 'python' / 'Lib' / 'site-packages'
+        (sp / 'torch' / 'lib').mkdir(parents=True)
+        (sp / 'torch-2.13.0.dist-info').mkdir()
+        files = {'torch/__init__.py': b'import x\n', 'torch/lib/c10.dll': b'MZ' + b'\0' * 64, 'torch/lib/gone.dll': b'MZ'}
+        rec = []
+        for rel, data in files.items():
+            rec.append('%s,sha256=%s,%d' % (rel, w.record_hash(hashlib.sha256(data).digest()), len(data)))
+            if rel != 'torch/lib/gone.dll':
+                (sp / rel).write_bytes(data)
+        rec += ['torch/__pycache__/x.cpython-313.pyc,,', '../../Scripts/torchrun.exe,sha256=abc,3', 'torch-2.13.0.dist-info/RECORD,,']
+        (sp / 'torch-2.13.0.dist-info' / 'RECORD').write_text('\n'.join(rec) + '\n')
+        env = w.verify_python_env(self.dir / 'python')
+        self.assertEqual((env['packages'], env['files'], env['bad_count']), (1, 3, 1))
+        self.assertEqual(env['bad'][0]['why'], 'absent')
+        # Changé en place, même taille (lien physique partagé avec l'atelier et réécrit)
+        (sp / 'torch/lib/c10.dll').write_bytes(b'MZ' + b'\1' * 64)
+        env = w.verify_python_env(self.dir / 'python')
+        self.assertEqual(env['bad_count'], 2)
+        self.assertIn({'package': 'torch-2.13.0.dist-info', 'file': 'torch/lib/c10.dll', 'why': 'empreinte différente de celle inscrite par pip'}, env['bad'])
+        self.assertIn('environnement Python abîmé : 2 fichier(s)', w.verify_summary([], env))
+
+    def test_model_entries_follow_the_catalog_for_any_engine(self):
+        gpu = w.Gpu(self.dir, {}, Path(w.__file__).resolve().parent)
+        klein = gpu.model_entries('flux3-klein')
+        names = [e['name'] for e in klein]
+        self.assertEqual(names, [f['name'] for f in gpu.catalog['types']['image']['models']['flux3-klein']['files']])
+        self.assertTrue(all('/gpu/comfyui/data/models/' in e['path'].replace('\\', '/') for e in klein))
+        self.assertTrue(all(len(e['sha256']) == 64 and e['size'] > 0 and e['url'] for e in klein))
+        default = gpu.catalog['types']['image']['default_model']
+        self.assertTrue(all(('/gpu/models/%s/' % default) in e['path'].replace('\\', '/') for e in gpu.model_entries(default)))
+        self.assertEqual(len(gpu.model_entries('comfyui')), len(gpu.catalog['benchmarks']['comfyui']['files']))
+        self.assertEqual(gpu.model_entries('nope'), [])
+        self.assertEqual(gpu.model_entries(None, installed_only=True), [], 'nothing on this machine yet')
+        p = Path(klein[1]['path'])
+        p.parent.mkdir(parents=True)
+        p.write_bytes(b'x')
+        self.assertEqual([e['name'] for e in gpu.model_entries(None, installed_only=True)], [klein[1]['name']])
+
+    def test_environment_reset_keeps_the_weights_and_asks_the_workshop_to_reclone(self):
+        spec = w.comfy_spec(Path(w.__file__).resolve().parent)
+        lay = w.comfy_layout(self.dir, spec)
+        for d in (lay['python'] / 'Lib', lay['src'], lay['data'] / 'models' / 'vae', lay['cache'] / 'miopen'):
+            d.mkdir(parents=True)
+        (lay['python'] / 'Lib' / 'x.py').write_bytes(b'1' * 100)
+        (lay['data'] / 'models' / 'vae' / 'ae.safetensors').write_bytes(b'w')
+        (lay['cache'] / 'miopen' / 'k.db').write_bytes(b'c' * 50)
+        for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+            (lay['root'] / ('.ok-' + step)).write_text(w.comfy_marker(spec, step))
+        at = w.atelier_layout(self.dir, spec)
+        at['root'].mkdir(parents=True)
+        (at['root'] / '.ok-env').write_text('x')
+        self.assertEqual(w.clear_compute_caches(self.dir, spec), 50)
+        self.assertFalse(lay['cache'].exists())
+        self.assertGreaterEqual(w.comfy_reset_env(self.dir, spec), 100)
+        self.assertFalse(lay['python'].exists() or lay['src'].exists())
+        self.assertFalse(any(w.comfy_done(lay, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')))
+        self.assertTrue((lay['data'] / 'models' / 'vae' / 'ae.safetensors').exists(), 'weights kept')
+        self.assertFalse((at['root'] / '.ok-env').exists(), 'the workshop clones the new environment at its next start')
+
+    def test_remote_verify_models_reports_files_and_environment(self):
+        r = w.gpu_test_report(self.dir, {}, 'verify_models', {'model': 'nope'})
+        self.assertFalse(r['ok'])
+        self.assertIn('inconnu du catalogue', r['error'])
+        r = w.gpu_test_report(self.dir, {}, 'verify_models', {})
+        self.assertTrue(r['ok'])
+        self.assertEqual((r['model'], r['files']), ('tous (posés sur ce PC)', []))
+        spec = w.comfy_spec(Path(w.__file__).resolve().parent)
+        sp = w.comfy_layout(self.dir, spec)['python'] / 'Lib' / 'site-packages'
+        (sp / 'a-1.dist-info').mkdir(parents=True)
+        (sp / 'a.py').write_bytes(b'changed')
+        (sp / 'a-1.dist-info' / 'RECORD').write_text('a.py,sha256=%s,7\n' % w.record_hash(hashlib.sha256(b'origin').digest()))
+        r = w.gpu_test_report(self.dir, {}, 'verify_models', {'model': 'flux3-klein'})
+        self.assertFalse(r['ok'])
+        self.assertEqual([f['state'] for f in r['files']], ['absent'] * 3)
+        self.assertIn('environnement Python abîmé : 1 fichier(s), ex. a.py', r['error'])
+        self.assertIn('comfyui_reinstall', r['next'])
+        r = w.gpu_test_report(self.dir, {}, 'verify_models', {'model': 'flux3-klein', 'env': False})
+        self.assertTrue(r['ok'])
+        self.assertNotIn('env', r)
+
+    def test_remote_comfyui_reinstall_removes_the_environment_first_and_keeps_the_weights(self):
+        spec = w.comfy_spec(Path(w.__file__).resolve().parent)
+        lay = w.comfy_layout(self.dir, spec)
+        (lay['python'] / 'Lib').mkdir(parents=True)
+        (lay['data'] / 'models' / 'vae').mkdir(parents=True)
+        (lay['data'] / 'models' / 'vae' / 'ae.safetensors').write_bytes(b'w')
+        for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+            (lay['root'] / ('.ok-' + step)).write_text(w.comfy_marker(spec, step))
+        r = w.gpu_test_report(self.dir, {'gpu_keep_free_gb': 0, 'gpu_max_gb': 1000}, 'comfyui_reinstall', {})
+        self.assertIn('reinstall_freed_gb', r)
+        self.assertFalse(lay['python'].exists())
+        self.assertTrue((lay['data'] / 'models' / 'vae' / 'ae.safetensors').exists())
+        self.assertFalse(r['ok'], 'then the normal installation runs: here it stops (Linux, or no room for the weights)')
+
+    def test_workshop_held_off_during_a_repair_then_free_to_start_again(self):
+        base = self.dir
+        at = w.Atelier(base, {'atelier_enabled': True, 'comfyui_any_os': True}, Path(w.__file__).resolve().parent, None)
+        self.assertTrue(at.wanted())
+        self.assertFalse(at.hold('environnement refait'))
+        self.assertFalse(at.wanted())
+        self.assertTrue(at.state.startswith('suspendu'))
+        at.next_try = 1e12
+        at.unhold()
+        self.assertTrue(at.wanted())
+        self.assertEqual(at.next_try, 0.0)
+        self.assertEqual(at.state, 'éteint')
+
+
+class ComfyNativeCrashTest(unittest.TestCase):
+    def test_a_native_crash_says_its_kind_and_the_python_line_that_called_native_code(self):
+        base = Path(tempfile.mkdtemp())
+        (base / 'logs').mkdir()
+        gpu = w.Gpu(base, {'comfyui_any_os': True, 'gpu_keep_free_gb': 0, 'gpu_max_gb': 1000}, Path(w.__file__).resolve().parent)
+        gpu.catalog['engines']['sdcpp']['linux'] = dict(gpu.catalog['engines']['sdcpp']['windows'])
+        spec = gpu.catalog['benchmarks']['comfyui']
+        spec['torch']['check'] = "print('TORCH 2.13.0+rocm10.0.0 7.1 True 1'); print('DEV 0 gfx1030 17163091968 AMD Radeon RX 6950 XT')"
+        lay = w.comfy_layout(base, spec)
+        lay['exe'].parent.mkdir(parents=True)
+        os.symlink(sys.executable, lay['exe'])
+        lay['src'].mkdir(parents=True)
+        (lay['src'] / 'main.py').write_text(FAKE_COMFY)
+        for step in ('python', 'pip', 'source', 'torch', 'requirements'):
+            (lay['root'] / ('.ok-' + step)).write_text(w.comfy_marker(spec, step))
+        for f in gpu.catalog['types']['image']['models']['flux3-klein']['files']:
+            dest = lay['data'] / 'models' / f['dir'] / f['name']
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b'fake')
+            st = dest.stat()
+            Path(str(dest) + '.ok').write_text('%s %d %d' % (f['sha256'], st.st_size, st.st_mtime_ns))
+        lay['data'].mkdir(parents=True, exist_ok=True)
+        (lay['data'] / 'native-crash').write_text('')
+        job = {'id': 191, 'kind': 'image', 'model': 'flux3-klein', 'prompt': 'a red mug', 'params': {'width': 256, 'height': 256, 'steps': 4}}
+        try:
+            with self.assertRaises(RuntimeError) as c:
+                gpu.run(job, None, base, None, lambda f, st: None)
+        finally:
+            gpu.stop_comfy()
+        msg = str(c.exception)
+        self.assertIn("s'est arrêté pendant le calcul (code -11, SIGSEGV) dans comfy/text_encoders/llama.py:412 forward", msg)
+        self.assertIsNotNone(w.crash_kind(msg), 'the worker recognises it for the auto-repair')
+        self.assertNotIn('threading.py', '\n'.join(gpu.last_trace.lines))
+
+
+class AutoRepairWorkerTest(unittest.TestCase):
+    """Le worker : échec -> raison -> vérification -> réparation -> un seul nouvel essai, chaque étape dite au hub."""
+    CRASH = "ComfyUI s'est arrêté pendant le calcul (code 3221225477) :    13s Windows fatal exception: access violation"
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp())
+        (self.base / 'logs').mkdir()
+        (self.base / 'reuse-worker.config.json').write_text(json.dumps({'hub_url': 'https://hub.invalid', 'token': 'jeton-de-test'}))
+        self.worker = w.Worker(self.base, None)
+        self.worker.hub = FakeHub(200)
+        self.data = b'poids' * 1000
+        mirror = self.base / 'mirror'
+        mirror.mkdir()
+        (mirror / 'te.safetensors').write_bytes(self.data)
+        self.file = self.base / 'models' / 'te.safetensors'
+        self.file.parent.mkdir()
+        self.entries = [{'model': 'flux3-klein', 'name': 'te.safetensors', 'path': str(self.file), 'size': len(self.data),
+                         'sha256': hashlib.sha256(self.data).hexdigest(), 'url': (mirror / 'te.safetensors').as_uri(), 'links': []}]
+        self.worker.gpu.model_entries = lambda model=None, installed_only=False: self.entries
+        self.runs = []
+        self.job = {'id': 187, 'kind': 'image', 'model': 'flux3-klein'}
+
+    def run_with(self, outcomes):
+        def fake_run(job, src, workdir, stop, progress):
+            self.runs.append(job['id'])
+            o = outcomes.pop(0)
+            if isinstance(o, Exception):
+                raise o
+            return Path('out.png'), 1.0, {'s_per_step': 4.0}
+        self.worker.gpu.run = fake_run
+        return self.worker.run_gpu(self.job, None, self.base, threading.Event(), lambda f, st: None)
+
+    def events(self):
+        return [(c[2]['what'], c[2]['detail']) for c in self.worker.hub.calls if c[1] == '/api/reuse/worker/events']
+
+    def test_a_corrupted_weight_after_a_native_crash_is_redownloaded_and_the_job_replayed_once(self):
+        broken = bytearray(self.data)
+        broken[10] ^= 0xFF
+        self.file.write_bytes(bytes(broken))
+        out, secs, meta = self.run_with([RuntimeError(self.CRASH), None])
+        self.assertEqual(len(self.runs), 2)
+        self.assertEqual(self.file.read_bytes(), self.data)
+        self.assertIn('te.safetensors : empreinte -> effacé ; retéléchargé et vérifié', meta['repair'])
+        what = [e[0] for e in self.events()]
+        self.assertEqual(what, ['repair_started', 'repair_file', 'repair_finished', 'repair_replay', 'repair_replay_ok'],
+                         'no ComfyUI environment here: not checked')
+        started, file = self.events()[0][1], self.events()[1][1]
+        self.assertIn('0xC0000005', started['reason'])
+        self.assertEqual((file['file'], file['state'], file['model'], file['job']), ('te.safetensors', 'empreinte', 'flux3-klein', 187))
+        self.assertEqual(self.worker.model_failures['flux3-klein'], 0)
+
+    def test_sound_files_after_a_native_crash_clear_the_caches_replay_once_and_say_the_cause_is_elsewhere(self):
+        self.file.write_bytes(self.data)
+        with self.assertRaises(RuntimeError) as c:
+            self.run_with([RuntimeError(self.CRASH), RuntimeError(self.CRASH)])
+        self.assertEqual(len(self.runs), 2, 'one replay, never more')
+        self.assertIn('[après auto-réparation : 1 fichier(s) vérifié(s), sains', str(c.exception))
+        fin = dict(self.events())['repair_finished']
+        self.assertIn('caches de calcul vidés', fin['summary'])
+        self.assertIn('cause ailleurs que dans les fichiers', fin['summary'])
+        self.assertIn('repair_replay_failed', [e[0] for e in self.events()])
+        # Un nouveau plantage dans les 6 h : pas de nouvelle vérification de 20 Go, la raison est dite
+        self.runs.clear()
+        with self.assertRaises(RuntimeError) as c:
+            self.run_with([RuntimeError(self.CRASH)])
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn('[auto-réparation : déjà tentée à', str(c.exception))
+        self.assertEqual(self.events()[-1][0], 'repair_skipped')
+
+    def test_an_ordinary_failure_is_not_repaired_until_it_happens_twice_in_a_row_on_the_same_model(self):
+        self.file.write_bytes(self.data)
+        with self.assertRaises(RuntimeError):
+            self.run_with([RuntimeError('ComfyUI refuse le workflow (HTTP 400)')])
+        self.assertEqual(self.events(), [])
+        with self.assertRaises(RuntimeError) as c:
+            self.run_with([RuntimeError('ComfyUI refuse le workflow (HTTP 400)')])
+        self.assertIn('2 échecs de suite', self.events()[0][1]['reason'])
+        self.assertIn('[auto-réparation : 1 fichier(s) vérifié(s), sains', str(c.exception))
+        self.assertEqual(len(self.runs), 2, 'sound files, no native crash: nothing to replay')
+        # Final (trop lent, image noire) : jamais une affaire de fichiers
+        self.worker.repairs.clear()
+        with self.assertRaises(w.Final):
+            self.run_with([w.Final('génération trop lente')])
+        self.assertEqual(self.events()[-1][0], 'repair_finished')
+
+    def test_a_damaged_python_environment_is_reset_once_with_the_workshop_held_off(self):
+        self.file.write_bytes(self.data)
+        spec = w.comfy_spec(Path(w.__file__).resolve().parent)
+        lay = w.comfy_layout(self.base, spec)
+        sp = lay['python'] / 'Lib' / 'site-packages'
+        (sp / 'torch-2.13.0.dist-info').mkdir(parents=True)
+        (sp / 'torch').mkdir()
+        (sp / 'torch' / 'c10.dll').write_bytes(b'changed')
+        (sp / 'torch-2.13.0.dist-info' / 'RECORD').write_text('torch/c10.dll,sha256=%s,7\n' % w.record_hash(hashlib.sha256(b'origin').digest()))
+        held, installs = [], []
+        self.worker.atelier.hold = lambda why: held.append(why) or False
+        real = w.comfy_install
+
+        def fake_install(base, spec_, gpu, stop, progress, report, files=None):
+            # Réinstallé avant le nouvel essai : sans cela, le modèle n'est plus proposé (gpu.models()) et l'essai échoue
+            installs.append((files, lay['python'].exists(), w.comfy_done(lay, spec_, 'torch')))
+            return lay, {}
+        w.comfy_install = fake_install
+        try:
+            out, _, meta = self.run_with([RuntimeError(self.CRASH), None])
+            self.assertEqual(installs, [([], False, False)], 'damaged environment removed, then reinstalled (weights untouched)')
+            self.assertEqual(len(held), 1)
+            self.assertIsNone(self.worker.atelier.held, 'workshop free to start again (it reclones the new environment)')
+            what = [e[0] for e in self.events()]
+            self.assertLess(what.index('repair_env_reset'), what.index('repair_env_reinstalled'))
+            self.assertLess(what.index('repair_env_reinstalled'), what.index('repair_replay'))
+            env = dict(self.events())['repair_env']
+            self.assertEqual(env['bad'][0]['file'], 'torch/c10.dll')
+            self.assertIn('environnement ComfyUI refait', meta['repair'])
+            # Même panne le lendemain matin (moins de 24 h) : pas de seconde réinstallation automatique
+            self.worker.repairs.clear()
+            (sp / 'torch-2.13.0.dist-info').mkdir(parents=True)
+            (sp / 'torch').mkdir()
+            (sp / 'torch' / 'c10.dll').write_bytes(b'changed')
+            (sp / 'torch-2.13.0.dist-info' / 'RECORD').write_text('torch/c10.dll,sha256=%s,7\n' % w.record_hash(hashlib.sha256(b'origin').digest()))
+            with self.assertRaises(RuntimeError) as c:
+                self.run_with([RuntimeError(self.CRASH)])
+            self.assertIn('pas de nouvelle réinstallation avant 24 h', dict(self.events())['repair_finished']['summary'])
+            self.assertEqual(len(installs), 1)
+        finally:
+            w.comfy_install = real
 
 if __name__ == '__main__':
     w.log.addHandler(__import__('logging').NullHandler())

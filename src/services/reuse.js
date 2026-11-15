@@ -10,7 +10,7 @@ import { logger } from '../utils/logger.js';
 import { workerWindow, workerInWindow, setWorkerSchedule, clearWorkerSchedule } from './reuse-schedule.js';
 import {
   workerSettings, patchWorkerSettings, workerEvents, pendingTest, createTest, listTests, getTest, cancelTest, reportTest,
-  noteTestOutput, testOutput, TEST_OUTPUT_EXT
+  noteTestOutput, testOutput, TEST_OUTPUT_EXT, workerEvent
 } from './worker-control.js';
 import { pendingAtelierTask, createAtelierTask, listAtelierTasks, getAtelierTask, cancelAtelierTask, reportAtelierTask } from './atelier-tasks.js';
 
@@ -684,6 +684,9 @@ export function reportWorkerTest(name, id, body) {
   const r = reportTest(name, id, body || {}, now, stop);
   return r.ok ? { ...r, orders: workerOrders(name, now) } : r;
 }
+
+/** A diagnosis or repair step the worker reports itself (auto-repair of model files, environment): kept in its journal. */
+export const reportWorkerEvent = (name, body) => workerEvent(name, body || {});
 
 /** Schedule of one worker and where it stands now. */
 export function getSchedule(name) {

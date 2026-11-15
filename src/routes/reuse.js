@@ -8,7 +8,7 @@ import {
   listWorkers, orderWorker, getSchedule, setSchedule, workerOrders, workerManifest, workerFilePath, pythonRuntime, inputPath, outputPath, inputLost,
   getWorkerSettings, setWorkerSettings, getAtelier, switchAtelier, requestAtelierTask, atelierTasks, atelierTask, stopAtelierTask,
   reportFromWorkerAtelierTask, requestWorkerTest, listWorkerTests, getWorkerTest, cancelWorkerTest, reportWorkerTest,
-  storeTestOutput, workerTestOutput
+  storeTestOutput, workerTestOutput, reportWorkerEvent
 } from '../services/reuse.js';
 import { gpuClaimHooks, gpuClaimView } from '../services/gpu-jobs.js';
 
@@ -196,8 +196,11 @@ router.post('/api/reuse/workers/:name/atelier/tasks/:id/cancel', guard('admin'),
 });
 
 /**
- * POST /api/reuse/workers/:name/tests {kind: "image"|"3d"|"comfyui"|"comfyui_remove", params} - Queue a GPU test, the
- * remote form of `reuse_worker.py --gpu-test`. Run between two jobs, inside the schedule, one at a time. 201 {test[, warning]}.
+ * POST /api/reuse/workers/:name/tests {kind, params} - Queue a GPU test, the remote form of `reuse_worker.py --gpu-test`.
+ * Run between two jobs, inside the schedule, one at a time. 201 {test[, warning]}. Kinds: "image", "3d", "comfyui",
+ * "comfyui_remove", "comfyui_reinstall" (ComfyUI's Python and torch redone, weights kept), "verify_models" ({model?,
+ * repair?: true, env?: true}: weights re-hashed against the catalog, wrong ones re-downloaded, ComfyUI's Python checked
+ * against pip's RECORD; result.files, result.env, result.summary).
  * GET /api/reuse/workers/:name/tests[?limit=20] - Tests of this worker, most recent first.
  * GET /api/reuse/workers/:name/tests/:id - {test: {status, stage, progress, ok, error, result: {compute_s, log, ...}}}.
  * POST /api/reuse/workers/:name/tests/:id/cancel - A running test is stopped by the worker within 30 s.
@@ -268,6 +271,15 @@ router.post('/api/reuse/worker/status', guard('worker'), json, (req, res) => {
  */
 router.post('/api/reuse/worker/tests/:id', guard('worker'), jsonReport, (req, res) => {
   answer(res, reportWorkerTest(req.reuseCaller.name, req.params.id, req.body));
+});
+
+/**
+ * POST /api/reuse/worker/events {what: "repair_*"|"verify_*", detail: {...}} - A step of the worker's own diagnosis or
+ * repair (file re-hashed, re-downloaded, environment checked or redone, job replayed), kept in its journal
+ * (GET /api/reuse/workers/:name/settings, history).
+ */
+router.post('/api/reuse/worker/events', guard('worker'), json, (req, res) => {
+  answer(res, reportWorkerEvent(req.reuseCaller.name, req.body));
 });
 
 /** POST /api/reuse/worker/atelier-tasks/:id {status: "running", stage, progress} every 30 s, then {status: "done"|"failed", result}. */

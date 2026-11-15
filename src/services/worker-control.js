@@ -32,8 +32,17 @@ export const TEST_KINDS = {
   image: { width: [256, 1536], height: [256, 1536], steps: [1, 30], seed: [0, 2147483647] },
   '3d': { res: ['512', '1024'], steps: [4, 30], seed: [0, 2147483647], texture: 'bool' },
   comfyui: { width: [256, 1536], height: [256, 1536], steps: [1, 30], seed: [0, 2147483647], runs: [1, 3] },
-  comfyui_remove: {}
+  comfyui_remove: {},
+  // Python, torch and ComfyUI of the jobs reinstalled (about 25 min), model weights kept; the workshop is held off meanwhile
+  comfyui_reinstall: {},
+  // Re-hash the weights of one catalog model (or of every model on the machine) against the catalog's size and SHA-256,
+  // re-download the wrong ones (repair, default true), check ComfyUI's Python against pip's RECORD hashes (env, default true)
+  verify_models: { model: /^[a-z0-9][a-z0-9._-]{0,63}$/, repair: 'bool', env: 'bool' }
 };
+
+/** What a worker may write in its own journal (POST /api/reuse/worker/events): steps of a diagnosis or a repair. */
+export const WORKER_EVENT = /^(repair|verify)_[a-z_]{1,32}$/;
+const EVENT_DETAIL_MAX = 4000;
 
 export const TEST_SILENT_MS = 15 * 60 * 1000;       // a running test the worker no longer reports on is failed
 export const TEST_PENDING_MS = 24 * 60 * 60 * 1000;   // a test nobody started in a day is not run by surprise later
@@ -162,6 +171,19 @@ export function patchWorkerSettings(name, patch, now = Date.now()) {
   return { ok: true, settings: workerSettings(name), changed };
 }
 
+/**
+ * A step the worker reports on its own (auto-repair: files re-hashed, re-downloaded, environment checked, job replayed),
+ * kept in its journal like the admin's actions. what: repair_* or verify_*; detail: a flat-enough object, clipped.
+ */
+export function workerEvent(name, { what, detail } = {}, now = Date.now()) {
+  if (typeof what !== 'string' || !WORKER_EVENT.test(what)) return err(400, `what must match ${WORKER_EVENT.source}`);
+  if (detail != null && (typeof detail !== 'object' || Array.isArray(detail))) return err(400, 'detail must be an object');
+  const kept = JSON.parse(clip(detail || {}, EVENT_DETAIL_MAX));
+  delete kept.at; delete kept.what;   // the journal's own fields (workerEvents spreads detail after them)
+  journal(name, what, kept, now);
+  return { ok: true };
+}
+
 /** Journal of one worker (settings changes, tests asked, started, finished, cancelled), most recent first. */
 export function workerEvents(name, limit = 50) {
   return q.events.all(name, Math.min(Math.max(Number(limit) || 50, 1), 500)).map(e => {
@@ -184,6 +206,9 @@ function checkTestParams(kind, params) {
     if (rule === undefined) return { error: `Unknown parameter "${k}" for a ${kind} test (allowed: ${Object.keys(allowed).join(', ') || 'none'})` };
     if (rule === 'bool') {
       if (typeof v !== 'boolean') return { error: `${k} must be true or false` };
+      out[k] = v;
+    } else if (rule instanceof RegExp) {
+      if (typeof v !== 'string' || !rule.test(v)) return { error: `${k} must match ${rule.source}` };
       out[k] = v;
     } else if (typeof rule[0] === 'string') {
       if (!rule.includes(String(v))) return { error: `${k} must be one of ${rule.join(', ')}` };
