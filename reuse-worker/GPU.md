@@ -350,6 +350,9 @@ revérifiés. Désormais :
      garde les paquets pip de ses nœuds (supprimer `atelier\python` pour le recloner à la main).
   4. Rien de faux après un plantage natif : caches de calcul vidés (MIOpen, torch, temporaires).
   5. Le travail est rejoué une fois. Échec : raison d'origine plus « [après auto-réparation : …] ».
+  6. Plantage natif et rien de faux : le rejeu prend un profil mémoire sûr (vram_mode normal, dynamic_vram vrai, text_encoder
+     inchangé), pour les réglages que le catalogue donne au modèle. S'il réussit : `repair_profile` dans les mesures et
+     événement `repair_safe_profile_ok` (profil du travail, profil sûr) : le profil par défaut du modèle pose problème sur ce PC.
 - Une même réparation au plus toutes les 6 h par modèle : un nouvel échec dit « déjà tentée à HH:MM : … » Ces deux délais sont
   gardés dans `auto-repair.json` (dossier du worker) : une mise à jour ou un redémarrage ne les rouvre pas.
 - Chaque étape est envoyée au hub (`POST /api/reuse/worker/events`) et lisible dans le journal du worker
