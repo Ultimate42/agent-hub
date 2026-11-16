@@ -44,7 +44,8 @@ opt = lambda k: a[a.index(k) + 1] if k in a else None
 base, port = opt('--base-directory'), int(opt('--port'))
 os.makedirs(base, exist_ok=True)
 with open(os.path.join(base, 'argv.jsonl'), 'a') as f:
-    f.write(json.dumps({'args': a, 'pid': os.getpid()}) + '\\n')
+    f.write(json.dumps({'args': a, 'pid': os.getpid(), 'hip': os.environ.get('HIP_VISIBLE_DEVICES')}) + '\\n')
+card = 'AMD Radeon RX 6950 XT' if os.environ.get('HIP_VISIBLE_DEVICES') == '1' else 'AMD Radeon(TM) Graphics'   # Windows : la n° 0 seule
 held = {'mib': 9000}
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *x):
@@ -58,8 +59,8 @@ class H(http.server.BaseHTTPRequestHandler):
             busy = os.path.exists(os.path.join(base, 'busy'))
             return self.answer(200, {'queue_running': [[1, 'p1', {}, {}, []]] if busy else [], 'queue_pending': []})
         if self.path == '/system_stats':
-            return self.answer(200, {'devices': [{'vram_total': 16384 * 1048576, 'vram_free': (16384 - held['mib']) * 1048576,
-                                                  'torch_vram_total': held['mib'] * 1048576}]})
+            return self.answer(200, {'devices': [{'name': 'cuda:0 %s : native' % card, 'vram_total': 16384 * 1048576,
+                                                  'vram_free': (16384 - held['mib']) * 1048576, 'torch_vram_total': held['mib'] * 1048576}]})
         return self.answer(404, {})
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
@@ -123,6 +124,9 @@ describe('worker: ComfyUI workshop beside the hub jobs', { skip: !canRun }, () =
         }
       }
     }
+    // gpu-box as ROCm sees it: the Ryzen integrated graphics first (no kernel in the gfx1030 wheels), then the RX 6950 XT
+    catalog.benchmarks.comfyui.torch.check = "print('TORCH 2.13.0+rocm10.0.0 7.15 True 2'); print('DEV 0 gfx1036 13065000000 AMD Radeon(TM) Graphics'); "
+      + "print('DEV 1 gfx1030 17163091968 AMD Radeon RX 6950 XT')";
     fs.writeFileSync(path.join(publish, 'gpu-catalog.json'), JSON.stringify(catalog, null, 1));
 
     // The jobs' ComfyUI environment is already installed on the PC (the workshop clones it): markers computed by the worker
@@ -201,6 +205,8 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     assert.ok(a.pid > 0 && alive(a.pid));
     const args = runs()[0].args;
     assert.strictEqual(args[args.indexOf('--listen') + 1], '127.0.0.1');
+    assert.strictEqual(runs()[0].hip, '1', 'the workshop picks its card itself, before any Klein job: never the integrated graphics');
+    assert.strictEqual((await until('card reported', async () => (await workshop()).atelier?.device)), 'cuda:0 AMD Radeon RX 6950 XT : native');
     assert.ok(!args.includes('--disable-all-custom-nodes'), 'custom nodes allowed in the workshop');
     assert.ok(fs.existsSync(path.join(pc, 'atelier', 'python', 'bin', 'python3')), 'environment cloned from the jobs one');
     assert.strictEqual((await (await fetch(`http://127.0.0.1:${ATELIER_PORT}/queue`)).json()).queue_running.length, 0);

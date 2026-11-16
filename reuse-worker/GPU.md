@@ -35,7 +35,8 @@ Image à partir d'une image : même chose avec `type: "image"`, un `prompt` et `
 Paramètres de l'image (Z-Image Turbo) : `width` et `height` (256 à 1536, multiples de 64, 1024 par défaut), ou
 `size: "1024x768"` ; `steps` (8) ; `seed` (tirée au hasard et renvoyée si absente : refaire la même image = même
 graine) ; `cfg_scale` (1) ; `sampler` (euler, euler_a, heun, dpm++2m, lcm) ; `negative_prompt` (sans effet à
-cfg 1) ; `priority` (-10 à 10). La 3D accepte `res` (512 ou 1024), `steps` (12), `seed`, `texture` (true).
+cfg 1) ; `priority` (-10 à 10). La 3D accepte `res` (512 ou 1024), `steps` (12), `seed`, `texture` (true) et
+`texture_size` (1024 ou 2048, voir « Taille de texture 3D »).
 Paramètres de premier niveau ou sous `params`. Alias compris : `w`, `h`, `cfg`, `negative`, `image_base64`.
 Une valeur hors bornes est ramenée dans les bornes et signalée dans `adjusted`. Une clé inconnue est ignorée et
 listée dans `ignored`. Une erreur (400) dit ce qui est attendu.
@@ -239,6 +240,22 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   `gpu\logs\`.
 - Pour tout retirer : supprimer le dossier `gpu\` (ComfyUI seul : essai `comfyui_remove`).
 
+## Taille de texture 3D (`texture_size`)
+
+- C'est le côté en pixels de l'atlas de texture du GLB, soit l'option `--atlas` de trellis.cpp v0.8.1 (alias `--tex`, lue
+  dans `src/trellis_args.cpp` de la v0.8.1). `res` règle le maillage, `texture_size` la texture : ce sont deux choses.
+- Valeurs : 1024 ou 2048. Absent, rien n'est passé et trellis.cpp garde son choix, d'où un défaut inchangé :
+  - 1024 en `res` 512, le défaut ;
+  - 2048 en `res` 1024 (`T = cascade ? 2048 : 1024` dans `trellis_cli.cpp`).
+- `texture_size` avec `texture: false` est refusé (400) : sans texture, il n'y a rien à cuire. La règle est dans le
+  catalogue (`requires`), pas dans le code.
+- Mémoire : la cuisson de l'atlas (`uv_bake.cpp`) tourne sur le processeur, sans ggml. 2048 coûte environ 55 Mo de RAM
+  (couleur, métal-rugosité, masque et profondeur, en 2048²), et rien sur la carte. La mémoire vidéo dépend de `res` et
+  de `tex-res` (volume PBR), que le hub ne change pas. Il n'y a donc pas de refus « mémoire » pour 2048, même en `res`
+  1024 : c'est déjà le défaut de trellis.cpp dans ce cas.
+- Ce qui a été cuit est relevé dans `engine.texture_size` du travail (ligne « textured GLB (atlas N) » du moteur).
+- Essai à distance : `{"kind":"3d","params":{"texture_size":"2048"}}`.
+
 ## La 3D est expérimentale : derrière un drapeau, non prouvée
 
 trellis.cpp v0.8.1 précède le correctif d'un bug Vulkan qui touche les cartes RDNA2 (RX 6000). Avec le pilote AMD
@@ -295,8 +312,13 @@ curl -H "$A" $H/settings                                         # réglages pos
 Ce que fait un essai :
 - Types d'essai :
   - `image` (512 par défaut ; paramètres width, height, steps, seed) ;
-  - `3d` (res, steps, seed, texture) ;
+  - `3d` (res, steps, seed, texture, texture_size) ;
   - `comfyui` (width, height, steps, seed, runs) ;
+  - `upscale` (model obligatoire, scale, 4 par défaut) : l'image d'essai `gpu-test-object.png` (512x512) est agrandie dans
+    l'atelier en marche par un fichier de son dossier `upscale_models` (nœuds natifs `UpscaleModelLoader` et
+    `ImageUpscaleWithModel`). L'essai est réussi si le PNG fait exactement `scale` fois l'entrée sur les deux côtés et n'est
+    pas uni (NaN ou noyau absent). Le rapport donne `device` (la carte vue par l'atelier), `hip_visible_devices`, `result`
+    (taille, moyenne et écart des octets) et la fin du journal de l'atelier. Le PNG est rattaché à l'essai (`output`) ;
   - `comfyui_remove` ;
   - `comfyui_reinstall` : Python, torch, dépendances et source de ComfyUI des travaux refaits (25 min environ), poids
     gardés ; l'atelier est arrêté pendant ce temps (refusé s'il calcule), puis reparti avec son propre environnement (paquets de ses nœuds gardés) ;
@@ -441,6 +463,30 @@ Il est séparé du ComfyUI des travaux du hub, qui reste sans nœuds additionnel
   - jamais `--fast` ni `COMFYUI_ENABLE_MIOPEN`.
 - Survit à une mise à jour du worker : le nouveau worker reprend le processus en marche, et le travail en cours n'est pas
   coupé. Le fichier `STOP` l'arrête avec le worker.
+
+**La carte de l'atelier : jamais le graphique intégré**
+- Sur gpu-box, ROCm voit deux cartes. La n° 0 est le graphique intégré du Ryzen (gfx1036, 13,1 Go de mémoire partagée), la
+  n° 1 est la RX 6950 XT (gfx1030). Les roues PyTorch ne contiennent que les noyaux gfx1030 (`torch[device-gfx1030]`). Or
+  ComfyUI sous Windows ne garde que la carte 0 si on ne lui dit rien.
+- **Panne du 16/11, vers 21 h 10.** Les agrandisseurs `4x-PBRify-UpscalerV4` (DAT) et VOSR2 plantaient en
+  `hipErrorInvalidImage` (« device kernel image is invalid »).
+  - Cause : l'atelier ne posait `HIP_VISIBLE_DEVICES` que si un travail Klein avait déjà choisi la carte dans ce worker.
+    Démarré à 9 h 46, avant tout travail, il calculait sur le gfx1036. On le voyait à `vram_total_mib` : 12 460 au lieu de
+    16 368.
+  - Ce n'était ni le modèle, ni la précision, ni MIOpen : tout calcul sur carte y aurait échoué. Même symptôme relevé ailleurs
+    (wan2gp-amd #5, ComfyUI PR #17673, ouverte).
+  - Contournement du soir : atelier éteint puis rallumé depuis le hub. Il a redémarré sur la RX 6950 XT
+    (`vram_total_mib` 16 368).
+- Depuis :
+  - l'atelier choisit lui-même sa carte avant de démarrer, comme les travaux (`comfy_pick_device`), même sans aucun travail
+    Klein ;
+  - le choix ne retient que les cartes dont les roues ont les noyaux (architecture dans `torch.packages`), puis la plus
+    grande. Une machine sans carte compatible le dit, au lieu de calculer à côté ;
+  - `device` dans l'état de l'atelier donne la carte réellement utilisée (`/system_stats`) ;
+  - un atelier repris en marche sur une autre carte que celle choisie (version précédente du worker) est relancé une fois,
+    dès qu'il ne calcule plus. La raison est dans `error`. S'il y retombe, il n'est plus relancé et `error` le dit.
+- Vérifier : essai `{"kind":"upscale","params":{"model":"4x-PBRify-UpscalerV4.safetensors"}}`, puis `result` 2048x2048 et
+  `device` = la RX 6950 XT.
 
 **Partage de la carte (16 Go) : un seul calcul à la fois, l'atelier d'abord**
 - Le worker lit la file de l'atelier (`/queue`) toutes les 3 s. Tant qu'elle n'est pas vide :

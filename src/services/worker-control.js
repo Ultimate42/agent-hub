@@ -30,14 +30,17 @@ export const WORKER_SETTINGS = {
 /** Kinds of remote test and the parameters each accepts (anything else is refused, never passed to the PC). */
 export const TEST_KINDS = {
   image: { width: [256, 1536], height: [256, 1536], steps: [1, 30], seed: [0, 2147483647] },
-  '3d': { res: ['512', '1024'], steps: [4, 30], seed: [0, 2147483647], texture: 'bool' },
+  '3d': { res: ['512', '1024'], steps: [4, 30], seed: [0, 2147483647], texture: 'bool', texture_size: ['1024', '2048'] },
   comfyui: { width: [256, 1536], height: [256, 1536], steps: [1, 30], seed: [0, 2147483647], runs: [1, 3] },
   comfyui_remove: {},
   // Python, torch and ComfyUI of the jobs reinstalled (about 25 min), model weights kept; the workshop is held off meanwhile
   comfyui_reinstall: {},
   // Re-hash the weights of one catalog model (or of every model on the machine) against the catalog's size and SHA-256,
   // re-download the wrong ones (repair, default true), check ComfyUI's Python against pip's RECORD hashes (env, default true)
-  verify_models: { model: /^[a-z0-9][a-z0-9._-]{0,63}$/, repair: 'bool', env: 'bool' }
+  verify_models: { model: /^[a-z0-9][a-z0-9._-]{0,63}$/, repair: 'bool', env: 'bool' },
+  // The bundled test image enlarged inside the workshop by one of its upscale_models files (UpscaleModelLoader +
+  // ImageUpscaleWithModel): ok when the PNG is exactly scale times the input on both sides and not flat (NaN, missing kernel)
+  upscale: { model: /^(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9_.() +-]{0,119}\.(safetensors|sft|pth|pt|ckpt|bin)$/i, scale: [1, 8] }
 };
 
 /** What a worker may write in its own journal (POST /api/reuse/worker/events): steps of a diagnosis or a repair. */
@@ -254,6 +257,7 @@ export function createTest(name, { kind, params } = {}, now = Date.now()) {
   if (!Object.hasOwn(TEST_KINDS, kind || '')) return err(400, `kind must be one of ${Object.keys(TEST_KINDS).join(', ')}`);
   const c = checkTestParams(kind, params);
   if (c.error) return err(400, c.error);
+  if (kind === 'upscale' && !c.params.model) return err(400, 'model is required: a file of the workshop upscale_models folder, e.g. 4x-PBRify-UpscalerV4.safetensors');
   expireTests(now);
   const open = q.open.get(name);
   if (open) return err(409, `Test ${open.id} (${open.kind}) is ${open.status} on ${name}: wait for it or cancel it first`);

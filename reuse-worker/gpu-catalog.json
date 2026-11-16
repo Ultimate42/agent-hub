@@ -536,10 +536,13 @@
             "res": { "type": "enum", "values": ["512", "1024"], "default": "512" },
             "steps": { "type": "int", "min": 4, "max": 30, "default": 12 },
             "seed": { "type": "int", "min": 0, "max": 2147483647, "default": "random" },
-            "texture": { "type": "bool", "default": true }
+            "texture": { "type": "bool", "default": true },
+            "texture_size": { "type": "enum", "values": ["1024", "2048"], "requires": { "texture": true },
+                              "note": "Cote de l'atlas de texture en pixels (--atlas de trellis.cpp v0.8.1). Absent : choix de trellis.cpp, 1024 en res 512, 2048 en res 1024. Cuisson sur le processeur : pas de memoire video en plus." }
           },
           "command": ["{input}", "{output}", "--models", "{models_dir}", "--backend", "Vulkan", "--require-gpu",
-                      "--res", "{res}", "--steps", "{steps}", "--seed", "{seed}", "{unless:texture=--no-texture}"],
+                      "--res", "{res}", "--steps", "{steps}", "--seed", "{seed}", "{unless:texture=--no-texture}",
+                      "{opt:texture_size=--atlas}"],
           "timeout_s": 3600
         }
       }

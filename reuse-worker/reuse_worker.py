@@ -901,7 +901,7 @@ class EngineTrace:
     ou des poids relus du disque à chaque travail ne se voient qu'à la lenteur."""
     KEEP = re.compile(r'ggml_vulkan|vulkan\d|auto-fit|devices?:|free\s+-?\d+ MiB|RAM\s+free|params\s+-?\d+ MiB|--backend|using CPU|'
                       r'no GPU|buffer size|completed, taking|completed in|memory-mapped|out of memory|tiling|model manager|'
-                      r'offload|staged|\bWARN|\bERROR|failed|error|^\s*\[\d+/\d+\]', re.I)
+                      r'offload|staged|\bWARN|\bERROR|failed|error|^\s*\[\d+/\d+\]|textured GLB', re.I)
     STAGE = re.compile(r'^\s*\[(\d+)/(\d+)\]\s*(.+)')   # étapes de trellis.cpp : « [5/7] FlexiDualGrid shape decode -> mesh »
     BAR = re.compile(r'\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)\s*(s/it|it/s|[KMG]B/s)')
     TAKING = (('load_s', r'loading tensors completed, taking ([\d.]+)s'), ('encode_s', r'get_learned_condition completed, taking ([\d.]+)s'),
@@ -1016,6 +1016,9 @@ class EngineTrace:
         m = re.search(r'RAM\s+free\s+(-?\d+) MiB', line)
         if m:
             self.meta.setdefault('ram_free_mib', int(m.group(1)))
+        m = re.search(r'textured GLB \(atlas (\d+)', line)   # trellis.cpp : côté de l'atlas réellement cuit
+        if m:
+            self.meta['texture_size'] = int(m.group(1))
         for key, pattern in self.TAKING:
             m = re.search(pattern, line)
             if m:
@@ -1087,6 +1090,7 @@ class Gpu:
         self.app = app
         self.catalog = read_json(app / GPU_CATALOG, {}) or {}
         self.hip_device = None   # carte ROCm choisie pour ComfyUI (None : pas encore regardé, '' : une seule carte)
+        self.hip_card = None     # cette carte telle que PyTorch la voit : {index, arch, memory_gb, name}
         self.comfy = None        # ComfyUI résident pour les modèles qui passent par lui (FLUX 3 Klein) : poignée de comfy_start
         self.pidfile = self.root / 'engine.pid'
         self.status = {}   # type -> état lisible (« prêt », « pas installé », « échec : … »)
@@ -2656,8 +2660,11 @@ class Worker:
         try:
             if kind == 'comfyui_reinstall':   # l'atelier tient ces fichiers (liens physiques) : gardé éteint, puis reparti tel quel
                 self.atelier.hold('réinstallation de l\'environnement ComfyUI des travaux (essai %d)' % tid)
-            report = gpu_test_report(self.base, dict(self.config), kind, test.get('params') or {},
-                                     bundled if kind == '3d' and bundled.exists() else None, stop, progress, unlock=self.unlock_for_repair)
+            if kind == 'upscale':   # dans l'atelier lui-même : c'est son ComfyUI (nœuds, carte choisie) qu'on veut éprouver
+                report = self.atelier.upscale_test(test.get('params') or {}, bundled, stop, progress)
+            else:
+                report = gpu_test_report(self.base, dict(self.config), kind, test.get('params') or {},
+                                         bundled if kind == '3d' and bundled.exists() else None, stop, progress, unlock=self.unlock_for_repair)
         finally:
             finished.set()
             self.job_active = False
@@ -3385,11 +3392,21 @@ def comfy_pick_device(lay, env, spec, gpu, stop, report):
     report['torch_devices'] = devices
     if ' True ' not in ' %s ' % line or not devices:
         raise RuntimeError('PyTorch ROCm ne voit pas la carte : %s' % (line or out.strip()[-300:]))
-    # Un processeur AMD à graphique intégré est aussi vu par ROCm : ComfyUI calcule sur la carte qui a le plus de mémoire
-    card = max(devices, key=lambda d: d['memory_gb'])
+    # Un processeur AMD à graphique intégré est aussi vu par ROCm, et c'est lui le numéro 0 sur gpu-box (Ryzen gfx1036, puis la
+    # RX 6950 XT gfx1030). Les roues ne contiennent les noyaux que des architectures demandées (torch[device-gfx1030]) : sur une
+    # autre carte, tout calcul échoue en hipErrorInvalidImage (« device kernel image is invalid »), et ComfyUI sous Windows ne
+    # garde que la carte 0 si on ne lui dit rien. On prend donc une carte de ces architectures, la plus grande s'il y en a
+    # plusieurs, et on cache les autres (HIP_VISIBLE_DEVICES).
+    built = set(re.findall(r'device-(gfx[0-9a-z]+)', ' '.join((spec.get('torch') or {}).get('packages') or [])))
+    usable = [d for d in devices if not built or d['arch'] in built]
+    if not usable:
+        raise RuntimeError('aucune carte que cette build de PyTorch sait calculer (cartes : %s ; noyaux : %s)' % (
+            ', '.join('%s %s' % (d['name'], d['arch']) for d in devices), ', '.join(sorted(built))))
+    card = max(usable, key=lambda d: d['memory_gb'])
     if len(devices) > 1:
         env['HIP_VISIBLE_DEVICES'] = str(card['index'])
     report['torch_device'] = card
+    gpu.hip_card = card
     return card
 
 
@@ -4019,6 +4036,8 @@ class Atelier:
         self.last_task = None
         self.restart_wanted = False     # nœuds ajoutés ou retirés : relance dès que l'atelier ne calcule plus
         self.held = None                # raison d'une réparation en cours qui le garde éteint (hold / unhold)
+        self.card_restarts = 0          # relances parce qu'il calculait sur une autre carte que celle choisie (check_card)
+        self.card_probe_at = -1e9       # dernier choix de carte tenté pour un atelier repris (un échec n'est pas relancé à chaque tour)
 
     # ---- réglages ----
     def spec(self):
@@ -4208,6 +4227,42 @@ class Atelier:
         mark.write_text(want)
         return True
 
+    # ---- carte : celle que PyTorch sait calculer, jamais le graphique intégré ----
+    def ensure_card(self, spec, lay):
+        """Carte ROCm de l'atelier, choisie comme pour les travaux (comfy_pick_device), une fois par vie du worker.
+        Panne du 16/11 : l'atelier ne prenait que le choix déjà fait par un travail Klein ; lancé avant tout travail, il voyait les
+        deux cartes et ComfyUI gardait la n° 0, le graphique intégré du Ryzen (gfx1036), sans noyau dans les roues gfx1030 :
+        tout calcul échouait en hipErrorInvalidImage (agrandisseurs 4x-PBRify-UpscalerV4 et VOSR2). -> HIP_VISIBLE_DEVICES ('' : une
+        seule carte, rien à cacher)."""
+        if self.gpu.hip_device is None:
+            self.state = 'préparation : choix de la carte'
+            env = comfy_env(lay, spec['atelier'])
+            (self.gpu.root / 'logs').mkdir(parents=True, exist_ok=True)
+            card = comfy_pick_device(lay, env, spec, self.gpu, self.stopping, {})
+            self.gpu.hip_device = env.get('HIP_VISIBLE_DEVICES', '')
+            log.info('Atelier : carte %s (%s, %.1f Go), HIP_VISIBLE_DEVICES=%s.', card['name'], card['arch'], card['memory_gb'],
+                     self.gpu.hip_device or '(une seule carte)')
+        return self.gpu.hip_device
+
+    def check_card(self, busy):
+        """La carte sur laquelle l'atelier calcule vraiment (/system_stats) est-elle celle choisie ? Sinon (atelier repris d'une
+        version qui ne la choisissait pas, variable ignorée), relancé une fois dès qu'il ne calcule plus, et dit au hub."""
+        want, have = (self.gpu.hip_card or {}).get('name'), self.vram.get('device')
+        if not want or not have or want in have:
+            return
+        if self.card_restarts >= 1:
+            self.error = 'calcule sur « %s » et non sur « %s », même après relance avec HIP_VISIBLE_DEVICES=%s : à voir sur le PC' % (
+                have, want, self.gpu.hip_device)
+            return
+        if busy:
+            return
+        self.card_restarts += 1
+        why = 'calculait sur « %s » au lieu de « %s » (hipErrorInvalidImage assuré) : relancé sur la bonne carte' % (have, want)
+        log.error('Atelier : %s.', why)
+        self.stop('mauvaise carte')
+        self.error = why
+        self.next_try = 0.0
+
     # ---- marche, arrêt ----
     def adopt(self, lay):
         """Atelier resté en marche pendant la mise à jour ou le redémarrage du worker : repris tel quel (le travail de Alice
@@ -4245,7 +4300,7 @@ class Atelier:
                 args += ['--enable-cors-header', cors]
             else:
                 log.warning('Atelier : atelier_cors_origin ignoré (une origine précise, http(s)://hôte[:port], jamais *) : %r', cors)
-        if self.gpu.hip_device:
+        if self.ensure_card(spec, lay):
             env['HIP_VISIBLE_DEVICES'] = self.gpu.hip_device
         flags, kwargs = self.gpu.spawn_options()
         if IS_WINDOWS:
@@ -4262,7 +4317,8 @@ class Atelier:
             self.proc = subprocess.Popen(args, cwd=str(lay['src']), stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                          env=env, creationflags=flags, **kwargs)
         self.pid, self.port, self.listen, self.started_at = self.proc.pid, port, listen, time.strftime('%Y-%m-%d %H:%M:%S')
-        write_json(lay['state'], {'pid': self.pid, 'port': port, 'listen': listen, 'started_at': self.started_at})
+        write_json(lay['state'], {'pid': self.pid, 'port': port, 'listen': listen, 'started_at': self.started_at,
+                                  'hip_device': env.get('HIP_VISIBLE_DEVICES')})
         self.state = 'démarrage'
         log.info('Atelier ComfyUI lancé (pid %d) : %s port %d%s.', self.pid, listen, port, ', avec ComfyUI-Manager' if manager else '')
         deadline = time.time() + float(atelier.get('start_timeout_s') or 600)
@@ -4419,7 +4475,7 @@ class Atelier:
             return self.vram
         mib = lambda v: int(v / 1048576) if isinstance(v, (int, float)) else None
         self.vram = {'free_mib': mib(dev.get('vram_free')), 'total_mib': mib(dev.get('vram_total')),
-                     'atelier_mib': mib(dev.get('torch_vram_total'))}
+                     'atelier_mib': mib(dev.get('torch_vram_total')), 'device': str(dev.get('name') or '')[:120] or None}
         return self.vram
 
     def free(self, why, wait_s=COMFY_FREE_WAIT_S):
@@ -4762,12 +4818,100 @@ class Atelier:
                 self.vram_at = now
                 self.read_vram()
                 self.read_log()
+                if self.gpu.hip_device is None and not busy and now - self.card_probe_at >= 600:   # repris en marche : carte pas encore choisie
+                    self.card_probe_at = now
+                    try:
+                        spec = self.spec()
+                        self.ensure_card(spec, atelier_layout(self.base, spec))
+                    except (RuntimeError, OSError, JobLost) as e:
+                        log.warning('Atelier : carte pas vérifiée (%s).', e)
+                    self.state = 'en marche'
+                self.check_card(busy)
+                if not self.pid:
+                    return
             # Tailscale prêt après coup, adresse changée, pare-feu posé ou retiré : relance (seulement sans calcul en cours)
             ip = self.remote_ip(now)
             want = '127.0.0.1' + (',' + ip if ip else '')
             if want != self.listen and not busy:
                 self.stop('adresse d\'écoute à changer : %s -> %s' % (self.listen, want))
                 self.next_try = 0.0
+
+    def upscale_test(self, params, image, stop, progress, timeout_s=900):
+        """Essai upscale : l'image d'essai livrée avec le worker agrandie dans l'atelier par un modèle de upscale_models
+        (UpscaleModelLoader + ImageUpscaleWithModel, les nœuds natifs de ComfyUI). Réussi si l'image produite fait exactement
+        scale fois l'entrée sur les deux côtés et n'est pas unie (NaN ou noyau absent : noire). -> rapport (ne lève pas)."""
+        report = {'ok': False, 'kind': 'upscale', 'at': time.strftime('%Y-%m-%d %H:%M:%S')}
+        try:
+            name, scale = str(params.get('model') or ''), int(params.get('scale') or 4)
+            if not SAFE_PART.fullmatch(name) or not MODEL_EXT.fullmatch(name) or '..' in name:
+                raise ValueError('model : nom d\'un fichier de upscale_models attendu (ex. 4x-PBRify-UpscalerV4.safetensors)')
+            report.update(model=name, scale=scale)
+            if not self.pid or self.state != 'en marche':
+                raise RuntimeError('atelier pas en marche (%s) : l\'allumer d\'abord ({"on": true})' % self.state)
+            spec = self.spec()
+            lay = atelier_layout(self.base, spec)
+            report['device'] = self.read_vram().get('device')
+            report['hip_visible_devices'] = (read_json(lay['state'], {}) or {}).get('hip_device')
+            sub = lay['data'] / 'input' / 'reuse-test'
+            sub.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(image, sub / image.name)
+            w_in, h_in = png_size(sub / image.name) or (0, 0)
+            report['input'] = {'file': image.name, 'width': w_in, 'height': h_in}
+            wf = {'1': {'class_type': 'LoadImage', 'inputs': {'image': 'reuse-test/' + image.name}},
+                  '2': {'class_type': 'UpscaleModelLoader', 'inputs': {'model_name': name}},
+                  '3': {'class_type': 'ImageUpscaleWithModel', 'inputs': {'upscale_model': ['2', 0], 'image': ['1', 0]}},
+                  '4': {'class_type': 'SaveImage', 'inputs': {'filename_prefix': 'reuse-test/upscale', 'images': ['3', 0]}}}
+            progress(0.1, 'agrandissement par %s dans l\'atelier' % name)
+            t0 = time.time()
+            status, answer = comfy_local(self.port, 'POST', '/prompt', {'prompt': wf, 'client_id': 'reuse-worker-test'}, timeout=60)
+            pid = (answer or {}).get('prompt_id')
+            if status != 200 or not pid:
+                raise RuntimeError('l\'atelier refuse le graphe (HTTP %s) : %s' % (status, json.dumps(answer, ensure_ascii=False)[:400]))
+            entry = None
+            while entry is None:
+                if stop is not None and stop.is_set():
+                    comfy_local(self.port, 'POST', '/interrupt', {}, timeout=10)
+                    raise JobLost('essai interrompu')
+                if time.time() - t0 > timeout_s:
+                    comfy_local(self.port, 'POST', '/interrupt', {}, timeout=10)
+                    raise RuntimeError('agrandissement trop long (plus de %s)' % fmt_duration(timeout_s))
+                time.sleep(1)
+                progress(min(0.9, 0.1 + (time.time() - t0) / timeout_s), 'agrandissement : %d s' % (time.time() - t0))
+                try:
+                    status, hist = comfy_local(self.port, 'GET', '/history/%s' % pid, timeout=30)
+                except (OSError, ValueError):
+                    continue
+                if status == 200 and isinstance(hist, dict) and pid in hist:
+                    entry = hist[pid]
+            report['compute_s'] = round(time.time() - t0, 1)
+            st = entry.get('status') or {}
+            if st.get('status_str') != 'success':
+                msgs = [m for m in st.get('messages') or [] if m and m[0] == 'execution_error']
+                e = (msgs[0][1] if msgs else {}) or {}
+                raise RuntimeError('agrandissement raté (%s) : %s %s' % (e.get('node_type', '?'), e.get('exception_type', ''),
+                                                                         str(e.get('exception_message', st))[:300]))
+            images = [im for node in (entry.get('outputs') or {}).values() for im in node.get('images') or []]
+            if not images:
+                raise RuntimeError('aucune image produite')
+            out = lay['data'] / 'output' / (images[0].get('subfolder') or '') / images[0]['filename']
+            dest = self.base / 'logs' / 'gpu-test-upscale.png'
+            shutil.copyfile(out, dest)
+            w_out, h_out = png_size(dest) or (0, 0)
+            stats = png_stats(dest)
+            report.update(output=str(dest), size=os.path.getsize(dest), sha256=sha256_file(dest),
+                          result={'width': w_out, 'height': h_out, 'image': stats})
+            if (w_out, h_out) != (w_in * scale, h_in * scale):
+                raise RuntimeError('taille %dx%d au lieu de %dx%d (x%d)' % (w_out, h_out, w_in * scale, h_in * scale, scale))
+            if not stats or stats['std'] <= 2:
+                raise RuntimeError('image unie (noire ?) : calcul tombé en NaN ou noyau absent, voir log')
+            report['ok'] = True
+        except JobLost as e:
+            report['error'] = 'annulé : %s' % e
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            report['error'] = str(e)[:400]
+        self.read_log(force=True)
+        report['log'] = list(self.log_lines)
+        return report
 
     def describe(self):
         d = {'enabled': self.enabled(), 'state': self.state, 'pid': self.pid, 'port': self.port, 'listen': self.listen,
@@ -4778,7 +4922,7 @@ class Atelier:
              'busy': self.busy_flag if self.pid else None, 'queue': '%d+%d' % self.queue if self.queue else None,
              'unresponsive_s': int(time.time() - self.unresponsive_since) if self.pid and self.doubtful() else None,
              'vram_free_mib': self.vram.get('free_mib'), 'vram_total_mib': self.vram.get('total_mib'),
-             'vram_atelier_mib': self.vram.get('atelier_mib'), 'freed': self.freed if self.pid else None,
+             'vram_atelier_mib': self.vram.get('atelier_mib'), 'device': self.vram.get('device'), 'freed': self.freed if self.pid else None,
              'manager': self.manager if self.manager is not None else None, 'started_at': self.started_at, 'files_gb': self.files_gb,
              'error': self.error or (self.ts.get('error') if self.pid and not self.ts.get('ip') else None), 'note': self.env_note,
              'task': ('%(id)d %(action)s %(ok)s' % dict(self.last_task, ok='ok' if self.last_task['ok'] else 'raté')) if self.last_task else None,
@@ -4789,7 +4933,8 @@ class Atelier:
         return {k: v for k, v in d.items() if v is not None}
 
 
-GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove', 'comfyui_reinstall', 'verify_models')
+GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove', 'comfyui_reinstall', 'verify_models', 'upscale')
+LOCAL_TEST_KINDS = GPU_TEST_KINDS[:-1]   # upscale passe par l'atelier, mené par le worker en marche : pas d'essai local
 GPU_TEST_OBJECT = 'gpu-test-object.png'   # entrée de l'essai 3D demandé par le hub (512x512, fond blanc)
 # Réglages que le hub peut poser sur cette machine (POST /api/reuse/workers/:nom/settings), avec leurs types. Aucun autre.
 REMOTE_SETTINGS = {'enable_3d': (bool,), 'gpu_max_gb': (int, float), 'gpu_keep_loaded_s': (int, float),
@@ -5122,7 +5267,7 @@ def gpu_test_report(base, config, kind, params=None, input_path=None, stop=None,
             values = {'width': 512, 'height': 512, 'steps': 8, 'cfg_scale': 1.0, 'seed': 42, 'sampler': 'euler', 'negative_prompt': ''}
         else:
             values = {'res': '512', 'steps': 12, 'seed': 42, 'texture': True}
-        values.update({k: v for k, v in params.items() if k in values})
+        values.update({k: v for k, v in params.items() if k in values or (kind == '3d' and k == 'texture_size')})
         job = {'kind': kind, 'model': model, 'params': values,
                'prompt': 'a red ceramic teapot on a white table, studio photo' if spec.get('prompt') != 'none' else ''}
         report['params'] = values
@@ -5199,7 +5344,7 @@ def main():
     parser.add_argument('--base', required=True, help='dossier d\'installation (config, runtime, logs)')
     parser.add_argument('--launcher', help='script qui a lancé ce worker (mis à jour avec lui)')
     parser.add_argument('--crash-test', action='store_true', help='essai complet sans hub : installe, teste la carte, nettoie 10 s, écrit logs/crash-test.json')
-    parser.add_argument('--gpu-test', choices=GPU_TEST_KINDS, help='essai de génération sans hub (worker arrêté) : logs/gpu-test.json')
+    parser.add_argument('--gpu-test', choices=LOCAL_TEST_KINDS, help='essai de génération sans hub (worker arrêté) : logs/gpu-test.json')
     parser.add_argument('--gpu-input', help='image d\'entrée de l\'essai 3D (défaut : logs/gpu-test.png)')
     args = parser.parse_args()
     base = Path(args.base).resolve()

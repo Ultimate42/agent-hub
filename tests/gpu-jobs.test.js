@@ -389,6 +389,22 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     assert.strictEqual(j.type, '3d', 'an image without a prompt means 3D');
     assert.deepStrictEqual([j.params.res, j.params.texture, j.params.steps], ['1024', false, 12]);
     assert.deepStrictEqual(j.input, { sha256: sha(photo), size: photo.length, format: 'png' });
+    assert.strictEqual(j.params.texture_size, undefined, 'no texture_size given: trellis.cpp keeps its own choice (1024 @512, 2048 @1024)');
+    // texture_size: 1024 or 2048, string or number, and only with a texture
+    const img64 = photo.toString('base64');
+    const big = await submit(agent, { image: img64, texture_size: 2048 });
+    assert.strictEqual(big.status, 201, JSON.stringify(big.data));
+    assert.deepStrictEqual([big.data.job.params.texture_size, big.data.job.params.texture, big.data.job.params.res], ['2048', true, '512']);
+    await call(`/api/gpu/jobs/${big.data.job.id}/cancel`, { method: 'POST', token: agent });
+    for (const [body, re] of [
+      [{ image: img64, texture_size: 4096 }, /texture_size must be one of: 1024, 2048/],
+      [{ image: img64, texture_size: 'huge' }, /texture_size must be one of/],
+      [{ image: img64, texture: false, texture_size: '2048' }, /texture_size needs texture: true \(here texture is false\)/]
+    ]) {
+      const r = await submit(agent, body);
+      assert.strictEqual(r.status, 400, JSON.stringify(body).slice(-60));
+      assert.match(r.data.error, re);
+    }
 
     assert.strictEqual((await poll(AMD, 'image')).data.job, null, 'gpu-box does not offer 3d');
     const claim = (await poll(NV, 'image,3d')).data.job;

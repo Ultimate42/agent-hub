@@ -315,7 +315,7 @@ class GpuTest(unittest.TestCase):
     def test_catalog_commands_use_only_known_values(self):
         for kind, spec in self.catalog['types'].items():
             for mid, m in spec['models'].items():
-                values = {k: (v['default'] if v.get('default') != 'random' else 1) for k, v in m['params'].items()}
+                values = {k: (v['default'] if v.get('default') != 'random' else 1) for k, v in m['params'].items() if 'default' in v}   # sans défaut : facultatif ({opt:...})
                 if m.get('engine') == 'comfyui':   # modèle joué par ComfyUI : un workflow au lieu d'une ligne de commande
                     extra = {k: how['map'][str(values[how['from']])] for k, how in (m.get('workflow_values') or {}).items()}
                     wf = w.comfy_workflow(m, dict(values, prompt='x', ref_megapixels=1.0, **extra))
@@ -1130,14 +1130,41 @@ class ComfyBenchTest(unittest.TestCase):
 
 
 FAKE_ATELIER = r'''
-import http.server, json, os, sys, time
+import http.server, json, os, struct, sys, threading, time, zlib
 a = sys.argv[1:]
 opt = lambda k: a[a.index(k) + 1] if k in a else None
 base, port = opt('--base-directory'), int(opt('--port'))
 os.makedirs(base, exist_ok=True)
+hip = os.environ.get('HIP_VISIBLE_DEVICES')
 with open(os.path.join(base, 'argv.jsonl'), 'a') as f:
-    f.write(json.dumps({'args': a, 'pid': os.getpid(), 'alloc': os.environ.get('PYTORCH_HIP_ALLOC_CONF'), 'temp': os.environ.get('TEMP')}) + '\n')
+    f.write(json.dumps({'args': a, 'pid': os.getpid(), 'alloc': os.environ.get('PYTORCH_HIP_ALLOC_CONF'), 'temp': os.environ.get('TEMP'),
+                        'hip': hip}) + '\n')
+# Comme ComfyUI sous Windows : seule la carte 0 de ce qu'on lui laisse voir ; sur gpu-box, la 0 est le graphique intégré
+card = 'AMD Radeon RX 6950 XT' if hip == '1' else 'AMD Radeon(TM) Graphics'
 held = {'mib': 9000}
+history = {}
+def png(path, w, h, flat):
+    rows = b''.join(b'\x00' + bytes(0 if flat else (x * 7 + y * 13) % 256 for x in range(w * 3)) for y in range(h))
+    c = lambda k, d: struct.pack('>I', len(d)) + k + d + struct.pack('>I', zlib.crc32(k + d))
+    open(path, 'wb').write(b'\x89PNG\r\n\x1a\n' + c(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + c(b'IDAT', zlib.compress(rows)) + c(b'IEND', b''))
+def upscale(pid, wf):
+    with open(os.path.join(base, 'last-workflow.json'), 'w') as f:
+        json.dump(wf, f)
+    node = lambda kind: [n for n in wf.values() if n['class_type'] == kind][0]['inputs']
+    src = os.path.join(base, 'input', node('LoadImage')['image'])
+    w, h = struct.unpack('>II', open(src, 'rb').read(24)[16:24])
+    time.sleep(0.3)
+    if card != 'AMD Radeon RX 6950 XT':   # roues gfx1030 sur le gfx1036
+        print('torch.AcceleratorError: CUDA error: device kernel image is invalid', flush=True)
+        history[pid] = {'status': {'status_str': 'error', 'messages': [['execution_error', {'node_type': 'ImageUpscaleWithModel',
+                        'exception_type': 'torch.AcceleratorError', 'exception_message': 'CUDA error: device kernel image is invalid'}]]}, 'outputs': {}}
+        return
+    sub = os.path.dirname(node('SaveImage')['filename_prefix'])
+    os.makedirs(os.path.join(base, 'output', sub), exist_ok=True)
+    png(os.path.join(base, 'output', sub, 'upscale_00001_.png'), 4 * w, 4 * h, os.path.exists(os.path.join(base, 'flat')))
+    print('Prompt executed in 0.30 seconds', flush=True)
+    history[pid] = {'status': {'status_str': 'success', 'messages': []},
+                    'outputs': {'4': {'images': [{'filename': 'upscale_00001_.png', 'subfolder': sub, 'type': 'output'}]}}}
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *x):
         pass
@@ -1152,8 +1179,12 @@ class H(http.server.BaseHTTPRequestHandler):
             busy = os.path.exists(os.path.join(base, 'busy'))
             return self.answer(200, {'queue_running': [[1, 'p1', {}, {}, []]] if busy else [], 'queue_pending': []})
         if self.path == '/system_stats':
-            return self.answer(200, {'devices': [{'vram_total': 16384 * 1048576, 'vram_free': (16384 - held['mib']) * 1048576,
+            return self.answer(200, {'devices': [{'name': 'cuda:0 %s : native' % card, 'vram_total': 16384 * 1048576,
+                                                  'vram_free': (16384 - held['mib']) * 1048576,
                                                   'torch_vram_total': held['mib'] * 1048576, 'torch_vram_free': 0}]})
+        if self.path.startswith('/history/'):
+            pid = self.path.rsplit('/', 1)[-1]
+            return self.answer(200, {pid: history[pid]} if pid in history else {})
         return self.answer(404, {})
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
@@ -1163,6 +1194,13 @@ class H(http.server.BaseHTTPRequestHandler):
             held['mib'] = 300
             self.send_response(200); self.send_header('Content-Length', '0'); self.end_headers()
             return
+        if self.path == '/prompt':
+            pid = 'u%d' % (len(history) + 1)
+            history_pending = threading.Thread(target=upscale, args=(pid, body['prompt']))
+            history_pending.start()
+            return self.answer(200, {'prompt_id': pid, 'number': 1})
+        if self.path == '/interrupt':
+            return self.answer(200, {})
         return self.answer(404, {})
 time.sleep(0.3)
 print('Starting server', flush=True)
@@ -1352,7 +1390,12 @@ class AtelierBase(unittest.TestCase):
         self.port = free_port()
         self.config = {'atelier_enabled': True, 'comfyui_any_os': True, 'atelier_port': self.port, 'gpu_keep_free_gb': 0}
         self.gpu = w.Gpu(self.base, self.config, Path(w.__file__).resolve().parent)
-        self.spec = self.gpu.catalog['benchmarks']['comfyui']
+        self.spec = json.loads(json.dumps(self.gpu.catalog['benchmarks']['comfyui']))
+        # gpu-box vu par ROCm : le graphique intégré du Ryzen d'abord (aucun noyau dans les roues gfx1030), puis la RX 6950 XT
+        self.spec['torch']['check'] = ("print('TORCH 2.13.0+rocm10.0.0 7.15 True 2'); print('DEV 0 gfx1036 13065000000 AMD Radeon(TM) Graphics'); "
+                                       "print('DEV 1 gfx1030 17163091968 AMD Radeon RX 6950 XT')")
+        self.saved_spec = w.comfy_spec
+        w.comfy_spec = lambda app=None: self.spec
         jobs = w.comfy_layout(self.base, self.spec)
         (jobs['python'] / 'bin').mkdir(parents=True)
         os.symlink(sys.executable, jobs['python'] / 'bin' / 'python3')
@@ -1372,6 +1415,7 @@ class AtelierBase(unittest.TestCase):
 
     def tearDown(self):
         w.tailscale_ip, w.read_firewall_rules = self.saved
+        w.comfy_spec = self.saved_spec
         for a in self.ateliers:
             a.shutdown('fin du test')
 
@@ -1598,7 +1642,8 @@ class AtelierLifeTest(AtelierBase):
         (self.lay['src'] / 'manager_requirements.txt').write_text('comfyui_manager==4.2.2\n')
         calls = []
         saved = w.run_logged
-        w.run_logged = lambda args, *x, **k: calls.append([str(v) for v in args]) or ''
+        # le contrôle de PyTorch (choix de la carte) passe ; seul pip est compté
+        w.run_logged = lambda args, *x, **k: saved(args, *x, **k) if '-c' in args and '-m' not in args else calls.append([str(v) for v in args]) or ''
         try:
             a = self.atelier()
             a.tick()
@@ -1611,6 +1656,118 @@ class AtelierLifeTest(AtelierBase):
         self.assertIn('torch==2.13.0+rocm10.0.0', (self.lay['root'] / 'constraints.txt').read_text())
         self.assertTrue(a.manager is True)
         self.assertIn('--enable-manager', self.runs()[-1]['args'])
+
+
+class AtelierCardTest(AtelierBase):
+    """Panne du 16/11 : l'atelier lancé avant tout travail Klein ne choisissait pas de carte ; ComfyUI gardait la n° 0, le
+    graphique intégré du Ryzen (gfx1036), et tout agrandissement échouait en hipErrorInvalidImage."""
+
+    def test_card_chosen_by_the_workshop_itself(self):
+        self.assertIsNone(self.gpu.hip_device, 'no Klein job ran in this worker')
+        a = self.atelier()
+        a.tick()
+        self.assertEqual(a.state, 'en marche', a.error)
+        self.assertEqual(self.runs()[-1]['hip'], '1')
+        self.assertEqual(self.gpu.hip_card['arch'], 'gfx1030')
+        self.assertEqual(w.read_json(self.lay['state'], {})['hip_device'], '1')
+        a.vram_at = 0
+        a.tick()
+        self.assertEqual(a.describe()['device'], 'cuda:0 AMD Radeon RX 6950 XT : native')
+        self.assertEqual(len(self.runs()), 1, 'right card: not relaunched')
+
+    def test_adopted_on_the_integrated_graphics_is_relaunched_once_idle(self):
+        old_gpu = w.Gpu(self.base, self.config, Path(w.__file__).resolve().parent)
+        old_gpu.hip_device = ''   # comme l'ancienne version : rien posé
+        old = w.Atelier(self.base, self.config, Path(w.__file__).resolve().parent, old_gpu)
+        old.tick()
+        self.assertIsNone(self.runs()[-1]['hip'])
+        pid = old.pid
+        b = self.atelier()   # le worker mis à jour reprend l'atelier en marche
+        (self.lay['data'] / 'busy').write_text('1')
+        b.tick()
+        self.assertEqual(b.pid, pid)
+        b.vram_at = 0
+        b.tick()
+        self.assertEqual(b.pid, pid, 'never relaunched while Alice computes')
+        self.assertIsNone(self.gpu.hip_device, 'not even the card probe while it computes')
+        (self.lay['data'] / 'busy').unlink()
+        b.tick()
+        b.vram_at = 0
+        b.tick()
+        self.assertEqual(self.gpu.hip_device, '1', 'card chosen once idle')
+        self.assertIsNone(b.pid, 'stopped: it computed on the integrated graphics')
+        self.assertIn('AMD Radeon(TM) Graphics', b.describe()['error'])
+        self.assertFalse(alive(pid))
+        b.tick()
+        self.assertEqual((b.state, self.runs()[-1]['hip']), ('en marche', '1'))
+
+    def test_upscale_test_in_the_workshop(self):
+        a = self.atelier()
+        img = Path(w.__file__).resolve().parent / w.GPU_TEST_OBJECT
+        r = a.upscale_test({'model': '4x-PBRify-UpscalerV4.safetensors'}, img, None, lambda f, s: None)
+        self.assertFalse(r['ok'])
+        self.assertIn('pas en marche', r['error'])
+        a.tick()
+        r = a.upscale_test({'model': '4x-PBRify-UpscalerV4.safetensors'}, img, None, lambda f, s: None)
+        self.assertTrue(r['ok'], json.dumps(r, ensure_ascii=False)[:800])
+        w_in, h_in = w.png_size(img)
+        self.assertEqual((r['result']['width'], r['result']['height']), (4 * w_in, 4 * h_in))
+        self.assertEqual(r['device'], 'cuda:0 AMD Radeon RX 6950 XT : native')
+        self.assertEqual(r['hip_visible_devices'], '1')
+        self.assertEqual(Path(r['output']), self.base / 'logs' / 'gpu-test-upscale.png')
+        wf = json.loads((self.lay['data'] / 'last-workflow.json').read_text())
+        self.assertEqual(sorted(n['class_type'] for n in wf.values()), ['ImageUpscaleWithModel', 'LoadImage', 'SaveImage', 'UpscaleModelLoader'])
+        (self.lay['data'] / 'flat').write_text('1')
+        r = a.upscale_test({'model': '4x-PBRify-UpscalerV4.safetensors'}, img, None, lambda f, s: None)
+        self.assertFalse(r['ok'])
+        self.assertIn('unie', r['error'])
+        r = a.upscale_test({'model': '4x.pth', 'scale': 2}, img, None, lambda f, s: None)
+        self.assertIn('au lieu de', r['error'])
+        for bad in ({}, {'model': '../x.pth'}, {'model': 'x.exe'}):
+            self.assertIn('model', a.upscale_test(bad, img, None, lambda f, s: None)['error'])
+
+    def test_upscale_on_the_integrated_graphics_says_why(self):
+        self.gpu.hip_device = ''   # carte laissée au choix de ComfyUI : la n° 0
+        a = self.atelier()
+        a.check_card = lambda busy: None   # sans la vérification, on voit la panne du 16/11
+        a.tick()
+        r = a.upscale_test({'model': '4x-PBRify-UpscalerV4.safetensors'}, Path(w.__file__).resolve().parent / w.GPU_TEST_OBJECT,
+                           None, lambda f, s: None)
+        self.assertFalse(r['ok'])
+        self.assertIn('device kernel image is invalid', r['error'])
+        self.assertEqual(r['device'], 'cuda:0 AMD Radeon(TM) Graphics : native')
+
+
+class PickDeviceTest(unittest.TestCase):
+    def test_only_cards_the_wheels_have_kernels_for(self):
+        base = Path(tempfile.mkdtemp())
+        gpu = w.Gpu(base, {}, Path(w.__file__).resolve().parent)
+        (gpu.root / 'logs').mkdir(parents=True)
+        spec = json.loads(json.dumps(gpu.catalog['benchmarks']['comfyui']))
+        lay = {'exe': sys.executable}
+        # graphique intégré avec 32 Go de mémoire partagée : plus grand, mais sans noyau gfx1036 dans les roues
+        spec['torch']['check'] = ("print('TORCH 2.13.0+rocm10.0.0 7.15 True 2'); print('DEV 0 gfx1036 34000000000 AMD Radeon(TM) Graphics'); "
+                                  "print('DEV 1 gfx1030 17163091968 AMD Radeon RX 6950 XT')")
+        env, report = {}, {}
+        card = w.comfy_pick_device(lay, env, spec, gpu, None, report)
+        self.assertEqual((card['index'], env['HIP_VISIBLE_DEVICES'], gpu.hip_card['name']), (1, '1', 'AMD Radeon RX 6950 XT'))
+        spec['torch']['check'] = "print('TORCH 2.13.0+rocm10.0.0 7.15 True 1'); print('DEV 0 gfx1036 34000000000 AMD Radeon(TM) Graphics')"
+        with self.assertRaisesRegex(RuntimeError, 'aucune carte que cette build de PyTorch sait calculer.*gfx1030'):
+            w.comfy_pick_device(lay, {}, spec, gpu, None, {})
+
+
+class TextureSizeTest(unittest.TestCase):
+    def test_atlas_option_only_when_asked_and_measured(self):
+        cat = json.loads((Path(w.__file__).resolve().parent / w.GPU_CATALOG).read_text())
+        model = cat['types']['3d']['models']['trellis2']
+        base = {'input': 'i.png', 'output': 'o.glb', 'models_dir': 'm', 'res': '512', 'steps': 12, 'seed': 1, 'texture': True}
+        self.assertNotIn('--atlas', w.build_command(model['command'], base), 'default unchanged: trellis.cpp chooses')
+        args = w.build_command(model['command'], dict(base, texture_size='2048'))
+        self.assertEqual(args[args.index('--atlas') + 1], '2048')
+        t = w.EngineTrace(None)
+        t.line('      textured GLB (atlas 2048, +C:\\w\\out_base.png)')
+        self.assertEqual(t.meta['texture_size'], 2048)
+        self.assertTrue(any('textured GLB' in l for l in t.lines))
 
 
 class AtelierTaskTest(AtelierBase):
@@ -1634,6 +1791,8 @@ class AtelierTaskTest(AtelierBase):
             return 'f' * 64
 
         def fake_run(args, *a, **k):
+            if '-c' in args and '-m' not in args:   # contrôle de PyTorch (choix de la carte de l'atelier) : le vrai, sur le faux Python
+                return self.saved_tasks[1](args, *a, **k)
             args = [str(x) for x in args]
             if 'freeze' in args:
                 return '\n'.join(self.freeze[-1]) + '\n'

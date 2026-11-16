@@ -119,6 +119,17 @@ describe('RE-USE worker remote control', () => {
     assert.strictEqual((await ask('gpu-box', { kind: '3d', params: { command: 'x' } })).status, 400, 'unknown parameter refused');
     assert.strictEqual((await ask('gpu-box', { kind: 'comfyui', params: { width: 1000 } })).status, 400, 'multiple of 64');
     assert.strictEqual((await ask('gpu-box', { kind: 'comfyui', params: { steps: 8.5 } })).status, 400);
+    assert.strictEqual((await ask('gpu-box', { kind: '3d', params: { texture_size: '4096' } })).status, 400);
+    for (const params of [undefined, { model: '../x.safetensors' }, { model: 'x.exe' }, { model: 'a/b.pth' }, { model: 'x.pth', scale: 0 }, { model: 'x.pth', path: 'C:/' }]) {
+      assert.strictEqual((await ask('gpu-box', { kind: 'upscale', params })).status, 400, `upscale ${JSON.stringify(params)}`);
+    }
+    const up = await ask('gpu-box', { kind: 'upscale', params: { model: '4x-PBRify-UpscalerV4.safetensors' } });
+    assert.strictEqual(up.status, 201, JSON.stringify(up.data));
+    assert.deepStrictEqual(up.data.test.params, { model: '4x-PBRify-UpscalerV4.safetensors' });
+    assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${up.data.test.id}/cancel`, { method: 'POST', token: ADMIN })).status, 200);
+    const tex = await ask('gpu-box', { kind: '3d', params: { res: '1024', texture_size: '2048' } });
+    assert.strictEqual(tex.status, 201);
+    assert.strictEqual((await call(`/api/reuse/workers/gpu-box/tests/${tex.data.test.id}/cancel`, { method: 'POST', token: ADMIN })).status, 200);
 
     // dev-box never said it runs remote tests (old version): accepted, with the reason it will wait
     await next(NV, { version: 'v1' });

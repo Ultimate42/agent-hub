@@ -366,6 +366,13 @@ export function normalizeRequest(body, catalog = gpuCatalog(), { admin = false }
     params[name] = c.value;
     if (c.note) adjusted.push(c.note);
   }
+  // A parameter that only means something with another one set (texture_size without texture): refused, not silently dropped
+  for (const [name, ps] of Object.entries(specs)) {
+    if (params[name] === undefined || !ps.requires) continue;
+    for (const [k, v] of Object.entries(ps.requires)) {
+      if (params[k] !== v) return err(400, `${name} needs ${k}: ${JSON.stringify(v)} (here ${k} is ${JSON.stringify(params[k] ?? null)})`);
+    }
+  }
   const ignored = Object.keys(given).filter(k => !TOP.has(k) && !(k in specs) && k !== 'width' && k !== 'height');
   for (const k of ['width', 'height']) if (given[k] !== undefined && !(k in specs)) ignored.push(k);
   for (const k of adminOnly) ignored.push(`${k} (admin only)`);

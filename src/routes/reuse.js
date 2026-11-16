@@ -200,7 +200,8 @@ router.post('/api/reuse/workers/:name/atelier/tasks/:id/cancel', guard('admin'),
  * Run between two jobs, inside the schedule, one at a time. 201 {test[, warning]}. Kinds: "image", "3d", "comfyui",
  * "comfyui_remove", "comfyui_reinstall" (ComfyUI's Python and torch redone, weights kept), "verify_models" ({model?,
  * repair?: true, env?: true}: weights re-hashed against the catalog, wrong ones re-downloaded, ComfyUI's Python checked
- * against pip's RECORD; result.files, result.env, result.summary).
+ * against pip's RECORD; result.files, result.env, result.summary), "upscale" ({model, scale?: 4}: the bundled test image enlarged
+ * inside the running workshop by one of its upscale_models files; ok when exactly scale times larger and not flat).
  * GET /api/reuse/workers/:name/tests[?limit=20] - Tests of this worker, most recent first.
  * GET /api/reuse/workers/:name/tests/:id - {test: {status, stage, progress, ok, error, result: {compute_s, log, ...}}}.
  * POST /api/reuse/workers/:name/tests/:id/cancel - A running test is stopped by the worker within 30 s.
