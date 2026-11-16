@@ -116,7 +116,7 @@ describe('FLUX 3 Klein: references and model announcement', () => {
     }
     assert.strictEqual(got.id, id);
     assert.strictEqual(got.model, 'flux3-klein');
-    assert.deepStrictEqual(got.params, { width: 1024, height: 1024, steps: 12, seed: 9, unet_dtype: 'default', attention: 'quad', dynamic_vram: false, ref_megapixels: 1, vram_mode: 'high', text_encoder: 'gpu', comfyui_options: 'alloc_expandable,no_comfy_compiler' });
+    assert.deepStrictEqual(got.params, { width: 1024, height: 1024, steps: 12, seed: 9, unet_dtype: 'default', attention: 'quad', dynamic_vram: true, ref_megapixels: 1, vram_mode: 'normal', text_encoder: 'gpu', comfyui_options: 'alloc_expandable,no_comfy_compiler' });
     assert.deepStrictEqual(got.references.map(x => [x.n, x.format, x.size, x.sha256]), refs.map((b, n) => [n, n % 2 ? 'jpg' : 'png', b.length, sha(b)]));
     for (const [n, b] of refs.entries()) {
       const dl = await call(`/api/gpu/jobs/${id}/references/${n}`, { token: AMD });
@@ -168,7 +168,7 @@ describe('FLUX 3 Klein: references and model announcement', () => {
     assert.deepStrictEqual([r.data.job.params.unet_dtype, r.data.job.params.attention, r.data.job.params.dynamic_vram, r.data.job.params.ref_megapixels],
       ['default', 'split', true, 0.5]);
     const d = await submit(klein());
-    assert.deepStrictEqual([d.data.job.params.unet_dtype, d.data.job.params.dynamic_vram], ['default', false], 'defaults');
+    assert.deepStrictEqual([d.data.job.params.unet_dtype, d.data.job.params.dynamic_vram], ['default', true], 'defaults');
     for (const id of [r.data.job.id, d.data.job.id]) await call(`/api/gpu/jobs/${id}/cancel`, { method: 'POST', token: ADMIN });
   });
 

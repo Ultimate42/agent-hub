@@ -437,3 +437,35 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     }
   });
 });
+
+// Proportion kept when a side leaves the catalog range (direct, no server)
+describe('normalizeRequest: width x height keep their proportion', async () => {
+  const { normalizeRequest } = await import('../src/services/gpu-jobs.js');
+  const catalog = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'reuse-worker', 'gpu-catalog.json'), 'utf8'));
+  const run = (model, extra) => normalizeRequest({ model, prompt: 'x', ...extra }, catalog);
+  const wh = (r) => [r.params.width, r.params.height];
+
+  test('Klein 2048x1024 -> 1536x768 with a clear note', () => {
+    const r = run('flux3-klein', { width: 2048, height: 1024 });
+    assert.deepStrictEqual(wh(r), [1536, 768]);
+    assert.deepStrictEqual(r.adjusted, ['width 2048 x height 1024 -> 1536 x 768 (proportion gardée, max 1536)']);
+  });
+  test('Klein 2048x496 -> 1536x368 (372 rounded down to 16)', () => {
+    assert.deepStrictEqual(wh(run('flux3-klein', { size: '2048x496' })), [1536, 368]);
+  });
+  test('Z-image 2048x1024 -> 1536x768 (multiple 64)', () => {
+    assert.deepStrictEqual(wh(run('z-image-turbo', { width: 2048, height: 1024 })), [1536, 768]);
+  });
+  test('height too large: 1024x3072 -> 512x1536', () => {
+    assert.deepStrictEqual(wh(run('flux3-klein', { width: 1024, height: 3072 })), [512, 1536]);
+  });
+  test('below min: 128x64 -> 512x256 (both scaled)', () => {
+    assert.deepStrictEqual(wh(run('flux3-klein', { width: 128, height: 64 })), [512, 256]);
+  });
+  test('no overshoot: unchanged apart from the multiple', () => {
+    const r = run('flux3-klein', { width: 1000, height: 700 });
+    assert.deepStrictEqual(wh(r), [1008, 704]);
+    assert.deepStrictEqual(r.adjusted, ['width 1000 -> 1008', 'height 700 -> 704']);
+    assert.deepStrictEqual(run('flux3-klein', {}).adjusted, []);
+  });
+});

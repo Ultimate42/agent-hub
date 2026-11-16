@@ -313,6 +313,36 @@ export function normalizeRequest(body, catalog = gpuCatalog(), { admin = false }
   const specs = m.params || {};
   const params = {};
   const adminOnly = [];
+  // width AND height: when one is out of range, scale both by the same factor so the proportion survives (a per-side clamp
+  // would crop the picture), then round down to the model's multiple; checkParam below only bounds what is left
+  const ws = specs.width, hs = specs.height;
+  if (ws && hs && ['int', 'number'].includes(ws.type) && ['int', 'number'].includes(hs.type)) {
+    const num = (v) => (typeof v === 'string' && v.trim() !== '' ? Number(v) : v);
+    const w0 = num(given.width !== undefined && given.width !== null && given.width !== '' ? given.width : ws.default);
+    const h0 = num(given.height !== undefined && given.height !== null && given.height !== '' ? given.height : hs.default);
+    if ([w0, h0].every(v => typeof v === 'number' && Number.isFinite(v) && v > 0)) {
+      const over = (ws.max !== undefined && w0 > ws.max) || (hs.max !== undefined && h0 > hs.max);
+      const under = (ws.min !== undefined && w0 < ws.min) || (hs.min !== undefined && h0 < hs.min);
+      let f = 1;
+      if (over) f = Math.min(ws.max !== undefined ? ws.max / w0 : Infinity, hs.max !== undefined ? h0 && hs.max / h0 : Infinity);
+      else if (under) f = Math.max(ws.min !== undefined ? ws.min / w0 : 0, hs.min !== undefined ? hs.min / h0 : 0);
+      if (f !== 1) {
+        const fit = (v, sp) => {
+          let r = Math.floor(v * f + 1e-9);
+          if (sp.multiple) r = Math.floor(r / sp.multiple) * sp.multiple;
+          if (sp.min !== undefined && r < sp.min) r = sp.min;
+          if (sp.max !== undefined && r > sp.max) r = sp.max;
+          return r;
+        };
+        const w1 = fit(w0, ws), h1 = fit(h0, hs);
+        const both = (a, b) => (a === b ? `${a}` : `${a}x${b}`);
+        const limit = over ? `max ${both(ws.max, hs.max)}` : `min ${both(ws.min, hs.min)}`;
+        given.width = w1;
+        given.height = h1;
+        adjusted.push(`width ${w0} x height ${h0} -> ${w1} x ${h1} (proportion gardée, ${limit})`);
+      }
+    }
+  }
   for (const [name, ps] of Object.entries(specs)) {
     if (ps.needs_input && !input) continue;
     let raw = given[name];
