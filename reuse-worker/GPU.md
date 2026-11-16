@@ -255,6 +255,10 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   1024 : c'est déjà le défaut de trellis.cpp dans ce cas.
 - Ce qui a été cuit est relevé dans `engine.texture_size` du travail (ligne « textured GLB (atlas N) » du moteur).
 - Essai à distance : `{"kind":"3d","params":{"texture_size":"2048"}}`.
+- **Mesure du 16/11 (job 273, `res` 1024, donc atlas 2048 par défaut) :** sur gpu-box, le flux de forme en cascade
+  (« [4/7] shape SLAT flow (LR 512 -> upsample -> HR 1024 cascade) ») n'a pas fini en 60 minutes, le plafond du modèle. Le
+  travail a été arrêté, puis annulé à la relance. Ce n'est pas la mémoire (pas d'erreur), c'est la durée. Sur cette carte, la
+  texture 2048 passe donc par `res` 512 avec `texture_size: "2048"`, qui ne change que la cuisson.
 
 ## La 3D est expérimentale : derrière un drapeau, non prouvée
 
