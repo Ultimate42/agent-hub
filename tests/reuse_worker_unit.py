@@ -1683,6 +1683,9 @@ class AtelierCardTest(AtelierBase):
         self.assertIsNone(self.runs()[-1]['hip'])
         pid = old.pid
         b = self.atelier()   # le worker mis à jour reprend l'atelier en marche
+        seen, saved_pick = [], w.comfy_pick_device
+        w.comfy_pick_device = lambda *x: seen.append((b.state, b.busy())) or saved_pick(*x)
+        self.addCleanup(setattr, w, 'comfy_pick_device', saved_pick)
         (self.lay['data'] / 'busy').write_text('1')
         b.tick()
         self.assertEqual(b.pid, pid)
@@ -1695,6 +1698,7 @@ class AtelierCardTest(AtelierBase):
         b.vram_at = 0
         b.tick()
         self.assertEqual(self.gpu.hip_device, '1', 'card chosen once idle')
+        self.assertEqual(seen, [('en marche', False)], 'still running for busy() while the card is probed')
         self.assertIsNone(b.pid, 'stopped: it computed on the integrated graphics')
         self.assertIn('AMD Radeon(TM) Graphics', b.describe()['error'])
         self.assertFalse(alive(pid))

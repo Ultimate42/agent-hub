@@ -4235,7 +4235,8 @@ class Atelier:
         tout calcul échouait en hipErrorInvalidImage (agrandisseurs 4x-PBRify-UpscalerV4 et VOSR2). -> HIP_VISIBLE_DEVICES ('' : une
         seule carte, rien à cacher)."""
         if self.gpu.hip_device is None:
-            self.state = 'préparation : choix de la carte'
+            if not self.pid:   # atelier repris en marche : il reste « en marche » (busy() en dépend, un travail ne passerait pas devant lui)
+                self.state = 'préparation : choix de la carte'
             env = comfy_env(lay, spec['atelier'])
             (self.gpu.root / 'logs').mkdir(parents=True, exist_ok=True)
             card = comfy_pick_device(lay, env, spec, self.gpu, self.stopping, {})
@@ -4825,7 +4826,6 @@ class Atelier:
                         self.ensure_card(spec, atelier_layout(self.base, spec))
                     except (RuntimeError, OSError, JobLost) as e:
                         log.warning('Atelier : carte pas vérifiée (%s).', e)
-                    self.state = 'en marche'
                 self.check_card(busy)
                 if not self.pid:
                     return
