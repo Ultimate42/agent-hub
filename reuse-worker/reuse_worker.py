@@ -3883,13 +3883,16 @@ def manager_wanted(spec_atelier, config):
 def write_manager_config(path, want):
     """Pose want dans la section [default] de config.ini de ComfyUI-Manager (les autres clés restent), avec une copie de
     l'original (config.ini.bak-worker, une seule fois) : réversible en la remettant, ou en retirant la clé du catalogue.
-    -> {clé: (avant, après)} de ce qui a changé."""
+    -> {clé: (avant, après)} de ce qui a changé. Fichier illisible : ValueError (jamais réécrit à l'aveugle)."""
     import configparser
     cp = configparser.ConfigParser(strict=False, interpolation=None)
     cp.optionxform = str   # Manager lit ses clés en minuscules ; celles qu'on ne connaît pas gardent leur casse
     existed = path.exists()
     if existed:
-        cp.read(str(path), encoding='utf-8')
+        try:
+            cp.read(str(path), encoding='utf-8-sig')   # un BOM (Bloc-notes) n'empêche pas la lecture ; réécrit sans BOM, que Manager lit
+        except configparser.Error as e:   # pas une ValueError : sans cela, un config.ini abîmé empêcherait ComfyUI de démarrer
+            raise ValueError('config.ini illisible : %s' % str(e).replace('\n', ' ')) from e
     if not cp.has_section('default'):
         cp.add_section('default')
     changed = {}

@@ -2033,6 +2033,26 @@ class AtelierManagerConfigTest(unittest.TestCase):
         cp.read(str(path), encoding='utf-8')
         self.assertEqual((cp['default']['security_level'], cp['default']['network_mode']), ('normal', 'offline'))
 
+    def test_bom_is_read_and_a_broken_config_ini_never_blocks_the_start(self):
+        """config.ini enregistré par le Bloc-notes (BOM) : lu, réécrit sans BOM. Abîmé (pas de [section]) : ValueError, que
+        set_manager_config rattrape (ComfyUI démarre quand même), et le fichier n'est pas touché."""
+        d = Path(tempfile.mkdtemp())
+        path = d / 'config.ini'
+        path.write_bytes(b'\xef\xbb\xbf[default]\nsecurity_level = normal\nuse_uv = True\n')
+        self.assertEqual(w.write_manager_config(path, {'security_level': 'strong'}), {'security_level': ('normal', 'strong')})
+        self.assertFalse(path.read_bytes().startswith(b'\xef\xbb\xbf'))
+        self.assertIn('use_uv = True', path.read_text(encoding='utf-8'))
+        path.write_text('security_level = normal\n', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            w.write_manager_config(path, {'security_level': 'strong'})
+        self.assertEqual(path.read_text(encoding='utf-8'), 'security_level = normal\n', 'broken file left as it was')
+        a = w.Atelier.__new__(w.Atelier)
+        a.config = {}
+        (d / 'user' / '__manager').mkdir(parents=True)
+        (d / 'user' / '__manager' / 'config.ini').write_text('garbage\n', encoding='utf-8')
+        a.set_manager_config({'data': d}, {'manager_config': {'security_level': 'strong'}})
+        self.assertTrue(a.manager_cfg.startswith('non posé'), a.manager_cfg)
+
     def test_startup_times_lists_the_slowest_nodes(self):
         log = Path(tempfile.mkdtemp()) / 'atelier.log'
         log.write_text('Prestartup times for custom nodes:\n[INFO]    4.2 seconds: C:\\ReuseWorker\\atelier\\src\\custom_nodes\\comfyui-manager\n'
