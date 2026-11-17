@@ -13,7 +13,7 @@ Ce qu'il fait :
   AVANT de relayer cet appel, pour que les messages d'un /prompt ne se perdent pas ;
 - un appel HTTP/1.1 qui attend le réveil (ComfyUI à froid : jusqu'à plusieurs minutes) ne reste pas sans un octet : toutes les
   HEARTBEAT_S secondes le relais envoie « 100 Continue » (réponse intermédiaire, que le client doit sauter, RFC 9110 §15.2), ce qui
-  relance le délai « aucune donnée reçue » des clients. Un client parti est vu à cet envoi : son attente est retirée (le worker ne
+  relance le délai « aucune donnée reçue » des clients (pas fetch de Node : il le refuse). Un client parti est vu à cet envoi : son attente est retirée (le worker ne
   croit plus qu'un appel attend) ;
 - il note la dernière activité HTTP (octets dans un sens ou l'autre) : le worker ne met ComfyUI en veille qu'après
   atelier_idle_stop_minutes sans activité ni calcul, file /queue lue vide.
@@ -44,7 +44,8 @@ DORMANT_BUFFER = 64 * 1024  # octets envoyés par un WebSocket gardé, relayés 
 ATTACH_WAIT_S = 10          # au réveil, branchement des WebSockets gardés avant de relayer le premier appel
 FLUSH_S = 5                 # dernière activité écrite au plus toutes les 5 s
 HEARTBEAT_S = 10            # un appel HTTP qui attend le réveil reçoit un signe de vie toutes les 10 s (0 : aucun)
-INTERIM = b'HTTP/1.1 100 Continue\r\n\r\n'   # le seul « 1xx » que tous les clients HTTP/1.1 courants sautent (http.client, undici, aiohttp, Go, curl)
+INTERIM = b'HTTP/1.1 100 Continue\r\n\r\n'   # sauté par http.client (urllib, requests), aiohttp, curl, Node http, navigateurs ; 102/103 font échouer http.client
+NO_INTERIM_AGENTS = ('node', 'undici')   # fetch de Node (undici) : un 100 non demandé = « bad response », appel perdu (vérifié Node 20, 17/11)
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 LOOPBACK = ipaddress.ip_network('127.0.0.0/8')
 try:   # empreinte de ce fichier : le worker relance un relais repris d'une version précédente (quand l'atelier ne calcule pas)
@@ -116,6 +117,12 @@ def client_gone(sock):
         return bool(ready) and sock.recv(1, socket.MSG_PEEK) == b''
     except OSError:
         return True
+
+
+def interim_allowed(version, headers):
+    """Le client sait-il sauter un « 100 Continue » qu'il n'a pas demandé ? HTTP/1.1 seulement, et pas fetch de Node."""
+    agent = headers.get('user-agent', '').strip().lower().split('/')[0].split(' ')[0]
+    return version == 'HTTP/1.1' and agent not in NO_INTERIM_AGENTS
 
 
 def send_interim(sock, http11=True):
@@ -399,7 +406,7 @@ class Relay:
                 # ComfyUI vient d'être mis en veille (la sonde ne l'a pas encore vu) : l'onglet qui rouvre /ws 300 ms après
                 # la coupure est gardé, comme pendant la veille ; sinon il le réveillerait à chaque mise en veille
                 return self.keep_dormant(sock, data, headers)
-            ok = self.wait_ready(cause, beat=None if ws else (lambda: send_interim(sock, version == 'HTTP/1.1' and self.heartbeat_s > 0)))
+            ok = self.wait_ready(cause, beat=None if ws else (lambda: send_interim(sock, self.heartbeat_s > 0 and interim_allowed(version, headers))))
             if ok is None:   # le client a raccroché pendant l'attente
                 sock.close()
                 return

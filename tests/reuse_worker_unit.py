@@ -1886,6 +1886,16 @@ class AtelierRelayTest(unittest.TestCase):
             with self.assertRaises(socket.timeout):
                 s10.recv(100)
             s10.close()
+            # fetch de Node (undici) refuse un 100 non demandé (« bad response ») : pas de signe de vie pour lui
+            sn = socket.create_connection(('127.0.0.1', hb_port), timeout=10)
+            sn.sendall(b'GET /queue HTTP/1.1\r\nHost: x\r\nuser-agent: node\r\n\r\n')
+            sn.settimeout(1.2)
+            with self.assertRaises(socket.timeout):
+                sn.recv(100)
+            sn.close()
+            self.assertTrue(relay_mod.interim_allowed('HTTP/1.1', {'user-agent': 'Python-urllib/3.12'}))
+            self.assertFalse(relay_mod.interim_allowed('HTTP/1.1', {'user-agent': 'undici'}))
+            self.assertFalse(relay_mod.interim_allowed('HTTP/1.0', {}))
             s.close()   # le client raccroche : à la prochaine pulsation le relais retire son attente
             def waiting():
                 try:
