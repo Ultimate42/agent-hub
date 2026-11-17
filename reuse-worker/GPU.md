@@ -454,7 +454,7 @@ Il est séparé du ComfyUI des travaux du hub, qui reste sans nœuds additionnel
   `--enable-manager`.
 - Modèles des travaux partagés en lecture (`extra_model_paths.yaml`, réécrit à chaque démarrage). Les modèles de
   l'atelier vont dans `atelier\data\models`.
-- Port fixe 8188.
+- Port fixe 8188 (tenu par le relais en veille, voir « Veille » ; ComfyUI derrière, sur 8189).
 - Écoute sur `127.0.0.1`, plus l'adresse Tailscale du PC (`tailscale ip -4`), jamais `0.0.0.0`.
   - L'adresse Tailscale n'est ajoutée que si les règles de pare-feu ci-dessous sont en place : sans elles, Windows
     ouvrirait sa fenêtre « autoriser l'accès ».
@@ -500,9 +500,41 @@ Il est séparé du ComfyUI des travaux du hub, qui reste sans nœuds additionnel
 - Avant chaque travail GPU du hub, il envoie `POST /free` à l'atelier et attend que sa mémoire retombe.
 - Un travail GPU en cours quand l'atelier se met à calculer est arrêté et rendu à la file sans compter l'essai
   (`release`). Il reprend quand l'atelier a fini.
-- Après 10 minutes sans calcul, l'atelier rend sa mémoire vidéo (`/free`) sans s'arrêter.
+- Après 10 minutes sans calcul, l'atelier rend sa mémoire vidéo (`/free`) sans s'arrêter ; sans travail ni appel pendant
+  `atelier_idle_stop_minutes`, il s'arrête (veille, ci-dessous).
 - Le créneau des agents est inchangé. L'atelier reste allumé hors créneau, sauf si `atelier_window_only` est vrai.
 - Conséquence : des agents qui envoient des graphes sans arrêt bloquent les travaux du hub tout ce temps (voulu).
+
+**Veille : presque rien au repos, réveil à la demande**
+- Constat de Alice : ComfyUI au repos gardait 3,2 Go de mémoire vive en permanence, modèles déjà déchargés (`/free`).
+- Un relais (`atelier_relay.py`, bibliothèque standard seule, environ 20 Mo) écoute à la place de ComfyUI :
+  - même port (8188), mêmes adresses (127.0.0.1 et l'adresse Tailscale), même Python (celui de l'atelier, que visent les
+    règles du pare-feu) : rien à changer sur le poste client ni dans le pare-feu ;
+  - il ne laisse passer que la boucle locale et l'adresse autorisée par le pare-feu (`allowed_from`), en plus du pare-feu ;
+  - ComfyUI tourne derrière, sur 127.0.0.1 seulement, port interne `atelier_backend_port` (8189).
+- Réveil : une requête HTTP arrive et ComfyUI dort, le relais l'écrit dans `atelier\relay.json` (état « démarrage »), le
+  worker le voit en 3 s au plus et démarre ComfyUI ; la requête attend (5 min au plus, puis 503 avec la raison) et passe.
+  Un essai `upscale` du hub réveille l'atelier de la même façon. Les travaux GPU du hub n'en ont pas besoin (leur ComfyUI
+  est à part).
+- WebSocket `/ws` : relayé tel quel quand ComfyUI tourne. Ouvert pendant la veille, il ne réveille rien (un onglet oublié se
+  reconnecte sans fin) : le relais fait la poignée de main lui-même et garde la connexion, puis la branche sur ComfyUI au
+  réveil, avant de relayer la requête qui a réveillé (le `/prompt` d'un agent ne perd aucun message).
+- Veille : après `atelier_idle_stop_minutes` (10) sans calcul ni octet HTTP relayé, la file `/queue` est relue ; vide et
+  vraiment lue, ComfyUI est arrêté. Jamais pendant un calcul, un appel en attente ou un essai du worker, jamais sans relais
+  en marche.
+- Repli : relais impossible (fichier absent, port pris), ComfyUI reste en marche sur 8188 comme avant, `mode` le dit
+  (`direct (repli : relais en échec)`) avec `relay_error` ; un changement du réglage retente le relais.
+- Réversible : `atelier_idle_stop_minutes: 0` arrête le relais et remet ComfyUI en marche permanente sur 8188 (ancien
+  fonctionnement), dès qu'il ne calcule plus.
+- État (`GET $H/atelier`, et `info.atelier` de `/api/reuse/workers`) : `state` (en veille, démarrage, en marche), `mode`,
+  `relay` (en veille, en démarrage, actif), `relay_pid`, `backend_port`, `ram_mib` et `ram_private_mib` (ComfyUI, mesurés
+  toutes les 30 s), `relay_ram_mib`, `ws_open`, `wakes`, `sleeps`, `last_wake` (cause, durée du démarrage), `last_sleep`
+  (mémoire rendue), `asleep_since`.
+- Journal du worker (`GET $H/settings`, `history`) : `atelier_wake` (cause, `ready_s`), `atelier_wake_failed`,
+  `atelier_sleep` (`idle_s`, `mem_mib` rendus), `atelier_relay` (démarré, arrêté, échec). Fichiers sur le PC :
+  `atelier\logs\relay.log`, `atelier\relay.json`.
+- Un relais ou un ComfyUI en marche survivent à une mise à jour du worker (repris tels quels). Un relais d'un autre code est
+  relancé dès que ComfyUI ne calcule pas.
 
 **Allumer, éteindre, voir l'état** (jeton admin RE-USE)
 ```bash
@@ -525,12 +557,14 @@ Réglages (`POST $H/settings`, `null` remet la valeur du PC) :
 - `atelier_enabled` ;
 - `atelier_window_only` (faux) ;
 - `atelier_idle_free_s` (600, 0 = jamais) ;
+- `atelier_idle_stop_minutes` (10, 0 à 1440, décimales permises ; 0 = jamais de veille, sans relais) ;
 - `atelier_keep_days` (7) et `atelier_files_max_gb` (20) : ménage des sorties (`output`) et des images envoyées
   (`input`), au-delà de 7 jours puis les plus anciennes tant que le total dépasse 20 Go. Toutes les 10 minutes et à
   chaque démarrage.
 
 Seulement dans `reuse-worker.config.json` du PC :
 - `atelier_port` ;
+- `atelier_backend_port` (8189 : ComfyUI derrière le relais, 127.0.0.1 seulement) ;
 - `atelier_listen_ip` (adresse imposée, jamais 0.0.0.0) ;
 - `atelier_require_firewall: false` (à éviter) ;
 - `atelier_manager: false` ;

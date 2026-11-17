@@ -101,7 +101,7 @@ describe('worker: ComfyUI workshop beside the hub jobs', { skip: !canRun }, () =
     pc = path.join(tmp, 'pc');
     const store = path.join(tmp, 'store');
     for (const d of [publish, pc, store]) fs.mkdirSync(d);
-    for (const f of ['reuse_worker.py', 'install-and-run.sh']) fs.copyFileSync(path.join(SRC, f), path.join(publish, f));
+    for (const f of ['reuse_worker.py', 'atelier_relay.py', 'install-and-run.sh']) fs.copyFileSync(path.join(SRC, f), path.join(publish, f));
     fs.copyFileSync(path.join(SRC, 'install-and-run.sh'), path.join(pc, 'install-and-run.sh'));
 
     // Catalog = the real one, with a Linux fake image engine and small model files
@@ -157,7 +157,9 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     fs.writeFileSync(path.join(tmp, 'model.gguf'), 'fake');
     fs.writeFileSync(path.join(pc, 'reuse-worker.config.json'), JSON.stringify({
       hub_url: BASE_URL, allow_http: true, token: TOKEN, backend: 'cpu', audiocpp_cli: engine, model: path.join(tmp, 'model.gguf'),
-      gpu_max_gb: 1, gpu_keep_free_gb: 0, gpu_keep_loaded_s: 0, comfyui_any_os: true, atelier_port: ATELIER_PORT
+      // Without sleep at first (ComfyUI straight on the workshop's port, as before the relay); the sleep is turned on from the hub below
+      gpu_max_gb: 1, gpu_keep_free_gb: 0, gpu_keep_loaded_s: 0, comfyui_any_os: true, atelier_port: ATELIER_PORT, atelier_idle_stop_minutes: 0,
+      atelier_backend_port: ATELIER_PORT + 1
     }));
 
     hub = spawn('node', ['src/index.js'], {
@@ -284,6 +286,55 @@ exec ffmpeg -v error -nostdin -y -i "$IN" -af volume=0.5 -c:a pcm_s16le "$OUT"
     const history = (await admin('/api/reuse/workers/gpu-box/settings')).history.map(e => e.what);
     for (const what of ['atelier_task_requested', 'atelier_task_started', 'atelier_task_finished']) assert.ok(history.includes(what), what);
     assert.strictEqual((await admin(tasks)).tasks.length, 3);
+  });
+
+  test('sleep from the hub: a relay keeps the port, a call wakes ComfyUI behind it, idle it stops; journaled, reversible', async () => {
+    const set = (body) => admin('/api/reuse/workers/gpu-box/settings', { method: 'POST', body: JSON.stringify(body) });
+    assert.match((await set({ atelier_idle_stop_minutes: -1 })).error, /atelier_idle_stop_minutes must be a number from 0 to 1440/);
+    const direct = (await workshop()).atelier.pid;
+    // 3 s of idle for the test (10 minutes by default)
+    assert.deepStrictEqual((await set({ atelier_idle_stop_minutes: 0.05 })).changed, [{ key: 'atelier_idle_stop_minutes', from: null, to: 0.05 }]);
+    const asleep = await until('relay on the port, ComfyUI stopped', async () => {
+      const a = (await workshop()).atelier;
+      return a?.mode === 'relais' && a.state === 'en veille' && a.relay === 'en veille' && a;
+    }, 90);
+    assert.ok(!alive(direct), 'ComfyUI (direct) gave the port to the relay');
+    assert.strictEqual(asleep.port, ATELIER_PORT);
+    assert.strictEqual(asleep.listen, '127.0.0.1');
+    assert.ok(asleep.relay_pid > 0 && alive(asleep.relay_pid));
+    assert.strictEqual(asleep.pid, undefined, 'no ComfyUI process at rest');
+    // A call of the dev PC: answered once ComfyUI is up behind the relay, on 127.0.0.1 and its own port
+    const before = runs().length;
+    const r = await fetch(`http://127.0.0.1:${ATELIER_PORT}/queue`);
+    assert.strictEqual(r.status, 200);
+    assert.deepStrictEqual(await r.json(), { queue_running: [], queue_pending: [] });
+    const woken = runs().at(-1);
+    assert.strictEqual(runs().length, before + 1);
+    assert.strictEqual(woken.args[woken.args.indexOf('--listen') + 1], '127.0.0.1');
+    assert.strictEqual(woken.args[woken.args.indexOf('--port') + 1], String(ATELIER_PORT + 1));
+    // Idle: stopped (queue read empty), the relay stays; RAM given back said in the journal
+    const slept = await until('back to sleep', async () => {
+      const a = (await workshop()).atelier;
+      return a?.state === 'en veille' && a.sleeps >= 1 && a;
+    }, 60);
+    assert.ok(!alive(woken.pid), 'ComfyUI process gone');
+    assert.ok(alive(slept.relay_pid));
+    assert.match(slept.last_sleep, /Mio de mémoire vive rendus/);
+    assert.match(slept.last_wake, /appel GET \/queue \(127\.0\.0\.1\), prêt en/);
+    assert.strictEqual(slept.backend_port, ATELIER_PORT + 1);
+    const history = (await admin('/api/reuse/workers/gpu-box/settings')).history;
+    for (const what of ['atelier_relay', 'atelier_wake', 'atelier_sleep']) assert.ok(history.some(e => e.what === what), what);
+    assert.match(history.find(e => e.what === 'atelier_wake').cause, /GET \/queue/);
+    assert.ok(history.find(e => e.what === 'atelier_sleep').mem_mib > 0);
+    // Reversible: the override removed, the PC's own 0 applies again: relay stopped, ComfyUI always on, on the port
+    await set({ atelier_idle_stop_minutes: null });
+    const back = await until('direct again', async () => {
+      const a = (await workshop()).atelier;
+      return a?.mode === 'direct' && a.state === 'en marche' && a;
+    }, 90);
+    assert.ok(!alive(slept.relay_pid), 'relay stopped');
+    assert.strictEqual(back.port, ATELIER_PORT);
+    assert.strictEqual((await fetch(`http://127.0.0.1:${ATELIER_PORT}/queue`)).status, 200);
   });
 
   test('turned off from the hub: the process is stopped', async () => {

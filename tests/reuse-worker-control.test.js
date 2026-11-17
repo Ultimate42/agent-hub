@@ -372,6 +372,12 @@ describe('worker-control: expiry (clock passed in)', () => {
     assert.strictEqual(wc.workerEvent('pc-z', { what: 'repair_' }).status, 400);
     assert.strictEqual(wc.workerEvent('pc-z', { what: 'repair_X' }).status, 400);
     assert.strictEqual(wc.workerEvent('pc-z', { what: 'test_finished' }).status, 400);
+    // The workshop's sleep (woken, asleep, relay): these four only, never the hub's own atelier_task_* events
+    for (const what of ['atelier_wake', 'atelier_wake_failed', 'atelier_sleep', 'atelier_relay']) {
+      assert.strictEqual(wc.workerEvent('pc-z', { what, detail: { cause: 'appel GET /queue' } }).ok, true, what);
+    }
+    for (const what of ['atelier_task_finished', 'atelier_', 'atelier_sleepx']) assert.strictEqual(wc.workerEvent('pc-z', { what }).status, 400, what);
+    assert.strictEqual(wc.WORKER_SETTINGS.atelier_idle_stop_minutes.max, 1440);
     assert.strictEqual(wc.workerEvent('pc-z', { what: 'verify_finished', detail: 'x' }).status, 400);
     assert.strictEqual(wc.workerEvent('pc-z', { what: 'verify_finished', detail: { ok: true, summary: 'y'.repeat(9000), at: 1 } }).ok, true);
     const [e] = wc.workerEvents('pc-z');

@@ -4,7 +4,8 @@ import { logger } from '../utils/logger.js';
 // ---------------------------------------------------------------------------
 // Remote control of the RE-USE worker machines, beyond pause and update:
 //  - settings: a few keys of reuse-worker.config.json the admin may override from the hub (enable_3d, gpu_max_gb,
-//    gpu_keep_loaded_s, and the ComfyUI workshop: atelier_enabled, atelier_window_only, atelier_idle_free_s). Sent with every order; the worker lays them over its local config. null removes an
+//    gpu_keep_loaded_s, and the ComfyUI workshop: atelier_enabled, atelier_window_only, atelier_idle_free_s,
+//    atelier_idle_stop_minutes). Sent with every order; the worker lays them over its local config. null removes an
 //    override, so the machine is back on its own file. Every change is journaled (who, when, from, to).
 //  - GPU tests: the remote form of `reuse_worker.py --gpu-test`, plus the ComfyUI bench. The admin queues one test;
 //    the worker runs it between two jobs, inside its schedule, reports its stage while it runs and its report at
@@ -24,7 +25,10 @@ export const WORKER_SETTINGS = {
   atelier_window_only: { type: 'bool' },          // true: only inside the machine's schedule (default: always, when enabled)
   atelier_idle_free_s: { type: 'int', min: 0, max: 86400 },  // the workshop gives the card back after this long idle (600; 0 never)
   atelier_keep_days: { type: 'number', min: 0.5, max: 365 },   // its outputs and uploaded images kept this long (7)...
-  atelier_files_max_gb: { type: 'number', min: 1, max: 500 }   // ...and this much at most, oldest removed first (20)
+  atelier_files_max_gb: { type: 'number', min: 1, max: 500 },  // ...and this much at most, oldest removed first (20)
+  // Sleep (idle ComfyUI held 3.2 GB of RAM): a light relay keeps the workshop's port, ComfyUI behind it is started
+  // on the first call and stopped after this long without work or calls (10); 0: never, ComfyUI always on, no relay
+  atelier_idle_stop_minutes: { type: 'number', min: 0, max: 1440 }
 };
 
 /** Kinds of remote test and the parameters each accepts (anything else is refused, never passed to the PC). */
@@ -43,8 +47,9 @@ export const TEST_KINDS = {
   upscale: { model: /^(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9_.() +-]{0,119}\.(safetensors|sft|pth|pt|ckpt|bin)$/i, scale: [1, 8] }
 };
 
-/** What a worker may write in its own journal (POST /api/reuse/worker/events): steps of a diagnosis or a repair. */
-export const WORKER_EVENT = /^(repair|verify)_[a-z_]{1,32}$/;
+/** What a worker may write in its own journal (POST /api/reuse/worker/events): steps of a diagnosis or a repair, and the
+ * workshop's sleep: ComfyUI woken (or failing to), put to sleep, relay started or stopped. Never the hub's own events. */
+export const WORKER_EVENT = /^(?:(?:repair|verify)_[a-z_]{1,32}|atelier_(?:wake|wake_failed|sleep|relay))$/;
 const EVENT_DETAIL_MAX = 4000;
 
 export const TEST_SILENT_MS = 15 * 60 * 1000;       // a running test the worker no longer reports on is failed

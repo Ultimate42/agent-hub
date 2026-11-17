@@ -150,7 +150,7 @@ router.delete('/api/reuse/workers/:name/schedule', guard('admin'), (req, res) =>
  * journal of changes and remote tests (most recent first) (admin).
  * POST - body {enable_3d: true|false|null, gpu_max_gb: 5..200|null, gpu_keep_loaded_s: 0..7200|null, atelier_enabled,
  * atelier_window_only: true|false|null, atelier_idle_free_s: 0..86400|null, atelier_keep_days: 0.5..365|null,
- * atelier_files_max_gb: 1..500|null}: merged; null
+ * atelier_files_max_gb: 1..500|null, atelier_idle_stop_minutes: 0..1440|null}: merged; null
  * removes the override (the machine's own reuse-worker.config.json applies again). Sent at its next poll.
  */
 router.get('/api/reuse/workers/:name/settings', guard('admin'), (req, res) => {
@@ -161,8 +161,9 @@ router.post('/api/reuse/workers/:name/settings', guard('admin'), json, (req, res
 });
 
 /**
- * GET /api/reuse/workers/:name/atelier - {settings, online, atelier: {enabled, state, listen, listening, firewall, busy, vram...}}:
- * Alice's ComfyUI workshop on that machine, as the worker last described it (admin).
+ * GET /api/reuse/workers/:name/atelier - {settings, online, atelier: {enabled, state, listen, listening, firewall, busy, vram...,
+ * mode, relay, ram_mib, relay_ram_mib, wakes, sleeps, last_wake, last_sleep}}: Alice's ComfyUI workshop on that machine, as
+ * the worker last described it (admin). state "en veille": ComfyUI stopped, its relay keeps the port and wakes it on a call.
  * POST {on: true|false} - turn it on or off (setting atelier_enabled, journaled; applied at the worker's next poll).
  */
 router.get('/api/reuse/workers/:name/atelier', guard('admin'), (req, res) => {
@@ -275,8 +276,9 @@ router.post('/api/reuse/worker/tests/:id', guard('worker'), jsonReport, (req, re
 });
 
 /**
- * POST /api/reuse/worker/events {what: "repair_*"|"verify_*", detail: {...}} - A step of the worker's own diagnosis or
- * repair (file re-hashed, re-downloaded, environment checked or redone, job replayed), kept in its journal
+ * POST /api/reuse/worker/events {what: "repair_*"|"verify_*"|"atelier_wake"|"atelier_wake_failed"|"atelier_sleep"|"atelier_relay",
+ * detail: {...}} - A step of the worker's own diagnosis or repair (file re-hashed, re-downloaded, environment checked or
+ * redone, job replayed), or of the workshop's sleep (woken by a call, put to sleep, relay started), kept in its journal
  * (GET /api/reuse/workers/:name/settings, history).
  */
 router.post('/api/reuse/worker/events', guard('worker'), json, (req, res) => {

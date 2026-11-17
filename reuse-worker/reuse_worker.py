@@ -1797,6 +1797,7 @@ class Worker:
         self.gpu = Gpu(base, self.config, self.app, self.engine)
         self.atelier = Atelier(base, self.config, self.app, self.gpu)
         self.gpu.atelier = self.atelier   # l'environnement des travaux n'est pas réinstallé sous un atelier en marche
+        self.atelier.notify = self.journal   # démarrages, veilles et relais de l'atelier : dans le journal du worker sur le hub
         self.card_lock = threading.Lock()   # un travail du hub qui démarre / l'atelier qui fait vider la carte des moteurs résidents
         self.job_active = False
         self.work = base / 'work'
@@ -2199,6 +2200,10 @@ class Worker:
         GET /api/reuse/workers/<nom>/settings). Un hub plus ancien (404) ou injoignable ne bloque rien."""
         detail = {k: v for k, v in detail.items() if v is not None}
         log.info('Auto-réparation : %s %s', what, json.dumps(detail, ensure_ascii=False)[:800])
+        self.journal(what, **detail)
+
+    def journal(self, what, **detail):
+        """Envoi au journal du worker sur le hub (déjà écrit dans worker.log par l'appelant)."""
         try:
             self.hub.request('POST', '/api/reuse/worker/events', body={'what': what, 'detail': detail}, timeout=30)
         except OSError as e:
@@ -2628,7 +2633,7 @@ class Worker:
             post({'status': 'failed', 'report': {'ok': False, 'error': 'l\'atelier ComfyUI calcule : réinstallation refusée, la redemander '
                                                                         'quand sa file est vide'}})
             return
-        if kind in ('comfyui', 'comfyui_remove') and self.atelier.pid:
+        if kind in ('comfyui', 'comfyui_remove') and self.atelier.env_in_use():
             spec = comfy_spec(self.app)
             lay = comfy_layout(self.base, spec)
             if kind == 'comfyui_remove' or not all(comfy_done(lay, spec, x) for x in ('python', 'pip', 'source', 'torch', 'requirements')):
@@ -2974,7 +2979,7 @@ def comfy_install(base, spec, gpu, stop, progress, report, files=None):
     root.mkdir(parents=True, exist_ok=True)
     files = (spec.get('files') or []) if files is None else files
     atelier = getattr(gpu, 'atelier', None)
-    if atelier is not None and atelier.pid and not all(comfy_done(lay, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')):
+    if atelier is not None and atelier.env_in_use() and not all(comfy_done(lay, spec, s) for s in ('python', 'pip', 'source', 'torch', 'requirements')):
         raise RuntimeError('environnement ComfyUI des travaux à (ré)installer : ' + ATELIER_SHARES)
     need = comfy_need_bytes(lay, spec, files)
     used = folder_bytes(gpu.root) if gpu.root.exists() else 0
@@ -3483,6 +3488,15 @@ ATELIER_FREE_DONE_MIB = 1024     # mémoire gardée par le PyTorch de l'atelier 
 ATELIER_KEEP_DAYS = 7            # sorties et images envoyées gardées 7 jours (réglable : atelier_keep_days)
 ATELIER_FILES_MAX_GB = 20.0      # et 20 Go au plus à elles deux, les plus anciennes d'abord (réglable : atelier_files_max_gb)
 ATELIER_PURGE_S = 600            # ménage toutes les 10 minutes
+# Veille (ComfyUI au repos gardait 3,2 Go de mémoire vive) : un relais léger (atelier_relay.py, avec le Python de
+# l'atelier, celui que vise le pare-feu) écoute sur le port de l'atelier à sa place ; ComfyUI tourne derrière, sur
+# 127.0.0.1 seulement, démarré à la première demande et arrêté après atelier_idle_stop_minutes sans calcul ni appel.
+ATELIER_IDLE_STOP_MIN = 10       # 0 = jamais : ComfyUI toujours en marche, directement sur le port de l'atelier, sans relais
+ATELIER_BACKEND_PORT = 8189      # port de ComfyUI derrière le relais (127.0.0.1 ; réglable dans la config : atelier_backend_port)
+ATELIER_WAKE_WAIT_S = 300        # un appel attend au plus 5 minutes que ComfyUI soit prêt, puis 503
+ATELIER_RELAY = 'atelier_relay.py'
+ATELIER_RELAY_START_S = 15       # le relais écrit son état en moins d'une seconde ; au-delà, il a échoué
+ATELIER_MEM_S = 30               # mémoire vive de ComfyUI et du relais relue toutes les 30 s
 TAILNET = ipaddress.ip_network('100.64.0.0/10')
 LOOPBACK = ipaddress.ip_network('127.0.0.0/8')
 
@@ -3492,7 +3506,44 @@ def atelier_layout(base, spec):
     return {'root': root, 'python': root / 'python', 'src': root / spec['source']['root'], 'data': root / 'data',
             'tmp': root / 'tmp', 'cache': root / 'cache', 'logs': root / 'logs', 'state': root / 'atelier.json',
             'extra': root / 'extra_model_paths.yaml', 'exe': root / 'python' / ('python.exe' if IS_WINDOWS else 'bin/python3'),
-            'jobs': comfy_layout(base, spec)}
+            'relay': root / 'relay' / ATELIER_RELAY, 'relay_state': root / 'relay.json', 'jobs': comfy_layout(base, spec)}
+
+
+def process_memory(pid):
+    """Mémoire vive d'un processus -> {'ws_mib': ensemble de travail (résident), 'private_mib': octets privés (engagés)},
+    {} si illisible. Windows : appel système direct (ctypes), sans lancer de programme ; Linux : /proc."""
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+            size_t = ctypes.c_size_t
+
+            class C(ctypes.Structure):
+                _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD), ('PeakWorkingSetSize', size_t),
+                            ('WorkingSetSize', size_t), ('QuotaPeakPagedPoolUsage', size_t), ('QuotaPagedPoolUsage', size_t),
+                            ('QuotaPeakNonPagedPoolUsage', size_t), ('QuotaNonPagedPoolUsage', size_t), ('PagefileUsage', size_t),
+                            ('PeakPagefileUsage', size_t), ('PrivateUsage', size_t)]
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            h = k.OpenProcess(0x1000 | 0x0010, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+            if not h:
+                return {}
+            try:
+                c = C()
+                c.cb = ctypes.sizeof(C)
+                if not k.K32GetProcessMemoryInfo(wintypes.HANDLE(h), ctypes.byref(c), c.cb):
+                    return {}
+                return {'ws_mib': int(c.WorkingSetSize / 1048576), 'private_mib': int(c.PrivateUsage / 1048576)}
+            finally:
+                k.CloseHandle(wintypes.HANDLE(h))
+        out = {}
+        for line in Path('/proc/%d/status' % int(pid)).read_text().splitlines():
+            key, _, value = line.partition(':')
+            if key in ('VmRSS', 'RssAnon') and value.split():
+                out['ws_mib' if key == 'VmRSS' else 'private_mib'] = int(value.split()[0]) // 1024
+        return out
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def link_tree(src, dst, copy_names=r'.*\._pth|pyvenv\.cfg'):
@@ -4038,6 +4089,28 @@ class Atelier:
         self.held = None                # raison d'une réparation en cours qui le garde éteint (hold / unhold)
         self.card_restarts = 0          # relances parce qu'il calculait sur une autre carte que celle choisie (check_card)
         self.card_probe_at = -1e9       # dernier choix de carte tenté pour un atelier repris (un échec n'est pas relancé à chaque tour)
+        # Veille : relais sur le port de l'atelier, ComfyUI derrière, démarré à la demande, arrêté sans travail
+        self.relay_proc = None          # Popen du relais si ce worker l'a lancé ; None si repris (relay_pid seulement)
+        self.relay_pid = None
+        self.relay_listen = None
+        self.relay_allow = None
+        self.relay_info = {}            # relay.json : état écrit par le relais (veille, démarrage, actif, dernière activité)
+        self.relay_error = None
+        self.relay_failures = 0
+        self.relay_next_try = 0.0
+        self.relay_setting = None       # atelier_idle_stop_minutes vu au dernier tour (changé : le relais est retenté)
+        self.relay_mem = {}
+        self.wake_wanted = None         # réveil demandé par le worker lui-même (essai upscale) : la raison
+        self.wake_cause = None          # raison du démarrage en cours (dite au journal quand il est prêt)
+        self.in_use = 0                 # essais du worker en cours dans l'atelier : pas de veille pendant ce temps
+        self.mem = {}                   # mémoire vive de ComfyUI (process_memory)
+        self.mem_at = 0.0
+        self.wakes = 0
+        self.sleeps = 0
+        self.last_wake = None
+        self.last_sleep = None
+        self.asleep_since = None
+        self.notify = None              # notify(what, **detail) : journal du worker sur le hub (Worker.journal)
 
     # ---- réglages ----
     def spec(self):
@@ -4055,6 +4128,36 @@ class Atelier:
         if not IS_WINDOWS and not self.config.get('comfyui_any_os'):
             return False
         return not (self.config.get('atelier_window_only') is True and self.in_window is False)
+
+    def idle_stop_s(self):
+        """Veille après ce temps sans calcul ni appel (atelier_idle_stop_minutes) ; 0 : jamais, ancien fonctionnement."""
+        try:
+            return max(0.0, float(self.config.get('atelier_idle_stop_minutes', ATELIER_IDLE_STOP_MIN))) * 60
+        except (TypeError, ValueError):
+            return ATELIER_IDLE_STOP_MIN * 60.0
+
+    def relay_mode(self):
+        """Veille avec relais. Si le relais ne peut pas démarrer, repli : ComfyUI reste en marche sur le port de l'atelier
+        comme avant (un atelier en veille sans relais serait injoignable), jusqu'au prochain changement du réglage ou
+        redémarrage du worker ; la raison est dans relay_error."""
+        stop_s = self.idle_stop_s()
+        if stop_s != self.relay_setting:
+            self.relay_setting, self.relay_failures, self.relay_next_try = stop_s, 0, 0.0
+        return stop_s > 0 and (bool(self.relay_pid) or self.relay_failures == 0)
+
+    def backend_port(self, atelier):
+        try:
+            port = int(self.config.get('atelier_backend_port') or ATELIER_BACKEND_PORT)
+        except (TypeError, ValueError):
+            port = ATELIER_BACKEND_PORT
+        return port if port != self.port_wanted(atelier) else port + 1
+
+    def journal(self, what, **detail):
+        """Démarrage, veille, relais : écrit dans worker.log et envoyé au hub (journal du worker), sans jamais bloquer."""
+        detail = {k: v for k, v in detail.items() if v is not None}
+        log.info('Atelier : %s %s', what, json.dumps(detail, ensure_ascii=False)[:600])
+        if self.notify:
+            threading.Thread(target=self.notify, args=(what,), kwargs=detail, name='atelier-journal', daemon=True).start()
 
     def idle_free_s(self):
         try:
@@ -4133,7 +4236,9 @@ class Atelier:
         return self.ts['ip'] if self.fw.get('ok') else None
 
     def look_net(self, now, force=False):
-        if not IS_WINDOWS or not self.pid or (not force and now - self.net['at'] < ATELIER_NET_S):
+        """Adresses réellement écoutées par ComfyUI et par le relais (netstat), jamais toutes les adresses."""
+        pids = {p for p in (self.pid, self.relay_pid) if p}
+        if not IS_WINDOWS or not pids or (not force and now - self.net['at'] < ATELIER_NET_S):
             return
         try:
             code, out = quiet_run(['netstat', '-ano'], timeout=30)
@@ -4141,15 +4246,17 @@ class Atelier:
             self.net = {'listening': None, 'error': str(e)[:120], 'at': now}
             return
         rows = parse_netstat(out)
-        mine = sorted({'%s:%d' % (h, p) for h, p, pid in rows if pid == self.pid})
-        others = sorted({'%s:%d (pid %d)' % (h, p, pid) for h, p, pid in rows if p == self.port and pid != self.pid})
-        wide = [a for a in mine if a.rpartition(':')[0] in ('0.0.0.0', '::') and a.rpartition(':')[2] == str(self.port)]
+        ports = {p for p in (self.port, self.relay_info.get('port') if self.relay_pid else None) if p}
+        mine = sorted({'%s:%d' % (h, p) for h, p, pid in rows if pid in pids})
+        others = sorted({'%s:%d (pid %d)' % (h, p, pid) for h, p, pid in rows if p in ports and pid not in pids})
+        wide = [a for a in mine if a.rpartition(':')[0] in ('0.0.0.0', '::') and a.rpartition(':')[2] in {str(p) for p in ports}]
         self.net = {'listening': mine, 'port_taken_by': others or None, 'at': now}
         if wide:
             log.error('Atelier : écoute sur toutes les adresses (%s) : arrêté.', ', '.join(wide))
             self.stop('écoute sur toutes les adresses')
+            self.stop_relay('écoute sur toutes les adresses')
             self.error = 'écoute sur toutes les adresses (%s) : arrêté' % ', '.join(wide)
-            self.next_try = now + 3600
+            self.next_try = self.relay_next_try = now + 3600
 
     # ---- préparation : environnement cloné de celui des travaux, source, Manager ----
     def prepare(self, spec, lay):
@@ -4284,13 +4391,14 @@ class Atelier:
         lay = atelier_layout(self.base, spec)
         with self.env_lock:
             self.prepare(spec, lay)
-        port = self.port_wanted(atelier)
+        relay = self.relay_mode()   # derrière le relais : 127.0.0.1 seulement, sur le port interne
+        port = self.backend_port(atelier) if relay else self.port_wanted(atelier)
         try:   # quelque chose répond déjà sur ce port (une connexion, pas un bind : nos requêtes passées laissent des TIME_WAIT)
             socket.create_connection(('127.0.0.1', port), timeout=2).close()
             raise RuntimeError('port %d déjà pris sur ce PC (un autre ComfyUI ?)' % port)
         except OSError:
             pass
-        ip = self.remote_ip(now)
+        ip = None if relay else self.remote_ip(now)
         listen = '127.0.0.1' + (',' + ip if ip else '')
         manager = self.manager is True
         args = [str(lay['exe']), '-s', str(lay['src'] / 'main.py')] + atelier_args(spec, atelier, port, listen, lay['data'], lay['extra'], manager)
@@ -4400,6 +4508,7 @@ class Atelier:
             self.held = str(why)[:200]
             if was:
                 self.stop('réparation : %s' % self.held)
+            self.stop_relay('réparation : %s' % self.held)   # il tient le python.exe de l'atelier, lié à celui des travaux
             self.state = 'suspendu : %s' % self.held[:120]
             return was
 
@@ -4415,6 +4524,209 @@ class Atelier:
     def shutdown(self, why):
         self.stopping.set()
         self.stop(why)
+        self.stop_relay(why)
+
+    def env_in_use(self):
+        """ComfyUI ou le relais tournent avec le Python de l'atelier (liens physiques vers celui des travaux)."""
+        return bool(self.pid or self.relay_pid)
+
+    # ---- veille : le relais ----
+    def relay_running(self):
+        if self.relay_proc is not None:
+            return self.relay_proc.poll() is None
+        return bool(self.relay_pid) and pid_alive(self.relay_pid)
+
+    def relay_sha(self):
+        try:
+            return hashlib.sha256((self.app / ATELIER_RELAY).read_bytes()).hexdigest()[:12]
+        except OSError:
+            return None
+
+    def read_relay(self, lay):
+        info = read_json(lay['relay_state'], {}) or {}
+        self.relay_info = info if isinstance(info, dict) and info.get('pid') == self.relay_pid else {}
+        return self.relay_info
+
+    def adopt_relay(self, lay):
+        """Relais resté en marche pendant la mise à jour ou le redémarrage du worker : repris (les connexions du poste client ne
+        sont pas coupées), seulement si ce numéro est bien le Python de l'atelier, et pas ComfyUI lui-même."""
+        st = read_json(lay['relay_state'], {}) or {}
+        pid = st.get('pid') if isinstance(st, dict) else None
+        if not pid or pid == self.pid or not same_file(process_exe(pid), lay['exe']):
+            lay['relay_state'].unlink(missing_ok=True)
+            return False
+        self.relay_proc, self.relay_pid = None, int(pid)
+        self.relay_listen, self.relay_allow, self.relay_info = st.get('listen'), st.get('allow') or '', st
+        log.info('Atelier : relais repris en marche (pid %d, %s port %s).', self.relay_pid, self.relay_listen, st.get('port'))
+        return True
+
+    def start_relay(self, lay, listen, allow, port, backend):
+        """Le relais, avec le Python de l'atelier (le pare-feu ne vise que lui), copié dans atelier\\relay (jamais lancé depuis
+        app\\ : la mise à jour du worker renomme ce dossier)."""
+        src = self.app / ATELIER_RELAY
+        lay['relay'].parent.mkdir(parents=True, exist_ok=True)
+        if not lay['relay'].exists() or lay['relay'].read_bytes() != src.read_bytes():
+            shutil.copyfile(src, lay['relay'])
+        lay['relay_state'].unlink(missing_ok=True)
+        lay['logs'].mkdir(parents=True, exist_ok=True)
+        logf = lay['logs'] / 'relay.log'
+        if logf.exists():
+            os.replace(logf, lay['logs'] / 'relay.previous.log')
+        args = [str(lay['exe']), '-s', str(lay['relay']), '--listen', listen, '--port', str(port), '--backend', str(backend),
+                '--state', str(lay['relay_state']), '--allow', allow, '--wait', str(ATELIER_WAKE_WAIT_S)]
+        env = dict(os.environ, PYTHONNOUSERSITE='1', PYTHONUTF8='1', PYTHONDONTWRITEBYTECODE='1')
+        flags, kwargs = self.gpu.spawn_options()
+        if IS_WINDOWS:
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        with open(logf, 'wb') as out:
+            self.relay_proc = subprocess.Popen(args, cwd=str(lay['root']), stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                               env=env, creationflags=flags, **kwargs)
+        self.relay_pid, self.relay_listen, self.relay_allow = self.relay_proc.pid, listen, allow
+        deadline = time.time() + ATELIER_RELAY_START_S
+        while not self.read_relay(lay):
+            code = self.relay_proc.poll()
+            if code is not None or time.time() > deadline:
+                said = log_tail(logf, 3)
+                self.stop_relay('pas prêt')
+                raise RuntimeError('relais arrêté au démarrage (code %s) : %s' % (code, ' | '.join(said)[-230:]))
+            time.sleep(0.1)
+        self.relay_error = None
+        self.relay_failures = 0
+        self.journal('atelier_relay', action='démarré', pid=self.relay_pid, listen=listen, port=port, backend_port=backend,
+                     allow=allow or None, mem_mib=process_memory(self.relay_pid).get('ws_mib'))
+
+    def stop_relay(self, why):
+        with self.lock:
+            if self.relay_proc is not None and self.relay_proc.poll() is None:
+                self.relay_proc.kill()   # rien à finir proprement : les connexions relayées se ferment avec lui
+                try:
+                    self.relay_proc.wait(15)
+                except subprocess.TimeoutExpired:
+                    pass
+            elif self.relay_proc is None and self.relay_pid:
+                try:
+                    lay = atelier_layout(self.base, self.spec())
+                    if same_file(process_exe(self.relay_pid), lay['exe']):
+                        if IS_WINDOWS:
+                            quiet_run(['taskkill', '/PID', str(self.relay_pid), '/F'], timeout=30)
+                        else:
+                            os.kill(self.relay_pid, 9)
+                        deadline = time.time() + 15
+                        while pid_alive(self.relay_pid) and time.time() < deadline:
+                            time.sleep(0.1)
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    pass
+            if self.relay_pid:
+                self.journal('atelier_relay', action='arrêté', pid=self.relay_pid, why=why)
+            self.relay_proc, self.relay_pid, self.relay_listen, self.relay_allow, self.relay_info, self.relay_mem = None, None, None, None, {}, {}
+            try:
+                atelier_layout(self.base, self.spec())['relay_state'].unlink(missing_ok=True)
+            except (RuntimeError, OSError):
+                pass
+
+    def manage_relay(self, now, relay):
+        """Relais en marche en mode veille, arrêté sinon ; relancé si l'adresse, le pare-feu ou son code ont changé (jamais
+        pendant un calcul : les connexions du poste client passent par lui)."""
+        busy = bool(self.pid) and self.busy_flag
+        if self.relay_pid and not self.relay_running():
+            code = self.relay_proc.returncode if self.relay_proc is not None else '?'
+            self.relay_proc, self.relay_pid, self.relay_info = None, None, {}
+            self.relay_failures += 1
+            self.relay_next_try = now + min(1800, 30 * 2 ** (self.relay_failures - 1))
+            self.relay_error = 'relais arrêté de lui-même (code %s) : repli, ComfyUI reste en marche sans veille' % code
+            log.warning('Atelier : %s.', self.relay_error)
+        if not relay:
+            if self.relay_pid and not busy:
+                self.stop_relay('veille coupée (atelier_idle_stop_minutes = 0) : ComfyUI reprend le port lui-même')
+            return
+        spec = self.spec()
+        lay = atelier_layout(self.base, spec)
+        port, backend = self.port_wanted(spec['atelier']), self.backend_port(spec['atelier'])
+        ip = self.remote_ip(now)
+        listen = '127.0.0.1' + (',' + ip if ip else '')
+        allow = ','.join(self.fw.get('allow_from') or []) if ip and self.fw.get('ok') else ''
+        if self.relay_pid:
+            info = self.read_relay(lay)
+            changed = [what for what, bad in (('adresse', self.relay_listen != listen), ('pare-feu', self.relay_allow != allow),
+                                              ('port', info and (info.get('port'), info.get('backend_port')) != (port, backend)),
+                                              ('code', info and info.get('sha') != self.relay_sha())) if bad]
+            if not changed or busy:
+                if now - (self.relay_mem.get('at') or 0) >= ATELIER_MEM_S:
+                    self.relay_mem = dict(process_memory(self.relay_pid), at=now)
+                self.look_net(now)
+                return
+            self.stop_relay('relancé : %s changé' % ', '.join(changed))
+        if now < self.relay_next_try:
+            return
+        if self.pid and self.port == port:
+            return   # ComfyUI (sans relais, version précédente) tient encore le port : arrêté d'abord, quand il ne calcule plus
+        try:
+            if not ((lay['root'] / '.ok-env').exists() and lay['exe'].exists()):   # première mise en marche : le Python de l'atelier
+                with self.env_lock:
+                    self.prepare(spec, lay)
+            self.start_relay(lay, listen, allow, port, backend)
+        except Exception as e:   # toute panne : pause croissante, jamais une relance en boucle
+            self.relay_failures += 1
+            self.relay_next_try = now + min(1800, 30 * 2 ** (self.relay_failures - 1))
+            self.relay_error = ('%s : repli, ComfyUI reste en marche sans veille' % e)[:300]
+            log.warning('Atelier : relais : %s (repli : ComfyUI reste en marche sur le port de l\'atelier, sans veille).', e)
+            self.journal('atelier_relay', action='échec', error=self.relay_error)
+
+    def wake_request(self):
+        """Raison de démarrer ComfyUI endormi : un essai du worker, ou un appel qui attend au relais. None : rester en veille."""
+        if self.wake_wanted:
+            return self.wake_wanted
+        info = self.relay_info
+        if self.relay_pid and info.get('state') == 'démarrage' and info.get('waiting'):
+            return 'appel %s' % (info.get('wake_cause') or '?')
+        return None
+
+    def wake_for(self, why, timeout_s=None):
+        """Réveil demandé par le worker lui-même (essai upscale) : attend ComfyUI en marche. -> True s'il l'est."""
+        if self.pid and self.state == 'en marche':
+            return True
+        if not self.relay_mode():
+            return False
+        self.wake_wanted = why
+        self.in_use += 1   # réveillé pour ce besoin : pas remis en veille avant que l'appelant ait pu s'en servir
+        deadline = time.time() + (timeout_s or ATELIER_WAKE_WAIT_S)
+        try:
+            while time.time() < deadline and not self.stopping.is_set():
+                if self.pid and self.state == 'en marche':
+                    self.last_busy = time.time()   # le délai de veille repart d'ici
+                    return True
+                if self.wake_wanted is None and self.state == 'en échec':
+                    return False
+                time.sleep(0.5)
+            return False
+        finally:
+            self.wake_wanted = None
+            self.in_use -= 1
+
+    def idle_for(self, now):
+        last = max(self.last_busy, float(self.relay_info.get('last_activity_at') or 0))
+        return now - last
+
+    def go_to_sleep(self, now):
+        """Veille : file /queue relue juste avant, vide et vraiment lue (jamais un calcul coupé), aucun appel en attente,
+        aucun essai du worker. -> True si ComfyUI a été arrêté."""
+        if self.in_use or self.restart_wanted or (self.relay_info.get('waiting') or 0) > 0 or not self.relay_running():
+            return False   # sans relais en marche, personne ne pourrait le réveiller
+        self.poll()
+        if self.busy_flag or self.queue_errors or self.queue != (0, 0):
+            return False
+        mem = process_memory(self.pid) or self.mem
+        idle = self.idle_for(now)
+        self.stop('veille : %s sans calcul ni appel' % fmt_duration(idle))
+        self.state = 'en veille'
+        self.sleeps += 1
+        self.asleep_since = time.strftime('%Y-%m-%d %H:%M:%S')
+        self.last_sleep = '%s : après %s sans travail, %s Mio de mémoire vive rendus' % (
+            self.asleep_since, fmt_duration(idle), mem.get('ws_mib', '?'))
+        self.journal('atelier_sleep', idle_s=int(idle), mem_mib=mem.get('ws_mib'), private_mib=mem.get('private_mib'),
+                     relay_mem_mib=process_memory(self.relay_pid).get('ws_mib') if self.relay_pid else None)
+        self.mem = {}
+        return True
 
     # ---- file, mémoire vidéo ----
     def poll(self):
@@ -4758,20 +5070,46 @@ class Atelier:
                     if lay['state'].exists() and self.adopt(lay):
                         self.state = 'en marche'
                         self.freed = False
+                    if lay['relay_state'].exists():
+                        self.adopt_relay(lay)
                 except RuntimeError:
                     pass
             if not self.wanted():
+                why = ('éteint depuis le hub' if not self.enabled() else
+                       'réparation : %s' % self.held if self.held else 'hors du créneau (atelier_window_only)')
                 if self.pid:
-                    self.stop('éteint depuis le hub' if not self.enabled() else
-                              'réparation : %s' % self.held if self.held else 'hors du créneau (atelier_window_only)')
+                    self.stop(why)
+                if self.relay_pid:
+                    self.stop_relay(why)
                 self.state = 'suspendu : %s' % self.held[:120] if self.held else 'éteint'
                 self.error = None if not self.enabled() else self.error
+                self.wake_wanted = None
                 return
+            relay = self.relay_mode()
+            try:
+                self.manage_relay(now, relay)
+            except RuntimeError as e:   # catalogue sans atelier : dit par start ci-dessous
+                self.relay_error = str(e)[:300]
             if not self.pid:
+                cause = None
+                if relay:
+                    self.restart_wanted = False   # nœuds ajoutés pendant la veille : chargés au prochain démarrage
+                    cause = self.wake_request()
+                    if not cause:
+                        if self.state != 'en échec' or now >= self.next_try:
+                            self.state = 'en veille' if self.relay_pid else 'éteint'
+                        return
                 if now < self.next_try:
                     return
+                self.wake_wanted = None
+                t0 = time.time()
                 try:
                     self.start(now)
+                    if relay:
+                        self.wakes += 1
+                        self.asleep_since = None
+                        self.last_wake = '%s : %s, prêt en %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), cause, fmt_duration(time.time() - t0))
+                        self.journal('atelier_wake', cause=cause, ready_s=round(time.time() - t0, 1), port=self.port)
                 except Exception as e:   # toute panne du démarrage : pause croissante, jamais une relance immédiate en boucle
                     if self.pid and not self.running():
                         self.forget()
@@ -4781,6 +5119,8 @@ class Atelier:
                     self.error = str(e)[:300]
                     self.state = 'en échec'
                     log.warning('Atelier : %s (nouvel essai dans %s).', e, fmt_duration(pause))
+                    if relay:
+                        self.journal('atelier_wake_failed', cause=cause, error=self.error, retry_s=int(pause))
                 return
             if not self.running():
                 code = self.proc.returncode if self.proc is not None else '?'
@@ -4810,6 +5150,8 @@ class Atelier:
                 return
             if self.busy_flag:
                 self.last_busy, self.freed = now, False
+            elif relay and self.idle_for(now) >= self.idle_stop_s() and self.go_to_sleep(now):
+                return
             elif not self.freed and self.idle_free_s() > 0 and now - self.last_busy >= self.idle_free_s():
                 self.free('%s sans calcul' % fmt_duration(self.idle_free_s()), wait_s=0)
             self.look_net(now)
@@ -4819,6 +5161,7 @@ class Atelier:
                 self.vram_at = now
                 self.read_vram()
                 self.read_log()
+                self.mem = process_memory(self.pid) or self.mem
                 if self.gpu.hip_device is None and not busy and now - self.card_probe_at >= 600:   # repris en marche : carte pas encore choisie
                     self.card_probe_at = now
                     try:
@@ -4829,11 +5172,14 @@ class Atelier:
                 self.check_card(busy)
                 if not self.pid:
                     return
-            # Tailscale prêt après coup, adresse changée, pare-feu posé ou retiré : relance (seulement sans calcul en cours)
-            ip = self.remote_ip(now)
+            # Tailscale prêt après coup, adresse changée, pare-feu posé ou retiré, veille mise ou coupée : relance (seulement
+            # sans calcul en cours). Derrière le relais, ComfyUI n'écoute que 127.0.0.1, sur le port interne.
+            atelier = self.spec()['atelier']
+            ip = None if relay else self.remote_ip(now)
             want = '127.0.0.1' + (',' + ip if ip else '')
-            if want != self.listen and not busy:
-                self.stop('adresse d\'écoute à changer : %s -> %s' % (self.listen, want))
+            port = self.backend_port(atelier) if relay else self.port_wanted(atelier)
+            if (want, port) != (self.listen, self.port) and not busy:
+                self.stop('écoute à changer : %s port %s -> %s port %s' % (self.listen, self.port, want, port))
                 self.next_try = 0.0
 
     def upscale_test(self, params, image, stop, progress, timeout_s=900):
@@ -4841,11 +5187,15 @@ class Atelier:
         (UpscaleModelLoader + ImageUpscaleWithModel, les nœuds natifs de ComfyUI). Réussi si l'image produite fait exactement
         scale fois l'entrée sur les deux côtés et n'est pas unie (NaN ou noyau absent : noire). -> rapport (ne lève pas)."""
         report = {'ok': False, 'kind': 'upscale', 'at': time.strftime('%Y-%m-%d %H:%M:%S')}
+        self.in_use += 1   # pas de veille pendant l'essai
         try:
             name, scale = str(params.get('model') or ''), int(params.get('scale') or 4)
             if not SAFE_PART.fullmatch(name) or not MODEL_EXT.fullmatch(name) or '..' in name:
                 raise ValueError('model : nom d\'un fichier de upscale_models attendu (ex. 4x-PBRify-UpscalerV4.safetensors)')
             report.update(model=name, scale=scale)
+            if not self.pid and self.relay_mode():   # en veille : réveillé pour l'essai, comme par un appel du poste client
+                progress(0.02, 'réveil de l\'atelier (en veille)')
+                report['woken'] = self.wake_for('essai upscale')
             if not self.pid or self.state != 'en marche':
                 raise RuntimeError('atelier pas en marche (%s) : l\'allumer d\'abord ({"on": true})' % self.state)
             spec = self.spec()
@@ -4909,6 +5259,9 @@ class Atelier:
             report['error'] = 'annulé : %s' % e
         except (RuntimeError, OSError, ValueError, KeyError) as e:
             report['error'] = str(e)[:400]
+        finally:
+            self.in_use -= 1
+            self.last_busy = time.time()
         self.read_log(force=True)
         report['log'] = list(self.log_lines)
         return report
@@ -4930,7 +5283,26 @@ class Atelier:
              'log': list(self.log_lines) or None}   # fin du journal de ComfyUI : pourquoi il ne démarre pas, vu du hub   # ce que cette version sait faire : le hub ne donne de tâche qu'à elle
         if self.net.get('port_taken_by'):
             d['port_taken_by'] = ', '.join(self.net['port_taken_by'])
+        if self.enabled() or self.pid or self.relay_pid:
+            d.update(self.describe_sleep())
         return {k: v for k, v in d.items() if v is not None}
+
+    def describe_sleep(self):
+        """Veille : mode, relais (en veille, en démarrage, actif), mémoire vive mesurée, derniers réveil et mise en veille."""
+        relay, wanted = self.relay_mode(), self.idle_stop_s() > 0
+        info = self.relay_info if self.relay_pid else {}
+        states = {'veille': 'en veille', 'démarrage': 'en démarrage', 'actif': 'actif'}
+        d = {'mode': 'relais' if relay else 'direct (repli : relais en échec)' if wanted else 'direct',
+             'idle_stop_minutes': round(self.idle_stop_s() / 60, 2),
+             'relay': states.get(info.get('state'), 'en marche') if self.relay_pid else ('arrêté' if wanted else None),
+             'relay_pid': self.relay_pid, 'relay_error': self.relay_error if wanted else None,
+             'ram_mib': self.mem.get('ws_mib') if self.pid else None, 'ram_private_mib': self.mem.get('private_mib') if self.pid else None,
+             'relay_ram_mib': self.relay_mem.get('ws_mib') if self.relay_pid else None,
+             'ws_open': info.get('ws_open'), 'wakes': self.wakes if relay else None, 'sleeps': self.sleeps if relay else None,
+             'last_wake': self.last_wake, 'last_sleep': self.last_sleep, 'asleep_since': self.asleep_since if not self.pid else None}
+        if self.relay_pid:   # ce que voit le poste client : le port et les adresses du relais ; ComfyUI derrière, sur backend_port
+            d.update(port=info.get('port'), listen=self.relay_listen, backend_port=self.port if self.pid else info.get('backend_port'))
+        return d
 
 
 GPU_TEST_KINDS = ('image', '3d', 'comfyui', 'comfyui_remove', 'comfyui_reinstall', 'verify_models', 'upscale')
@@ -4939,7 +5311,7 @@ GPU_TEST_OBJECT = 'gpu-test-object.png'   # entrée de l'essai 3D demandé par l
 # Réglages que le hub peut poser sur cette machine (POST /api/reuse/workers/:nom/settings), avec leurs types. Aucun autre.
 REMOTE_SETTINGS = {'enable_3d': (bool,), 'gpu_max_gb': (int, float), 'gpu_keep_loaded_s': (int, float),
                    'atelier_enabled': (bool,), 'atelier_window_only': (bool,), 'atelier_idle_free_s': (int, float),
-                   'atelier_keep_days': (int, float), 'atelier_files_max_gb': (int, float)}
+                   'atelier_keep_days': (int, float), 'atelier_files_max_gb': (int, float), 'atelier_idle_stop_minutes': (int, float)}
 LOG_TAIL_LINES = 60
 
 

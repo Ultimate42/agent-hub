@@ -1388,7 +1388,10 @@ class AtelierBase(unittest.TestCase):
         self.base = Path(tempfile.mkdtemp())
         (self.base / 'logs').mkdir()
         self.port = free_port()
-        self.config = {'atelier_enabled': True, 'comfyui_any_os': True, 'atelier_port': self.port, 'gpu_keep_free_gb': 0}
+        # Sans veille (atelier_idle_stop_minutes = 0) : ComfyUI directement sur le port de l'atelier, comme avant le relais.
+        # La veille, avec son relais, est éprouvée par AtelierSleepTest.
+        self.config = {'atelier_enabled': True, 'comfyui_any_os': True, 'atelier_port': self.port, 'gpu_keep_free_gb': 0,
+                       'atelier_idle_stop_minutes': 0}
         self.gpu = w.Gpu(self.base, self.config, Path(w.__file__).resolve().parent)
         self.spec = json.loads(json.dumps(self.gpu.catalog['benchmarks']['comfyui']))
         # gpu-box vu par ROCm : le graphique intégré du Ryzen d'abord (aucun noyau dans les roues gfx1030), puis la RX 6950 XT
@@ -1656,6 +1659,413 @@ class AtelierLifeTest(AtelierBase):
         self.assertIn('torch==2.13.0+rocm10.0.0', (self.lay['root'] / 'constraints.txt').read_text())
         self.assertTrue(a.manager is True)
         self.assertIn('--enable-manager', self.runs()[-1]['args'])
+
+
+# ---- Veille de l'atelier : le relais (atelier_relay.py) et l'arrêt au repos ---------------------------------------------
+_rspec = importlib.util.spec_from_file_location('atelier_relay', Path(__file__).resolve().parent.parent / 'reuse-worker' / 'atelier_relay.py')
+relay_mod = importlib.util.module_from_spec(_rspec)
+_rspec.loader.exec_module(relay_mod)
+RELAY = Path(relay_mod.__file__)
+
+
+def ws_frame(payload, mask=True, opcode=1):
+    """Trame WebSocket d'un message court (client : masquée)."""
+    head = bytes([0x80 | opcode, (0x80 if mask else 0) | len(payload)])
+    if not mask:
+        return head + payload
+    key = os.urandom(4)
+    return head + key + bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+
+
+def ws_read(sock, timeout=10):
+    """Une trame lue (courte) -> (opcode, données démasquées) ; None si la connexion est fermée."""
+    sock.settimeout(timeout)
+    def take(n):
+        data = b''
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+    h = take(2)
+    if h is None:
+        return None
+    n, masked = h[1] & 0x7F, h[1] & 0x80
+    key = take(4) if masked else b''
+    data = take(n) or b''
+    if masked:
+        data = bytes(b ^ key[i % 4] for i, b in enumerate(data))
+    return h[0] & 0x0F, data
+
+
+def ws_open(port, path='/ws?clientId=abc', extensions=True):
+    import base64
+    import socket
+    s = socket.create_connection(('127.0.0.1', port), timeout=10)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(('GET %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n'
+               'Sec-WebSocket-Version: 13\r\n%s\r\n' % (path, port, key, 'Sec-WebSocket-Extensions: permessage-deflate\r\n' if extensions else '')).encode())
+    head = b''
+    while b'\r\n\r\n' not in head:
+        chunk = s.recv(1)
+        if not chunk:
+            raise OSError('fermé pendant la poignée de main')
+        head += chunk
+    return s, key, head.decode('latin-1')
+
+
+def http_call(port, method='GET', path='/queue', body=None, timeout=30):
+    import http.client
+    c = http.client.HTTPConnection('127.0.0.1', port, timeout=timeout)
+    try:
+        c.request(method, path, body=json.dumps(body) if body is not None else None, headers={'Content-Type': 'application/json'} if body else {})
+        r = c.getresponse()
+        return r.status, json.loads(r.read() or b'null')
+    finally:
+        c.close()
+
+
+class FakeComfy:
+    """ComfyUI vu du relais : HTTP (/queue, /prompt) et /ws (poignée de main, message status, trames reçues notées). Tout ce
+    qu'il voit est dans events, dans l'ordre."""
+
+    def __init__(self, port):
+        import socket
+        self.events, self.conns = [], []
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(('127.0.0.1', port))
+        self.srv.listen(16)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            self.conns.append(c)
+            threading.Thread(target=self.handle, args=(c,), daemon=True).start()
+
+    def handle(self, c):
+        try:
+            data = b''
+            while b'\r\n\r\n' not in data:
+                chunk = c.recv(65536)
+                if not chunk:
+                    return
+                data += chunk
+            method, path, headers = relay_mod.parse_head(data)
+            if relay_mod.is_websocket(headers):
+                self.events.append(('ws', path, headers))
+                c.sendall(('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n'
+                           % relay_mod.ws_accept(headers['sec-websocket-key'])).encode() + ws_frame(b'{"type":"status"}', mask=False))
+                while True:
+                    f = ws_read(c, timeout=None)
+                    if f is None:
+                        return
+                    self.events.append(('frame', f[1]))
+            body = data.split(b'\r\n\r\n', 1)[1]
+            while len(body) < int(headers.get('content-length') or 0):
+                body += c.recv(65536)
+            self.events.append(('http', method, path))
+            out = json.dumps({'queue_running': [], 'queue_pending': []} if path == '/queue' else {'prompt_id': 'p1'}).encode()
+            c.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(out) + out)
+            c.close()
+        except OSError:
+            pass
+
+    def close(self):
+        import socket
+        self.srv.close()
+        for c in self.conns:
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+                c.close()
+            except OSError:
+                pass
+
+
+class AtelierRelayTest(unittest.TestCase):
+    """Le relais seul, face à un faux ComfyUI que le test démarre quand le relais demande le réveil (le rôle du worker)."""
+
+    def setUp(self):
+        import subprocess
+        self.dir = Path(tempfile.mkdtemp())
+        self.port, self.backend = free_port(), free_port()
+        self.state = self.dir / 'relay.json'
+        self.fake = None
+        self.proc = subprocess.Popen([sys.executable, '-s', str(RELAY), '--listen', '127.0.0.1', '--port', str(self.port), '--backend',
+                                      str(self.backend), '--state', str(self.state), '--wait', '20'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.until(lambda: self.info().get('state') == 'veille', 'relay up')
+
+    def tearDown(self):
+        self.proc.kill()
+        self.proc.wait()
+        if self.fake:
+            self.fake.close()
+
+    def info(self):
+        try:
+            return json.loads(self.state.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def until(self, fn, what, seconds=15):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.05)
+        self.fail('timeout: %s (%s)' % (what, self.info()))
+
+    def in_thread(self, fn):
+        out = {}
+        t = threading.Thread(target=lambda: out.update(r=fn()), daemon=True)
+        t.start()
+        return t, out
+
+    def test_pure_helpers(self):
+        self.assertEqual(relay_mod.ws_accept('dGhlIHNhbXBsZSBub25jZQ=='), 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 'RFC 6455, 1.3')
+        m, path, h = relay_mod.parse_head(b'GET /ws?clientId=1 HTTP/1.1\r\nHost: x\r\nUpgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\n\r\n')
+        self.assertEqual((m, path), ('GET', '/ws?clientId=1'))
+        self.assertTrue(relay_mod.is_websocket(h))
+        self.assertFalse(relay_mod.is_websocket(relay_mod.parse_head(b'GET /queue HTTP/1.1\r\nHost: x\r\n\r\n')[2]))
+        with self.assertRaises(ValueError):
+            relay_mod.parse_head(b'garbage\r\n\r\n')
+        self.assertEqual(relay_mod.without_header(b'GET / HTTP/1.1\r\nSec-WebSocket-Extensions: permessage-deflate\r\nA: b\r\n\r\n', 'Sec-WebSocket-Extensions'),
+                         b'GET / HTTP/1.1\r\nA: b\r\n\r\n')
+        # Mêmes restrictions qu'avant : la boucle locale, et l'adresse du poste client quand le pare-feu la donne
+        self.assertTrue(relay_mod.peer_allowed('127.0.0.1', {'100.101.102.103'}))
+        self.assertTrue(relay_mod.peer_allowed('100.101.102.103', {'100.101.102.103'}))
+        self.assertFalse(relay_mod.peer_allowed('100.101.102.104', {'100.101.102.103'}))
+        self.assertFalse(relay_mod.peer_allowed('192.168.1.20', {'100.101.102.103'}))
+        self.assertTrue(relay_mod.peer_allowed('::ffff:127.0.0.1', {'100.101.102.103'}))
+        self.assertFalse(relay_mod.peer_allowed('not an ip', set()))
+        with self.assertRaises(SystemExit):
+            relay_mod.main(['--listen', '0.0.0.0', '--port', '1', '--backend', '2', '--state', str(self.dir / 'x.json')])
+
+    def test_a_call_wakes_comfyui_then_is_relayed_and_noted_as_activity(self):
+        t, out = self.in_thread(lambda: http_call(self.port, 'GET', '/object_info'))
+        info = self.until(lambda: self.info().get('state') == 'démarrage' and self.info(), 'wake asked')
+        self.assertIn('GET /object_info (127.0.0.1)', info['wake_cause'])
+        self.assertEqual((info['waiting'], info['wakes']), (1, 1))
+        self.assertIsNone(info['last_activity_at'], 'nothing relayed yet')
+        self.fake = FakeComfy(self.backend)   # le worker démarre ComfyUI
+        t.join(20)
+        self.assertEqual(out['r'][0], 200)
+        self.assertIn(('http', 'GET', '/object_info'), self.fake.events)
+        info = self.until(lambda: self.info().get('state') == 'actif' and self.info().get('last_activity_at') and self.info(), 'active')
+        self.assertGreater(info['last_activity_at'], time.time() - 30)
+        # Déjà réveillé : relayé tout de suite, sans nouveau réveil
+        self.assertEqual(http_call(self.port, 'POST', '/prompt', {'prompt': {}})[1], {'prompt_id': 'p1'})
+        self.assertEqual(self.info()['wakes'], 1)
+        # WebSocket relayé tel quel, dans les deux sens
+        s, key, head = ws_open(self.port)
+        self.assertIn(' 101 ', head)
+        self.assertIn(relay_mod.ws_accept(key), head)
+        self.assertEqual(ws_read(s), (1, b'{"type":"status"}'))
+        s.sendall(ws_frame(b'hello'))
+        self.until(lambda: ('frame', b'hello') in self.fake.events, 'frame relayed')
+        self.until(lambda: self.info().get('ws_open') == 1, 'ws counted', seconds=8)
+        # ComfyUI arrêté (veille) : le WebSocket se ferme, le relais revient en veille
+        self.fake.close()
+        self.fake = None
+        self.assertIsNone(ws_read(s))
+        self.until(lambda: self.info().get('state') == 'veille', 'back to sleep')
+        s.close()
+
+    def test_a_websocket_opened_while_asleep_does_not_wake_and_is_plugged_before_the_call_that_wakes(self):
+        s, key, head = ws_open(self.port)
+        self.assertIn(' 101 ', head, 'handshake done by the relay itself')
+        self.assertIn(relay_mod.ws_accept(key), head)
+        self.assertNotIn('permessage-deflate', head, 'no compression negotiated')
+        s.sendall(ws_frame(b'{"type":"feature_flags"}'))   # envoyé par l'interface à l'ouverture : gardé pour ComfyUI
+        time.sleep(3)
+        info = self.info()
+        self.assertEqual((info['state'], info['wakes'], info['ws_dormant']), ('veille', 0, 1), 'a lone websocket never wakes ComfyUI')
+        t, out = self.in_thread(lambda: http_call(self.port, 'POST', '/prompt', {'prompt': {}, 'client_id': 'abc'}))
+        self.until(lambda: self.info().get('state') == 'démarrage', 'wake asked by the call')
+        self.fake = FakeComfy(self.backend)
+        t.join(20)
+        self.assertEqual(out['r'], (200, {'prompt_id': 'p1'}))
+        kinds = [e[:3] if e[0] == 'http' else e[0] for e in self.fake.events]
+        self.assertLess(kinds.index('ws'), kinds.index(('http', 'POST', '/prompt')), 'websocket plugged before the /prompt that woke ComfyUI: no message lost')
+        ws = [e for e in self.fake.events if e[0] == 'ws'][0]
+        self.assertEqual(ws[1], '/ws?clientId=abc', 'same client id')
+        self.assertNotIn('sec-websocket-extensions', ws[2], 'ComfyUI must not compress: nothing was negotiated with the client')
+        self.assertEqual(ws_read(s), (1, b'{"type":"status"}'), 'messages of ComfyUI reach the client')
+        self.until(lambda: ('frame', b'{"type":"feature_flags"}') in self.fake.events, 'buffered frame delivered')
+        s.close()
+
+    def test_no_comfyui_in_time_gives_503_with_the_reason(self):
+        self.proc.kill()
+        self.proc.wait()
+        import subprocess
+        self.proc = subprocess.Popen([sys.executable, '-s', str(RELAY), '--listen', '127.0.0.1', '--port', str(self.port), '--backend',
+                                      str(self.backend), '--state', str(self.state), '--wait', '1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.until(lambda: self.info().get('pid') == self.proc.pid, 'relay up')
+        code, body = http_call(self.port)
+        self.assertEqual(code, 503)
+        self.assertIn('pas prêt après 1 s', body['error'])
+        self.until(lambda: self.info().get('timeouts') == 1 and self.info().get('state') == 'veille', 'said and back to sleep', seconds=10)
+
+
+class AtelierSleepTest(AtelierBase):
+    """La veille menée par tick() : relais sur le port de l'atelier, ComfyUI démarré par un appel, arrêté sans travail (file
+    relue vide juste avant), réversible par atelier_idle_stop_minutes = 0, journalisé."""
+
+    def setUp(self):
+        super().setUp()
+        self.backend = free_port()
+        self.config.update(atelier_idle_stop_minutes=10, atelier_backend_port=self.backend)
+        self.events = []
+
+    def atelier(self):
+        a = super().atelier()
+        a.notify = lambda what, **d: self.events.append((what, d))
+        return a
+
+    def tick_until(self, a, fn, what, seconds=30):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            a.tick()
+            if fn():
+                return
+            time.sleep(0.1)
+        self.fail('timeout: %s (%s)' % (what, a.describe()))
+
+    def journal(self, what):
+        time.sleep(0.2)   # envoyé au hub dans un fil à part
+        return [d for e, d in self.events if e == what]
+
+    def test_sleep_wake_and_back(self):
+        a = self.atelier()
+        a.tick()
+        d = a.describe()
+        self.assertEqual((d['state'], d['mode'], d['relay'], d['port'], d['listen']), ('en veille', 'relais', 'en veille', self.port, '127.0.0.1'))
+        self.assertEqual(self.runs(), [], 'ComfyUI not started before it is needed')
+        self.assertTrue(alive(a.relay_pid))
+        self.assertGreater(d['relay_ram_mib'] if 'relay_ram_mib' in d else w.process_memory(a.relay_pid)['ws_mib'], 0)
+        self.assertEqual(self.journal('atelier_relay')[0]['action'], 'démarré')
+        # Un appel du poste client : le relais demande le réveil, le worker démarre ComfyUI derrière, la réponse arrive
+        out = {}
+        t = threading.Thread(target=lambda: out.update(r=http_call(self.port, 'GET', '/queue')), daemon=True)
+        t.start()
+        self.tick_until(a, lambda: a.state == 'en marche', 'woken')
+        t.join(20)
+        self.assertEqual(out['r'][0], 200)
+        run = self.runs()[-1]['args']
+        self.assertEqual((run[run.index('--listen') + 1], run[run.index('--port') + 1]), ('127.0.0.1', str(self.backend)),
+                         'behind the relay: loopback only, internal port')
+        d = a.describe()
+        self.assertEqual((d['port'], d['backend_port'], d['state']), (self.port, self.backend, 'en marche'))
+        self.assertIn('appel GET /queue (127.0.0.1)', d['last_wake'])
+        self.assertEqual(self.journal('atelier_wake')[0]['cause'], 'appel GET /queue (127.0.0.1)')
+        self.tick_until(a, lambda: a.describe().get('relay') == 'actif', 'relay sees ComfyUI')
+        a.vram_at = 0
+        a.tick()
+        self.assertGreater(a.describe()['ram_mib'], 0, 'RAM of ComfyUI measured')
+        # Jamais en veille pendant un calcul : la file est relue juste avant
+        self.config['atelier_idle_stop_minutes'] = 0.001
+        (self.lay['data'] / 'busy').write_text('1')
+        a.last_busy = 0
+        a.tick()
+        self.assertEqual(a.state, 'en marche')
+        pid = a.pid
+        (self.lay['data'] / 'busy').unlink()
+        a.tick()   # file vide lue, mais calcul vu à l'instant : le délai repart
+        self.assertEqual(a.pid, pid)
+        time.sleep(0.2)
+        a.relay_info['last_activity_at'] = 0
+        a.tick()
+        self.assertIsNone(a.pid, 'stopped after the idle time, queue read empty')
+        self.assertFalse(alive(pid))
+        self.assertEqual(a.state, 'en veille')
+        self.tick_until(a, lambda: a.describe().get('relay') == 'en veille', 'the relay sees ComfyUI gone')
+        d = a.describe()
+        self.assertEqual((d['state'], d['relay'], d['sleeps']), ('en veille', 'en veille', 1))
+        self.assertIn('Mio de mémoire vive rendus', d['last_sleep'])
+        self.assertTrue(alive(a.relay_pid), 'the relay stays')
+        sleep = self.journal('atelier_sleep')[0]
+        self.assertGreater(sleep['mem_mib'], 0)
+        # Le worker redémarre (mise à jour) : le relais est repris tel quel, ComfyUI reste en veille
+        relay_pid = a.relay_pid
+        b = self.atelier()
+        b.tick()
+        self.assertEqual((b.relay_pid, b.state, b.pid), (relay_pid, 'en veille', None))
+        # Essai upscale du hub : le worker le réveille lui-même
+        self.config['atelier_idle_stop_minutes'] = 10
+        res = {}
+        t = threading.Thread(target=lambda: res.update(ok=b.wake_for('essai upscale', 20)), daemon=True)
+        t.start()
+        self.tick_until(b, lambda: not t.is_alive(), 'woken for the test')
+        self.assertTrue(res['ok'])
+        self.assertIn('essai upscale', b.describe()['last_wake'])
+        # Réparation : le relais tient le Python de l'atelier, il s'arrête aussi
+        self.assertTrue(b.env_in_use())
+        b.hold('environnement refait')
+        self.assertFalse(alive(relay_pid))
+        self.assertFalse(b.env_in_use())
+        b.unhold()
+        b.tick()
+        self.assertTrue(b.relay_pid and alive(b.relay_pid))
+        # Réversible : 0 = ComfyUI toujours en marche, directement sur le port de l'atelier, plus de relais
+        self.config['atelier_idle_stop_minutes'] = 0
+        b.tick()
+        self.assertIsNone(b.relay_pid)
+        self.tick_until(b, lambda: b.state == 'en marche', 'direct again')
+        run = self.runs()[-1]['args']
+        self.assertEqual(run[run.index('--port') + 1], str(self.port))
+        self.assertEqual(b.describe()['mode'], 'direct')
+        self.assertEqual(http_call(self.port)[0], 200)
+        # Et retour à la veille : ComfyUI (pas en calcul) libère le port, le relais le reprend
+        self.config['atelier_idle_stop_minutes'] = 10
+        self.tick_until(b, lambda: b.relay_pid and b.state == 'en veille', 'relay back')
+        self.assertEqual(b.describe()['port'], self.port)
+        out = {}
+        t = threading.Thread(target=lambda: out.update(r=http_call(self.port, 'GET', '/system_stats')), daemon=True)
+        t.start()
+        self.tick_until(b, lambda: not t.is_alive(), 'a call wakes it again')
+        self.assertEqual(out['r'][0], 200)
+        self.assertEqual((b.state, b.port, b.wakes), ('en marche', self.backend, 2))
+
+    def test_no_relay_falls_back_to_comfyui_always_on_never_unreachable(self):
+        a = self.atelier()
+        a.app = Path(tempfile.mkdtemp())   # version sans atelier_relay.py (hub pas à jour)
+        self.tick_until(a, lambda: a.state == 'en marche', 'ComfyUI on directly')
+        run = self.runs()[-1]['args']
+        self.assertEqual(run[run.index('--port') + 1], str(self.port), 'on the workshop port itself, as before')
+        d = a.describe()
+        self.assertEqual(d['mode'], 'direct (repli : relais en échec)')
+        self.assertIn('repli', d['relay_error'])
+        pid = a.pid
+        a.last_busy = 0   # sans calcul depuis toujours
+        a.tick()
+        self.assertEqual((a.state, a.pid), ('en marche', pid), 'never put to sleep without a relay to wake it')
+        self.assertEqual(self.journal('atelier_relay')[0]['action'], 'échec')
+        # Réglage changé : le relais est retenté ; toujours en échec, ComfyUI repart sur le port de l'atelier
+        self.config['atelier_idle_stop_minutes'] = 5
+        self.tick_until(a, lambda: a.state == 'en marche' and a.pid != pid, 'retried, then direct again')
+        self.assertEqual(len(self.journal('atelier_relay')), 2)
+
+    def test_switched_off_stops_relay_and_comfyui(self):
+        a = self.atelier()
+        a.tick()
+        relay_pid = a.relay_pid
+        self.config['atelier_enabled'] = False
+        a.tick()
+        self.assertFalse(alive(relay_pid))
+        d = a.describe()
+        self.assertEqual((d['state'], d.get('mode'), d.get('relay'), d.get('pid')), ('éteint', None, None, None), 'switched off: nothing about the sleep')
+
+    def test_process_memory(self):
+        m = w.process_memory(os.getpid())
+        self.assertGreater(m['ws_mib'], 0)
+        self.assertEqual(w.process_memory(2 ** 22 + 7), {})
 
 
 class AtelierCardTest(AtelierBase):

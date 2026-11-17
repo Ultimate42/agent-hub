@@ -347,7 +347,10 @@ function announcedAtelierTask(w, name, now) {
 /** What a worker says about its ComfyUI workshop (info.atelier): flat object, known keys, short scalars only. */
 const ATELIER_KEYS = ['enabled', 'state', 'pid', 'port', 'listen', 'listening', 'tailscale_ip', 'firewall', 'allowed_from', 'busy', 'queue',
   'vram_free_mib', 'vram_total_mib', 'vram_atelier_mib', 'device', 'freed', 'manager', 'started_at', 'files_gb', 'error', 'note', 'port_taken_by',
-  'task', 'tasks', 'unresponsive_s', 'log'];
+  'task', 'tasks', 'unresponsive_s', 'log',
+  // sleep: mode (relais|direct), relay state (en veille, en démarrage, actif), RAM measured, last wake and sleep
+  'mode', 'idle_stop_minutes', 'relay', 'relay_pid', 'relay_error', 'backend_port', 'ram_mib', 'ram_private_mib', 'relay_ram_mib',
+  'ws_open', 'wakes', 'sleeps', 'last_wake', 'last_sleep', 'asleep_since'];
 function cleanAtelier(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return undefined;
   const out = {};
@@ -583,7 +586,8 @@ export function getAtelier(name, now = Date.now()) {
     const s = workerSettings(name);
     return {
       ok: true, worker: name,
-      settings: Object.fromEntries(['atelier_enabled', 'atelier_window_only', 'atelier_idle_free_s', 'atelier_keep_days', 'atelier_files_max_gb']
+      settings: Object.fromEntries(['atelier_enabled', 'atelier_window_only', 'atelier_idle_free_s', 'atelier_keep_days', 'atelier_files_max_gb',
+        'atelier_idle_stop_minutes']
         .map(k => [k, s[k] ?? null])),
       online: Boolean(w?.last_poll_at) && now - w.last_poll_at < 90 * 1000,
       age_s: w?.last_poll_at ? Math.round((now - w.last_poll_at) / 1000) : null,
