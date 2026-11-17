@@ -198,8 +198,11 @@ class Relay:
             self.flush(force=True)
 
     def touch(self):
-        self.last_activity = time.time()
+        t, last = time.time(), self.last_activity
+        self.last_activity = t
         self.dirty = True
+        if last is None or t - last >= FLUSH_S:   # reprise après un silence : dite tout de suite, le worker allait peut-être
+            self.flush(force=True)                 # mettre ComfyUI en veille sur une activité vieille de 5 s
 
     # ---- sonde : ComfyUI répond-il ? ----
     def probe(self, full):
@@ -277,11 +280,19 @@ class Relay:
         socks = []
         for host in self.listen:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            if os.name == 'nt':   # personne d'autre ne peut se lier au même port pendant que le relais l'occupe
-                s.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_EXCLUSIVEADDRUSE', -5), 1)
-            else:
+            # Windows : options par défaut, comme ComfyUI avant lui (adresse précise déjà tenue : refusée aux autres). Jamais
+            # SO_EXCLUSIVEADDRUSE : un relais relancé (code, pare-feu, réglage) ne pourrait plus se lier au port tant que les
+            # connexions acceptées par le précédent ne sont pas éteintes (doc Microsoft), et l'atelier passerait en repli.
+            if os.name != 'nt':
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((host, self.port))
+            for left in range(20, -1, -1):   # le précédent (relais ou ComfyUI) finit de se fermer : quelques secondes
+                try:
+                    s.bind((host, self.port))
+                    break
+                except OSError:
+                    if not left:
+                        raise
+                    time.sleep(0.5)
             s.listen(64)
             socks.append(s)
         threading.Thread(target=self.watch, name='sonde', daemon=True).start()
@@ -342,6 +353,10 @@ class Relay:
             return self.keep_dormant(sock, data, headers)
         cause = '%s %s (%s)' % (method, target.split('?')[0][:120], peer)
         for _ in range(3):   # ComfyUI arrêté entre la sonde et la connexion : réveil, puis nouvel essai
+            if ws and not self.ready.is_set():
+                # ComfyUI vient d'être mis en veille (la sonde ne l'a pas encore vu) : l'onglet qui rouvre /ws 300 ms après
+                # la coupure est gardé, comme pendant la veille ; sinon il le réveillerait à chaque mise en veille
+                return self.keep_dormant(sock, data, headers)
             if not self.wait_ready(cause):
                 self.timeouts += 1
                 self.dirty = True

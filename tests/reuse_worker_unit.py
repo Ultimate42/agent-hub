@@ -144,9 +144,12 @@ class ArchiveTest(unittest.TestCase):
         src.write_bytes(b'payload')
         good = w.sha256_file(src)
         self.assertEqual(w.download(src.as_uri(), d / 'ok.bin', good, 'test').read_bytes(), b'payload')
-        w.time.sleep = lambda s: None   # pas d'attente entre les essais dans ce test
-        with self.assertRaises(RuntimeError):
-            w.download(src.as_uri(), d / 'ko.bin', '0' * 64, 'test')
+        sleep, w.time.sleep = w.time.sleep, lambda s: None   # pas d'attente entre les essais dans ce test (seulement lui :
+        try:                                                # time est partagé, les tests suivants mesurent des durées)
+            with self.assertRaises(RuntimeError):
+                w.download(src.as_uri(), d / 'ko.bin', '0' * 64, 'test')
+        finally:
+            w.time.sleep = sleep
         self.assertFalse((d / 'ko.bin').exists())
 
 
@@ -1778,6 +1781,10 @@ class FakeComfy:
 
     def close(self):
         import socket
+        try:   # sinon le fil bloqué dans accept() garde le port ouvert (Linux) : ComfyUI arrêté répondrait encore
+            self.srv.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.srv.close()
         for c in self.conns:
             try:
@@ -1901,6 +1908,35 @@ class AtelierRelayTest(unittest.TestCase):
         self.until(lambda: ('frame', b'{"type":"feature_flags"}') in self.fake.events, 'buffered frame delivered')
         s.close()
 
+    def test_tab_reconnecting_right_after_the_sleep_does_not_wake_comfyui(self):
+        """ComfyUI mis en veille : l'onglet oublié rouvre /ws 300 ms après la coupure, avant que la sonde (2 s) ait vu
+        ComfyUI parti. Gardé comme pendant la veille, jamais un réveil (sinon : réveil à chaque mise en veille, sans fin)."""
+        self.fake = FakeComfy(self.backend)
+        self.until(lambda: self.info().get('state') == 'actif', 'relay sees ComfyUI')
+        s, _, head = ws_open(self.port)
+        self.assertIn(' 101 ', head)
+        self.assertEqual(ws_read(s), (1, b'{"type":"status"}'), 'relayed to ComfyUI')
+        self.fake.close()   # mise en veille : ComfyUI arrêté, ses connexions coupées
+        self.fake = None
+        self.assertIsNone(ws_read(s), 'tab cut with ComfyUI')
+        s.close()
+        time.sleep(0.3)
+        s, _, head = ws_open(self.port)
+        self.assertIn(' 101 ', head, 'handshake done by the relay itself')
+        self.until(lambda: self.info().get('ws_dormant') == 1, 'kept asleep')
+        time.sleep(2.5)
+        info = self.info()
+        self.assertEqual((info['wakes'], info['state'], info['waiting']), (0, 'veille', 0), 'no wake for a reconnecting tab (%s)' % info)
+        s.close()
+
+    def test_activity_after_a_silence_is_written_at_once(self):
+        """Le worker décide la veille sur relay.json : la première activité après un silence y est tout de suite."""
+        self.fake = FakeComfy(self.backend)
+        self.until(lambda: self.info().get('state') == 'actif', 'relay sees ComfyUI')
+        t0 = time.time()
+        self.assertEqual(http_call(self.port)[0], 200)
+        self.until(lambda: (self.info().get('last_activity_at') or 0) >= t0, 'activity written', seconds=1)
+
     def test_no_comfyui_in_time_gives_503_with_the_reason(self):
         self.proc.kill()
         self.proc.wait()
@@ -1970,7 +2006,7 @@ class AtelierSleepTest(AtelierBase):
         a.tick()
         self.assertGreater(a.describe()['ram_mib'], 0, 'RAM of ComfyUI measured')
         # Jamais en veille pendant un calcul : la file est relue juste avant
-        self.config['atelier_idle_stop_minutes'] = 0.001
+        self.config['atelier_idle_stop_minutes'] = 0.03   # 1,8 s : un tour chargé (tests en parallèle) dure plus de 60 ms
         (self.lay['data'] / 'busy').write_text('1')
         a.last_busy = 0
         a.tick()
@@ -1979,8 +2015,7 @@ class AtelierSleepTest(AtelierBase):
         (self.lay['data'] / 'busy').unlink()
         a.tick()   # file vide lue, mais calcul vu à l'instant : le délai repart
         self.assertEqual(a.pid, pid)
-        time.sleep(0.2)
-        a.relay_info['last_activity_at'] = 0
+        time.sleep(2)
         a.tick()
         self.assertIsNone(a.pid, 'stopped after the idle time, queue read empty')
         self.assertFalse(alive(pid))

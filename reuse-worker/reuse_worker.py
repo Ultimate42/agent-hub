@@ -4543,7 +4543,9 @@ class Atelier:
             return None
 
     def read_relay(self, lay):
-        info = read_json(lay['relay_state'], {}) or {}
+        info = read_json(lay['relay_state'])
+        if info is None and self.relay_info.get('pid') == self.relay_pid:
+            return self.relay_info   # lecture ratée (Windows : fichier remplacé à cet instant) : la dernière reste, jamais « rien »
         self.relay_info = info if isinstance(info, dict) and info.get('pid') == self.relay_pid else {}
         return self.relay_info
 
@@ -4714,6 +4716,12 @@ class Atelier:
             return False   # sans relais en marche, personne ne pourrait le réveiller
         self.poll()
         if self.busy_flag or self.queue_errors or self.queue != (0, 0):
+            return False
+        try:   # état du relais relu après la file : un appel arrivé depuis le début du tour garde ComfyUI en marche
+            self.read_relay(atelier_layout(self.base, self.spec()))
+        except RuntimeError:
+            return False
+        if (self.relay_info.get('waiting') or 0) > 0 or self.idle_for(time.time()) < self.idle_stop_s():
             return False
         mem = process_memory(self.pid) or self.mem
         idle = self.idle_for(now)
