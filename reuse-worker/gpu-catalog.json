@@ -88,6 +88,7 @@
                  "--disable-comfy-compiler", "--preview-method", "auto", "--log-stdout",
                  "--base-directory", "{base}", "--extra-model-paths-config", "{extra}"],
         "manager_args": ["--enable-manager"],
+        "manager_config": { "security_level": "strong", "network_mode": "offline" },
         "env": { "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "MIOPEN_FIND_MODE": "2", "DO_NOT_TRACK": "1",
                  "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True", "PYTORCH_ALLOC_CONF": "expandable_segments:True" }
       },

@@ -1855,6 +1855,58 @@ class AtelierRelayTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             relay_mod.main(['--listen', '0.0.0.0', '--port', '1', '--backend', '2', '--state', str(self.dir / 'x.json')])
 
+    def test_waiting_call_gets_a_sign_of_life_and_a_gone_client_is_dropped(self):
+        """ComfyUI à froid : 3 minutes sans un octet et le client coupe (mesure du 17/11). Le relais envoie « 100 Continue » (sauté
+        par les clients HTTP/1.1) ; la réponse finale arrive ensuite, intacte ; un client parti n'est plus compté comme attendant."""
+        import socket
+        import subprocess
+        proc = subprocess.Popen([sys.executable, '-s', str(RELAY), '--listen', '127.0.0.1', '--port', str(free_port()),
+                                 '--backend', str(self.backend), '--state', str(self.dir / 'hb.json'), '--wait', '30', '--heartbeat', '0.3'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            hb_port = int(proc.args[proc.args.index('--port') + 1])
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    socket.create_connection(('127.0.0.1', hb_port), timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            s = socket.create_connection(('127.0.0.1', hb_port), timeout=10)
+            s.sendall(b'GET /queue HTTP/1.1\r\nHost: x\r\n\r\n')
+            got = b''
+            s.settimeout(5)
+            while got.count(b'100 Continue') < 2:
+                got += s.recv(4096)
+            self.assertTrue(got.startswith(b'HTTP/1.1 100 Continue\r\n\r\n'))
+            # HTTP/1.0 : jamais de réponse 1xx
+            s10 = socket.create_connection(('127.0.0.1', hb_port), timeout=10)
+            s10.sendall(b'GET /queue HTTP/1.0\r\n\r\n')
+            s10.settimeout(1.2)
+            with self.assertRaises(socket.timeout):
+                s10.recv(100)
+            s10.close()
+            s.close()   # le client raccroche : à la prochaine pulsation le relais retire son attente
+            def waiting():
+                try:
+                    return json.loads((self.dir / 'hb.json').read_text()).get('waiting')
+                except (OSError, ValueError):
+                    return None
+            self.until(lambda: waiting() == 0, 'gone client no longer counted as waiting')
+            # Et la vraie réponse arrive après les signes de vie, pour un client qui reste
+            import http.client
+            fake = FakeComfy(self.backend)
+            try:
+                c = http.client.HTTPConnection('127.0.0.1', hb_port, timeout=10)
+                c.request('GET', '/queue')
+                self.assertEqual(c.getresponse().status, 200)
+                c.close()
+            finally:
+                fake.close()
+        finally:
+            proc.kill()
+            proc.wait()
+
     def test_a_call_wakes_comfyui_then_is_relayed_and_noted_as_activity(self):
         t, out = self.in_thread(lambda: http_call(self.port, 'GET', '/object_info'))
         info = self.until(lambda: self.info().get('state') == 'démarrage' and self.info(), 'wake asked')
@@ -1950,6 +2002,46 @@ class AtelierRelayTest(unittest.TestCase):
         self.until(lambda: self.info().get('timeouts') == 1 and self.info().get('state') == 'veille', 'said and back to sleep', seconds=10)
 
 
+class AtelierManagerConfigTest(unittest.TestCase):
+    """Réglage sûr de ComfyUI-Manager (config.ini) et lecture des temps de démarrage de ComfyUI."""
+
+    def test_catalog_asks_for_strong_and_offline_and_only_known_values_pass(self):
+        cat = json.loads((Path(w.__file__).resolve().parent / 'gpu-catalog.json').read_text(encoding='utf-8'))
+        spec = cat['benchmarks']['comfyui']['atelier']
+        self.assertEqual(w.manager_wanted(spec, {}), {'security_level': 'strong', 'network_mode': 'offline'})
+        self.assertEqual(w.manager_wanted(spec, {'atelier_manager_config': {'security_level': 'Normal', 'network_mode': 'bogus', 'x': 'y'}}),
+                         {'security_level': 'normal', 'network_mode': 'offline'}, 'override by the worker config; unknown values/keys ignored')
+
+    def test_config_ini_is_merged_backed_up_once_and_idempotent(self):
+        d = Path(tempfile.mkdtemp()) / 'user' / '__manager'
+        path = d / 'config.ini'
+        self.assertEqual(w.write_manager_config(path, {'security_level': 'strong'}), {'security_level': (None, 'strong')}, 'no file yet')
+        self.assertFalse((d / 'config.ini.bak-worker').exists(), 'nothing to back up')
+        path.write_text('[default]\nsecurity_level = weak\nuse_uv = True\nShare_Option = all\n', encoding='utf-8')
+        self.assertEqual(w.write_manager_config(path, {'security_level': 'strong', 'network_mode': 'offline'}),
+                         {'security_level': ('weak', 'strong'), 'network_mode': (None, 'offline')})
+        text = path.read_text(encoding='utf-8')
+        self.assertIn('use_uv = True', text)
+        self.assertIn('Share_Option = all', text, 'other keys kept as they were')
+        self.assertIn('security_level = weak', (d / 'config.ini.bak-worker').read_text(encoding='utf-8'), 'original saved')
+        self.assertEqual(w.write_manager_config(path, {'security_level': 'strong', 'network_mode': 'offline'}), {}, 'already set: untouched')
+        w.write_manager_config(path, {'security_level': 'normal'})
+        self.assertIn('security_level = weak', (d / 'config.ini.bak-worker').read_text(encoding='utf-8'), 'backup never overwritten')
+        # Ce que Manager 4.2.2 en lira : mêmes clés, même section
+        import configparser
+        cp = configparser.ConfigParser(strict=False)
+        cp.read(str(path), encoding='utf-8')
+        self.assertEqual((cp['default']['security_level'], cp['default']['network_mode']), ('normal', 'offline'))
+
+    def test_startup_times_lists_the_slowest_nodes(self):
+        log = Path(tempfile.mkdtemp()) / 'atelier.log'
+        log.write_text('Prestartup times for custom nodes:\n[INFO]    4.2 seconds: C:\\ReuseWorker\\atelier\\src\\custom_nodes\\comfyui-manager\n'
+                       'Import times for custom nodes:\n[INFO]    0.2 seconds: C:\\x\\ComfyUI_LC_MaskMaker_nodes\n'
+                       '[INFO]   31.5 seconds (IMPORT FAILED): C:\\x\\heavy_pack\n', encoding='utf-8')
+        self.assertEqual(w.startup_times(log), ['heavy_pack 31.5 s', 'comfyui-manager 4.2 s'], 'under 0.5 s is noise')
+        self.assertEqual(w.startup_times(log.with_name('absent.log')), [])
+
+
 class AtelierSleepTest(AtelierBase):
     """La veille menée par tick() : relais sur le port de l'atelier, ComfyUI démarré par un appel, arrêté sans travail (file
     relue vide juste avant), réversible par atelier_idle_stop_minutes = 0, journalisé."""
@@ -2001,6 +2093,10 @@ class AtelierSleepTest(AtelierBase):
         self.assertEqual((d['port'], d['backend_port'], d['state']), (self.port, self.backend, 'en marche'))
         self.assertIn('appel GET /queue (127.0.0.1)', d['last_wake'])
         self.assertEqual(self.journal('atelier_wake')[0]['cause'], 'appel GET /queue (127.0.0.1)')
+        self.assertIn('prêt', a.describe()['wake_phases'], 'where the time of the start went, said to the hub')
+        self.assertIn('depuis le lancement de ComfyUI', self.journal('atelier_wake')[0]['phases'])
+        self.assertEqual(a.describe()['relay'] in ('actif', 'en démarrage'), True)
+        self.assertNotEqual(a.describe()['relay'], 'en démarrage', 'ComfyUI answers: never the stale relay label')
         self.tick_until(a, lambda: a.describe().get('relay') == 'actif', 'relay sees ComfyUI')
         a.vram_at = 0
         a.tick()

@@ -11,6 +11,10 @@ Ce qu'il fait :
 - un WebSocket ouvert pendant que ComfyUI dort ne le réveille pas (un onglet oublié se reconnecte sans fin) : le relais
   accepte la poignée de main lui-même et garde la connexion ; au réveil (premier appel HTTP), il la branche sur ComfyUI
   AVANT de relayer cet appel, pour que les messages d'un /prompt ne se perdent pas ;
+- un appel HTTP/1.1 qui attend le réveil (ComfyUI à froid : jusqu'à plusieurs minutes) ne reste pas sans un octet : toutes les
+  HEARTBEAT_S secondes le relais envoie « 100 Continue » (réponse intermédiaire, que le client doit sauter, RFC 9110 §15.2), ce qui
+  relance le délai « aucune donnée reçue » des clients. Un client parti est vu à cet envoi : son attente est retirée (le worker ne
+  croit plus qu'un appel attend) ;
 - il note la dernière activité HTTP (octets dans un sens ou l'autre) : le worker ne met ComfyUI en veille qu'après
   atelier_idle_stop_minutes sans activité ni calcul, file /queue lue vide.
 
@@ -18,7 +22,7 @@ Ce qu'il ne fait pas : démarrer ou arrêter ComfyUI (le worker le fait : carte,
 ailleurs que sur les adresses données (jamais 0.0.0.0). Seulement la bibliothèque standard : quelques Mo de mémoire.
 
 Lancé par le worker : python -s atelier_relay.py --listen 127.0.0.1,100.x.y.z --port 8188 --backend 8189
-                      --state <atelier>/relay.json [--allow 100.a.b.c] [--wait 300]
+                      --state <atelier>/relay.json [--allow 100.a.b.c] [--wait 300] [--heartbeat 10]
 """
 import argparse
 import base64
@@ -39,6 +43,8 @@ DORMANT_MAX = 16            # WebSockets gardés pendant la veille, au plus
 DORMANT_BUFFER = 64 * 1024  # octets envoyés par un WebSocket gardé, relayés au réveil
 ATTACH_WAIT_S = 10          # au réveil, branchement des WebSockets gardés avant de relayer le premier appel
 FLUSH_S = 5                 # dernière activité écrite au plus toutes les 5 s
+HEARTBEAT_S = 10            # un appel HTTP qui attend le réveil reçoit un signe de vie toutes les 10 s (0 : aucun)
+INTERIM = b'HTTP/1.1 100 Continue\r\n\r\n'   # le seul « 1xx » que tous les clients HTTP/1.1 courants sautent (http.client, undici, aiohttp, Go, curl)
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 LOOPBACK = ipaddress.ip_network('127.0.0.0/8')
 try:   # empreinte de ce fichier : le worker relance un relais repris d'une version précédente (quand l'atelier ne calcule pas)
@@ -103,6 +109,29 @@ def answer(sock, code, reason, body):
         pass
 
 
+def client_gone(sock):
+    """Le client a-t-il fermé sa connexion ? (lecture sans consommer : octet en attente = pas parti)"""
+    try:
+        ready, _, _ = select.select([sock], [], [], 0)
+        return bool(ready) and sock.recv(1, socket.MSG_PEEK) == b''
+    except OSError:
+        return True
+
+
+def send_interim(sock, http11=True):
+    """Pulsation d'un appel qui attend : signe de vie à un client HTTP/1.1 (jamais à un autre : pas de 1xx en HTTP/1.0).
+    -> False si le client n'est plus là."""
+    if client_gone(sock):
+        return False
+    if not http11:
+        return True
+    try:
+        sock.sendall(INTERIM)
+        return True
+    except OSError:
+        return False
+
+
 def splice(a, b, on_bytes=None, first=b''):
     """Relaie dans les deux sens jusqu'à ce qu'un côté ferme (ou une erreur), puis ferme les deux. first : déjà lu de a,
     à envoyer à b d'abord."""
@@ -130,8 +159,9 @@ def splice(a, b, on_bytes=None, first=b''):
 
 
 class Relay:
-    def __init__(self, listen, port, backend, state_path, allow=(), wait_s=300.0, probe_s=2.0):
+    def __init__(self, listen, port, backend, state_path, allow=(), wait_s=300.0, probe_s=2.0, heartbeat_s=HEARTBEAT_S):
         self.listen, self.port, self.backend = listen, port, backend
+        self.heartbeat_s = heartbeat_s
         self.state_path, self.allow, self.wait_s, self.probe_s = state_path, set(allow), wait_s, probe_s
         self.allow_list = list(allow)
         self.lock = threading.Lock()
@@ -255,8 +285,10 @@ class Relay:
         for d in todo:
             d.attached.wait(max(0.0, deadline - time.time()))
 
-    def wait_ready(self, cause):
-        """Un appel attend ComfyUI : demande de réveil (dite au worker par le fichier d'état), attente au plus wait_s."""
+    def wait_ready(self, cause, beat=None):
+        """Un appel attend ComfyUI : demande de réveil (dite au worker par le fichier d'état), attente au plus wait_s.
+        beat : appelé toutes les heartbeat_s secondes d'attente (signe de vie au client) ; il rend False quand le client est parti.
+        -> True (prêt), False (délai dépassé) ou None (client parti)."""
         if self.ready.is_set():
             return True
         with self.lock:
@@ -266,7 +298,16 @@ class Relay:
             self.dirty = True
         self.kick.set()
         try:
-            return self.ready.wait(self.wait_s)
+            deadline = time.time() + self.wait_s
+            step = (self.heartbeat_s if self.heartbeat_s > 0 else 5.0) if beat else None   # heartbeat 0 : plus de 1xx, mais un client parti reste vu
+            while True:
+                left = deadline - time.time()
+                if left <= 0:
+                    return self.ready.is_set()
+                if self.ready.wait(min(left, step) if step else left):
+                    return True
+                if step and not beat():
+                    return None
         finally:
             with self.lock:
                 self.waiters -= 1
@@ -344,6 +385,7 @@ class Relay:
                 sock.close()
                 return
             method, target, headers = parse_head(data)
+            version = data.split(b'\r\n', 1)[0].rsplit(b' ', 1)[-1].decode('latin-1')
         except (OSError, ValueError):
             sock.close()
             return
@@ -357,7 +399,11 @@ class Relay:
                 # ComfyUI vient d'être mis en veille (la sonde ne l'a pas encore vu) : l'onglet qui rouvre /ws 300 ms après
                 # la coupure est gardé, comme pendant la veille ; sinon il le réveillerait à chaque mise en veille
                 return self.keep_dormant(sock, data, headers)
-            if not self.wait_ready(cause):
+            ok = self.wait_ready(cause, beat=None if ws else (lambda: send_interim(sock, version == 'HTTP/1.1' and self.heartbeat_s > 0)))
+            if ok is None:   # le client a raccroché pendant l'attente
+                sock.close()
+                return
+            if not ok:
                 self.timeouts += 1
                 self.dirty = True
                 return answer(sock, 503, 'Service Unavailable', {
@@ -482,6 +528,7 @@ def main(argv=None):
     p.add_argument('--state', required=True, help='fichier d\'état lu par le worker')
     p.add_argument('--allow', default='', help='adresses distantes permises en plus de la boucle locale (vide : toutes)')
     p.add_argument('--wait', type=float, default=300.0, help='attente au plus d\'un ComfyUI prêt, en secondes')
+    p.add_argument('--heartbeat', type=float, default=HEARTBEAT_S, help='secondes entre deux signes de vie à un appel HTTP qui attend (0 : aucun)')
     a = p.parse_args(argv)
     listen = [h.strip() for h in a.listen.split(',') if h.strip()]
     for h in listen:
@@ -490,7 +537,7 @@ def main(argv=None):
             sys.exit('adresse d\'écoute refusée : %s' % h)
     if a.backend == a.port:
         sys.exit('le port de ComfyUI doit différer de celui du relais')
-    relay = Relay(listen, a.port, a.backend, a.state, [x.strip() for x in a.allow.split(',') if x.strip()], a.wait)
+    relay = Relay(listen, a.port, a.backend, a.state, [x.strip() for x in a.allow.split(',') if x.strip()], a.wait, heartbeat_s=a.heartbeat)
     print('Relais de l\'atelier : %s port %d -> 127.0.0.1:%d (pid %d)' % (','.join(listen), a.port, a.backend, os.getpid()), flush=True)
     relay.serve()
 

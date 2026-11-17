@@ -568,6 +568,7 @@ Seulement dans `reuse-worker.config.json` du PC :
 - `atelier_listen_ip` (adresse imposée, jamais 0.0.0.0) ;
 - `atelier_require_firewall: false` (à éviter) ;
 - `atelier_manager: false` ;
+- `atelier_manager_config` (`{"security_level": "strong|normal-|normal|weak", "network_mode": "offline|private|public"}`, par-dessus le catalogue) ;
 - `atelier_cors_origin`.
 
 **Pare-feu : la commande à coller une fois sur le PC GPU** (PowerShell en administrateur)
@@ -689,8 +690,22 @@ curl -H "$A" $T ; curl -H "$A" $T/12 ; curl -H "$A" -X POST $T/12/cancel
 - `Get-NetFirewallRule` est lisible sans droits administrateur.
 - Les liens physiques fonctionnent sur ce disque NTFS. Sinon, l'environnement est copié, avec 5,5 Go et un contrôle de
   place.
-- ComfyUI-Manager accepte des installations quand l'écoute n'est pas seulement locale. Sinon, son niveau de sécurité est
-  à régler dans `atelier\data\user\__manager\config.ini`. Les tâches du hub, elles, ne passent pas par lui.
+- **Sécurité de ComfyUI-Manager** (17/11). Manager décide « local ou distant » avec `--listen` (4.2.2 :
+  `is_loopback(args.listen)`, `manager_server.py`) : derrière le relais, ComfyUI écoute 127.0.0.1, donc toute action venue du
+  poste client passe pour locale (et son compteur de clients distants ne voit que le relais). Au niveau par défaut `normal`, les
+  actions « middle » (installer ou retirer un nœud du registre, mettre à jour, installer un modèle) sont alors permises à
+  qui joint le port 8188 ; seules les « high » (URL git, pip libre) restent refusées. Le worker pose donc, avant chaque
+  démarrage, dans `atelier\data\user\__manager\config.ini` (section `[default]`, autres clés conservées, original copié
+  une fois dans `config.ini.bak-worker`) : `security_level = strong` (aucune installation ni mise à jour par Manager : tout
+  passe par les tâches du hub, journalisées et annulables) et `network_mode = offline` (pas de téléchargement des listes
+  du registre à chaque démarrage ; Manager lit son cache). Réversible : `atelier_manager_config` dans
+  `reuse-worker.config.json`, par exemple `{"security_level": "normal"}`, ou `"atelier_manager": false` pour ne pas lancer
+  Manager. Journal : `atelier_relay` (action `réglage Manager`) ; état : `manager_config`.
+- **Démarrage à froid** : `wake_phases` (état) et `phases` / `slow_nodes` (événement `atelier_wake`) disent où va le temps :
+  préparation, puis secondes depuis le lancement de ComfyUI jusqu'au `prestartup` de Manager, à PyTorch (`Total VRAM`), à
+  l'import des nœuds, au serveur, et enfin « prêt ». Le journal complet reste sur le PC (`atelier\logs\atelier.log`).
+- **Appel qui attend le réveil** : le relais envoie « 100 Continue » toutes les 10 s à un client HTTP/1.1 (jamais en HTTP/1.0, ni
+  sur un WebSocket) pour qu'il ne reste pas sans octet ; un client parti est retiré de la liste des appels en attente.
 
 ## Côté hub
 

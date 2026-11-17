@@ -350,7 +350,7 @@ const ATELIER_KEYS = ['enabled', 'state', 'pid', 'port', 'listen', 'listening', 
   'task', 'tasks', 'unresponsive_s', 'log',
   // sleep: mode (relais|direct), relay state (en veille, en démarrage, actif), RAM measured, last wake and sleep
   'mode', 'idle_stop_minutes', 'relay', 'relay_pid', 'relay_error', 'backend_port', 'ram_mib', 'ram_private_mib', 'relay_ram_mib',
-  'ws_open', 'wakes', 'sleeps', 'last_wake', 'last_sleep', 'asleep_since'];
+  'ws_open', 'wakes', 'sleeps', 'last_wake', 'wake_phases', 'manager_config', 'last_sleep', 'asleep_since'];
 function cleanAtelier(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return undefined;
   const out = {};

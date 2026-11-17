@@ -3850,6 +3850,66 @@ def atelier_extra_paths(models_dir):
     return '\n'.join(lines) + '\n'
 
 
+MANAGER_CONFIG_ALLOWED = {'security_level': ('strong', 'normal-', 'normal', 'weak'), 'network_mode': ('offline', 'private', 'public')}
+STARTUP_MARKS = (('prestartup', 'Prestartup times for custom nodes'), ('torch', 'Total VRAM'), ('nodes', 'Import times for custom nodes'),
+                 ('server', 'To see the GUI'))   # lignes de ComfyUI, dans l'ordre : où va le temps d'un démarrage à froid
+
+
+def startup_times(logf, limit=6):
+    """Les nœuds les plus lents de « Prestartup times » / « Import times » (lignes « 3.2 seconds: chemin ») du journal de ComfyUI."""
+    try:
+        with open(logf, 'rb') as f:
+            text = f.read(400000).decode('utf-8', 'replace')
+    except OSError:
+        return []
+    found = []
+    for m in re.finditer(r'^\s*(?:\[\w+\]\s*)?\s*([0-9]+(?:\.[0-9]+)?) seconds(?: \(IMPORT FAILED\))?: (.+)$', text, re.M):
+        found.append((float(m.group(1)), re.split(r'[\\/]', m.group(2).strip())[-1][:60]))
+    return ['%s %s s' % (n, ('%.1f' % t).rstrip('0').rstrip('.')) for t, n in sorted(found, reverse=True)[:limit] if t >= 0.5]
+
+
+def manager_wanted(spec_atelier, config):
+    """Réglage de ComfyUI-Manager voulu : celui du catalogue (manager_config), surchargé par atelier_manager_config du worker
+    (valeurs connues seulement : une inconnue est ignorée). Une clé absente des deux : celle de Manager, inchangée."""
+    want = {}
+    for src in (spec_atelier.get('manager_config'), config.get('atelier_manager_config')):
+        if isinstance(src, dict):
+            for k, v in src.items():
+                if k in MANAGER_CONFIG_ALLOWED and isinstance(v, str) and v.lower() in MANAGER_CONFIG_ALLOWED[k]:
+                    want[k] = v.lower()
+    return want
+
+
+def write_manager_config(path, want):
+    """Pose want dans la section [default] de config.ini de ComfyUI-Manager (les autres clés restent), avec une copie de
+    l'original (config.ini.bak-worker, une seule fois) : réversible en la remettant, ou en retirant la clé du catalogue.
+    -> {clé: (avant, après)} de ce qui a changé."""
+    import configparser
+    cp = configparser.ConfigParser(strict=False, interpolation=None)
+    cp.optionxform = str   # Manager lit ses clés en minuscules ; celles qu'on ne connaît pas gardent leur casse
+    existed = path.exists()
+    if existed:
+        cp.read(str(path), encoding='utf-8')
+    if not cp.has_section('default'):
+        cp.add_section('default')
+    changed = {}
+    for k, v in want.items():
+        before = cp.get('default', k, fallback=None)
+        if (before or '').strip().lower() != v:
+            cp.set('default', k, v)
+            changed[k] = (before, v)
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        bak = path.with_name(path.name + '.bak-worker')
+        if existed and not bak.exists():
+            shutil.copyfile(path, bak)
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            cp.write(f)
+        os.replace(tmp, path)
+    return changed
+
+
 def atelier_args(spec, atelier, port, listen, data, extra, manager):
     args = build_command(atelier['args'], {'port': port, 'listen': listen, 'base': str(data), 'extra': str(extra)})
     if manager:
@@ -4108,6 +4168,9 @@ class Atelier:
         self.wakes = 0
         self.sleeps = 0
         self.last_wake = None
+        self.wake_phases = None         # où est allé le temps du dernier démarrage (journal de ComfyUI)
+        self.startup_nodes = []
+        self.manager_cfg = None         # réglage de ComfyUI-Manager posé (security_level, network_mode)
         self.last_sleep = None
         self.asleep_since = None
         self.notify = None              # notify(what, **detail) : journal du worker sur le hub (Worker.journal)
@@ -4416,6 +4479,8 @@ class Atelier:
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
         for d in ('custom_nodes', 'input', 'output', 'user'):   # ComfyUI (prestartup du Manager) liste custom_nodes avant de le créer
             (lay['data'] / d).mkdir(parents=True, exist_ok=True)
+        if manager:
+            self.set_manager_config(lay, atelier)
         logf = lay['logs'] / 'atelier.log'
         if logf.exists():
             os.replace(logf, lay['logs'] / 'atelier.previous.log')
@@ -4429,6 +4494,7 @@ class Atelier:
         write_json(lay['state'], {'pid': self.pid, 'port': port, 'listen': listen, 'started_at': self.started_at,
                                   'hip_device': env.get('HIP_VISIBLE_DEVICES')})
         self.state = 'démarrage'
+        t_spawn, marks = time.time(), {}
         log.info('Atelier ComfyUI lancé (pid %d) : %s port %d%s.', self.pid, listen, port, ', avec ComfyUI-Manager' if manager else '')
         deadline = time.time() + float(atelier.get('start_timeout_s') or 600)
         while True:
@@ -4444,12 +4510,23 @@ class Atelier:
             if time.time() > deadline:
                 self.stop('pas prêt à temps')
                 raise RuntimeError('atelier pas prêt après %s' % fmt_duration(deadline - now))
+            self.note_startup(logf, t_spawn, marks)
+            if relay and self.relay_pid:
+                self.read_relay(lay)   # le relais change d'état pendant ce démarrage (appels en attente, activité) : lu à chaque tour
             try:
                 if comfy_local(port, 'GET', '/queue', timeout=5)[0] == 200:
                     break
             except OSError:
                 pass
             time.sleep(2)
+        self.note_startup(logf, t_spawn, marks)
+        marks['prêt'] = round(time.time() - t_spawn)
+        marks = dict(sorted(marks.items(), key=lambda kv: kv[1]))
+        self.wake_phases = 'préparation %d s, puis depuis le lancement de ComfyUI : %s' % (
+            round(t_spawn - now), ', '.join('%s %d s' % kv for kv in marks.items()))
+        self.startup_nodes = startup_times(logf)
+        if self.relay_pid:
+            self.read_relay(lay)   # « actif » vu par le relais dès que ComfyUI répond : pas de libellé périmé jusqu'au tour suivant
         self.state = 'en marche'
         self.failures = 0
         if not (self.error or '').startswith('ne répondait plus'):   # la relance pour mutisme reste dite au hub
@@ -4458,6 +4535,36 @@ class Atelier:
         self.look_net(time.time(), force=True)
         self.purge(time.time())
         log.info('Atelier prêt en %s : %s.', fmt_duration(time.time() - now), ', '.join(self.net.get('listening') or [listen]))
+        log.info('Atelier : démarrage détaillé : %s ; nœuds : %s', self.wake_phases, ' | '.join(self.startup_nodes) or '-')
+
+    def set_manager_config(self, lay, atelier):
+        """Réglage sûr de ComfyUI-Manager avant chaque démarrage (config.ini, GPU.md « Sécurité de Manager »). Derrière le relais,
+        ComfyUI écoute 127.0.0.1 : Manager se croit « en local » (security_level lu avec --listen) et verrait comme locales les
+        actions du poste client. Jamais bloquant : un échec est dit, ComfyUI démarre quand même (Manager garde alors son réglage)."""
+        try:
+            want = manager_wanted(atelier, self.config)
+            path = lay['data'] / 'user' / '__manager' / 'config.ini'
+            changed = write_manager_config(path, want)
+            self.manager_cfg = ', '.join('%s=%s' % kv for kv in sorted(want.items())) or None
+            if changed:
+                self.journal('atelier_relay', action='réglage Manager', changed={k: '%s -> %s' % (b, a) for k, (b, a) in changed.items()},
+                             config=str(path), backup='config.ini.bak-worker' if (path.parent / 'config.ini.bak-worker').exists() else None)
+        except (OSError, ValueError, RuntimeError) as e:
+            self.manager_cfg = 'non posé : %s' % str(e)[:120]
+            log.warning('Atelier : réglage de ComfyUI-Manager non posé (%s).', e)
+
+    def note_startup(self, logf, t_spawn, marks):
+        """Instant (secondes depuis le lancement) où chaque étape connue du démarrage apparaît dans le journal de ComfyUI."""
+        if len(marks) >= len(STARTUP_MARKS):
+            return
+        try:
+            with open(logf, 'rb') as f:
+                text = f.read(400000).decode('utf-8', 'replace')
+        except OSError:
+            return
+        for key, needle in STARTUP_MARKS:
+            if key not in marks and needle in text:
+                marks[key] = round(time.time() - t_spawn)
 
     def forget(self, lay=None):
         self.proc, self.pid, self.busy_flag, self.queue, self.vram, self.listen = None, None, False, None, {}, None
@@ -5117,7 +5224,8 @@ class Atelier:
                         self.wakes += 1
                         self.asleep_since = None
                         self.last_wake = '%s : %s, prêt en %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), cause, fmt_duration(time.time() - t0))
-                        self.journal('atelier_wake', cause=cause, ready_s=round(time.time() - t0, 1), port=self.port)
+                        self.journal('atelier_wake', cause=cause, ready_s=round(time.time() - t0, 1), port=self.port, phases=self.wake_phases,
+                                     slow_nodes=self.startup_nodes or None)
                 except Exception as e:   # toute panne du démarrage : pause croissante, jamais une relance immédiate en boucle
                     if self.pid and not self.running():
                         self.forget()
@@ -5300,6 +5408,8 @@ class Atelier:
         relay, wanted = self.relay_mode(), self.idle_stop_s() > 0
         info = self.relay_info if self.relay_pid else {}
         states = {'veille': 'en veille', 'démarrage': 'en démarrage', 'actif': 'actif'}
+        if info.get('state') == 'démarrage' and self.pid and self.state == 'en marche':
+            info = dict(info, state='actif')   # ComfyUI répond (vu par le worker) : « en démarrage » n'est plus que le fichier du relais, pas encore relu
         d = {'mode': 'relais' if relay else 'direct (repli : relais en échec)' if wanted else 'direct',
              'idle_stop_minutes': round(self.idle_stop_s() / 60, 2),
              'relay': states.get(info.get('state'), 'en marche') if self.relay_pid else ('arrêté' if wanted else None),
@@ -5307,7 +5417,7 @@ class Atelier:
              'ram_mib': self.mem.get('ws_mib') if self.pid else None, 'ram_private_mib': self.mem.get('private_mib') if self.pid else None,
              'relay_ram_mib': self.relay_mem.get('ws_mib') if self.relay_pid else None,
              'ws_open': info.get('ws_open'), 'wakes': self.wakes if relay else None, 'sleeps': self.sleeps if relay else None,
-             'last_wake': self.last_wake, 'last_sleep': self.last_sleep, 'asleep_since': self.asleep_since if not self.pid else None}
+             'last_wake': self.last_wake, 'wake_phases': self.wake_phases, 'manager_config': self.manager_cfg, 'last_sleep': self.last_sleep, 'asleep_since': self.asleep_since if not self.pid else None}
         if self.relay_pid:   # ce que voit le poste client : le port et les adresses du relais ; ComfyUI derrière, sur backend_port
             d.update(port=info.get('port'), listen=self.relay_listen, backend_port=self.port if self.pid else info.get('backend_port'))
         return d
