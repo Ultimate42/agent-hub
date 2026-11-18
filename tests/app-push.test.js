@@ -158,7 +158,7 @@ describe('App Web Push', () => {
     assert.equal((await client.call('/push/subscribe', { method: 'POST', body: sub.json })).status, 201);
     const pubKey = (await client.call('/push/key')).data.public_key;
     pushes.length = 0;
-    await postAs(assistantRoom, assistant, 'Ton bilan de la semaine est prêt, on en parle ?');
+    await postAs(assistantRoom, assistant, 'Ton résumé est prêt, on en parle ?');
     assert.ok(await until(() => pushes.length === 1));
     const p = pushes[0];
     assert.equal(p.path, '/push/alice-phone');

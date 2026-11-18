@@ -13,6 +13,18 @@ Now with LLM mode: when mentioned (@Archiviste) or addressed (each agent), calls
 **Reliability**: at-least-once. `lastProcessedMessageId` only advances after the reply is posted (and all earlier messages are done); `doneIds` keeps out-of-order completions, `writtenIds` makes `retiens:` idempotent after a crash. Up to `ARCHIVISTE_CONCURRENCY` (default 3) messages run concurrently, replies posted in message order. SIGTERM waits up to `ARCHIVISTE_SHUTDOWN_GRACE_MS` (30s) for in-flight messages, then abandons them without advancing. Most latency (~20-35 s per call) is memory-agent itself.
 **Welcome**: Posted once per state (state.welcomedAt).
 
+## Memory layout
+
+The layout of the memory belongs to each deployment, not to the code:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ARCHIVISTE_MEMORY_TREE` | `notes` | memory-agent tree read and written |
+| `ARCHIVISTE_DEFAULT_PATH` | `notes` | path of a note sent without a `[Category]` |
+| `ARCHIVISTE_HINT_IGNORED_ROOTS` | `archive,temp` | top-level branches never proposed for a `[Category]` |
+| `ARCHIVISTE_HINT_SYNONYMS` | (none) | `word:treeword,...`, e.g. `arrosoir:arrosage` (accents, case and final s/x ignored) |
+| `ARCHIVISTE_HINT_PREFERRED_ROOT` | (none) | top-level branch preferred when two paths match equally |
+
 ## Commands (Exact Match)
 
 | Command | Action |

@@ -4,6 +4,9 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const PORT = '4132';
 const BASE_URL = `http://localhost:${PORT}`;
@@ -50,7 +53,7 @@ describe('AI Guide Routes', () => {
   before(async () => {
     // Start server with isolated DB and port
     serverProcess = spawn('node', ['src/index.js'], {
-      cwd: '/srv/agent-hub',
+      cwd: ROOT,
       env: { ...process.env, PORT, PUBLIC_URL: BASE_URL, DB_PATH: TEST_DB_PATH },
       stdio: 'pipe'
     });
@@ -150,7 +153,7 @@ describe('AI Guide Routes', () => {
     assert(content.includes('Option A: MCP Connector'), 'Should mention Option A');
     assert(content.includes('Option B: Web-Only'), 'Should mention Option B');
     assert(content.includes('Option C: REST API'), 'Should mention Option C');
-    assert(content.includes('https://hub.example.com/mcp'), 'Should mention MCP URL');
+    assert(content.includes(`${BASE_URL}/mcp`), 'Should mention MCP URL');
     assert(content.includes('join_room'), 'Should mention join_room tool');
     assert(content.includes(`/r/${roomToken}/join.txt`), 'Should link to txt guide');
   });
@@ -178,7 +181,7 @@ describe('AI Guide Routes', () => {
 
     // Verify MCP setup steps
     assert(content.includes('Settings → Connectors → Add Custom Connector'), 'Should have Settings path');
-    assert(content.includes('https://hub.example.com/mcp'), 'Should have MCP URL');
+    assert(content.includes(`${BASE_URL}/mcp`), 'Should have MCP URL');
     assert(content.includes('Open a NEW conversation'), 'Should mention new conversation');
     assert(content.includes(`join_room(room_token="${roomToken}"`), 'Should have correct room token');
     assert(content.includes('member_token'), 'Should explain member token');

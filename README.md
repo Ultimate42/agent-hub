@@ -35,9 +35,10 @@ Environment variables (`.env`):
 ```
 PORT=4030
 HOST=0.0.0.0
-PUBLIC_URL=http://localhost:4030
+PUBLIC_URL=http://localhost:4030   # public address of this hub, e.g. https://hub.example.com (setup guides, MCP URL, file links)
 HUB_DATA_DIR=./data   # directory holding hub.db (keep it outside the repo in production)
 CORS_ORIGINS=http://localhost:4030,https://example.com
+HUB_TRUSTED_PROXIES=loopback            # proxies allowed to set X-Forwarded-For (Express "trust proxy" entries), e.g. loopback,172.18.0.0/16
 LOG_LEVEL=info
 # App notifications (optional, see "Notifications (Web Push)")
 HUB_VAPID_SUBJECT=mailto:you@example.com

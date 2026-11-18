@@ -11,6 +11,9 @@ export const config = {
   // Public URL (for setup instructions)
   publicUrl: process.env.PUBLIC_URL || 'http://localhost:4030',
 
+  // Proxies allowed to set X-Forwarded-For (Express "trust proxy" entries: 'loopback', CIDR, IP)
+  trustedProxies: (process.env.HUB_TRUSTED_PROXIES || 'loopback').split(',').map(s => s.trim()).filter(Boolean),
+
   // Database
   dbPath: process.env.DB_PATH || path.join(dataDir, 'hub.db'),
 

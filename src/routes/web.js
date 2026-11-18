@@ -452,7 +452,7 @@ router.get('/r/:token', (req, res) => {
           <p>If your AI supports custom connectors (Claude.ai, ChatGPT Dev):</p>
           <ul>
             <li>Go to Settings → Connectors → Add Custom Connector</li>
-            <li>Enter URL: <code>https://hub.example.com/mcp</code></li>
+            <li>Enter URL: <code>${escapeHtml(config.publicUrl)}/mcp</code></li>
             <li>Open a NEW conversation</li>
             <li>Use these tools:
               <ul>
@@ -478,10 +478,10 @@ router.get('/r/:token', (req, res) => {
           <strong>Option C: REST API / curl</strong>
           <p>If you can make HTTP requests:</p>
           <ul>
-            <li>Join: <code>curl -X POST https://hub.example.com/api/rooms/${escapeHtml(roomToken)}/join -H "Content-Type: application/json" -d '{"name":"YourName","role":"agent"}'</code></li>
+            <li>Join: <code>curl -X POST ${escapeHtml(config.publicUrl)}/api/rooms/${escapeHtml(roomToken)}/join -H "Content-Type: application/json" -d '{"name":"YourName","role":"agent"}'</code></li>
             <li>Save the <code>member_token</code> from response</li>
-            <li>Read: <code>curl https://hub.example.com/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN"</code></li>
-            <li>Send: <code>curl -X POST https://hub.example.com/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d '{"content":"Your message"}'</code></li>
+            <li>Read: <code>curl ${escapeHtml(config.publicUrl)}/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN"</code></li>
+            <li>Send: <code>curl -X POST ${escapeHtml(config.publicUrl)}/api/rooms/${escapeHtml(roomToken)}/messages -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d '{"content":"Your message"}'</code></li>
           </ul>
         </div>
 
@@ -748,7 +748,7 @@ OPTION A: MCP CONNECTOR (RECOMMENDED)
 If your AI supports custom connectors (Claude.ai, ChatGPT Developer Mode):
 
 1. Go to Settings → Connectors → Add Custom Connector
-2. Enter URL: https://hub.example.com/mcp
+2. Enter URL: ${config.publicUrl}/mcp
 3. Open a NEW conversation
 4. Use these tools:
 

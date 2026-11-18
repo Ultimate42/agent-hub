@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Archiviste Agent - Resident memory manager for personal notes data
+ * Archiviste Agent - Resident memory manager (notes kept in a memory-agent tree)
  * Joins a room, monitors for commands, and interfaces with memory-agent API
  */
 
@@ -21,6 +21,9 @@ const LLM_MODEL = process.env.ARCHIVISTE_MODEL || 'claude-sonnet-5-5';
 const STATE_DIR = process.env.ARCHIVISTE_STATE_DIR || __dirname;
 const AGENT_HUB_URL = process.env.AGENT_HUB_URL || 'http://localhost:4030';
 const MEMORY_API_URL = process.env.MEMORY_API_URL || 'http://localhost:4010';
+// Memory layout of the deployment (tree name, default path, category hints): configuration, not code
+const MEMORY_TREE = process.env.ARCHIVISTE_MEMORY_TREE || 'notes';
+const DEFAULT_MEMORY_PATH = process.env.ARCHIVISTE_DEFAULT_PATH || 'notes';
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const AGENT_NAME = 'Archiviste';
 const AGENT_ROLE = 'agent';
@@ -209,21 +212,39 @@ async function postMessage(content) {
 }
 
 /**
- * Category hint: "[tomates] ..." -> existing memory path (fast path of memory-agent,
+ * Category hint: "[Tomates] ..." -> existing memory path (fast path of memory-agent,
  * ~0.6 s) or the bare label as classification hint (memory-agent then asks its LLM, ~9 s).
  */
 const HINT_STOP = new Set(['de', 'du', 'des', 'la', 'le', 'les', 'l', 'd', 'et', 'en', 'au', 'aux', 'un', 'une', 'mi',
   'actuel', 'actuelle', 'actuels', 'actuelles', 'janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout',
   'septembre', 'octobre', 'novembre', 'decembre', 'debut', 'fin']);
-const HINT_SYNONYMS = { charge: 'force', poids: 'force', courgette: 'courgette', outils: 'outils', seance: 'seances' };
-const HINT_IGNORED_ROOTS = new Set(['archive', 'temp', 'assistant', 'notes', 'poids']);
+/** One word as compared in hints: no accents, lower case, final s/x dropped ("Tomates" -> "tomate") */
+export function hintWord(w) {
+  return String(w).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim().replace(/(s|x)$/, '');
+}
+
+/** "a:b,c:d" -> {a: 'b', c: 'd'} (label word -> word used in the memory tree), both normalized by hintWord */
+export function parseSynonyms(raw) {
+  const out = {};
+  for (const e of String(raw || '').split(',')) {
+    const [k, v] = e.split(':').map(x => hintWord(x || ''));
+    if (k && v) out[k] = v;
+  }
+  return out;
+}
+const listEnv = (raw) => String(raw || '').split(',').map(x => x.trim()).filter(Boolean);
+const HINT_SYNONYMS = parseSynonyms(process.env.ARCHIVISTE_HINT_SYNONYMS);
+// Top-level branches never proposed as a hint target
+const HINT_IGNORED_ROOTS = new Set(listEnv(process.env.ARCHIVISTE_HINT_IGNORED_ROOTS ?? 'archive,temp'));
+// Top-level branch preferred when two paths match a label equally well
+const HINT_PREFERRED_ROOT = process.env.ARCHIVISTE_HINT_PREFERRED_ROOT || null;
 let treePathsCache = { at: 0, paths: [] };
 
 function hintTokens(text) {
   return String(text).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
     .split(/[^a-z0-9]+/).filter(Boolean)
     .filter(t => !HINT_STOP.has(t) && !/^\d+$/.test(t))
-    .map(t => t.replace(/(s|x)$/, ''))
+    .map(hintWord)
     .map(t => HINT_SYNONYMS[t] || t);
 }
 
@@ -242,7 +263,7 @@ function parseTreePaths(text) {
 async function getTreePaths() {
   if (Date.now() - treePathsCache.at < 5 * 60 * 1000 && treePathsCache.paths.length) return treePathsCache.paths;
   try {
-    const r = await fetch(`${MEMORY_API_URL}/tree/assistant`, { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(`${MEMORY_API_URL}/tree/${encodeURIComponent(MEMORY_TREE)}`, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) return treePathsCache.paths;
     const paths = parseTreePaths(await r.text());
     if (paths.length) treePathsCache = { at: Date.now(), paths };
@@ -269,7 +290,7 @@ async function deriveHint(text) {
       const last = new Set(hintTokens(segs[segs.length - 1]));
       if (!want.every(t => have.has(t)) || !want.some(t => last.has(t))) continue;
       // prefer the most specific path whose last segment covers the label, then the shortest
-      const score = (want.filter(t => last.has(t)).length * 10) - segs.length + (segs[0] === 'jardin' ? 1 : 0);
+      const score = (want.filter(t => last.has(t)).length * 10) - segs.length + (HINT_PREFERRED_ROOT && segs[0] === HINT_PREFERRED_ROOT ? 1 : 0);
       if (!best || score > best.score) best = { p, score };
     }
   }
@@ -279,7 +300,7 @@ async function deriveHint(text) {
 /**
  * Write to memory via memory-agent API
  */
-async function writeMemory(content, path = 'notes/notes', hint = null) {
+async function writeMemory(content, path = DEFAULT_MEMORY_PATH, hint = null) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 90000);
@@ -291,7 +312,7 @@ async function writeMemory(content, path = 'notes/notes', hint = null) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           content: content,
-          tree: 'assistant',
+          tree: MEMORY_TREE,
           ...(hint ? { hint } : { path }),
         }),
         signal: controller.signal,
@@ -335,7 +356,7 @@ async function readMemory(subject) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           subject: subject,
-          tree: 'assistant',
+          tree: MEMORY_TREE,
         }),
         signal: controller.signal,
       }
@@ -667,7 +688,7 @@ async function processMessage(msg, gate = Promise.resolve()) {
 
       // Build system prompt
       const systemPrompt =
-        'You are Archiviste, a memory agent for Alice\'s personal assistant. ' +
+        'You are Archiviste, a memory agent for the user\'s personal assistant. ' +
         'Respond in English in the hub. Keep response to 5 lines max. ' +
         (memoryText ? `Relevant memory context: ${memoryText}` : '');
 
@@ -707,7 +728,7 @@ async function processMessage(msg, gate = Promise.resolve()) {
                        /(que|et|le|de|est|un|une|je|tu|il|elle|nous|vous|ils|elles)\b/i.test(content);
 
       const briefResponse = isFrench
-        ? 'Je suis un script relais vers la mémoire du assistant (modèle Sonnet 5.5).\nCommandes: retiens:, cherche:, résume:, ?, aide'
+        ? 'Je suis un script relais vers la mémoire de l\'assistant (modèle Sonnet 5.5).\nCommandes: retiens:, cherche:, résume:, ?, aide'
         : 'I am a relay script to the assistant\'s memory (Sonnet 5.5 model).\nCommands: retiens:, cherche:, résume:, ?, aide';
 
       await post(briefResponse);

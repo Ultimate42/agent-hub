@@ -11,7 +11,7 @@ const MEM_PORT = 4161;
 const BASE = `http://localhost:${PORT}`;
 const DB = path.join(os.tmpdir(), `hub-test-archiviste-hint-${process.pid}-${Date.now()}.db`);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const TREE = 'jardin\n outils\n  tomates(1)\n  courgettes(7)\n profil\n  force(2)\n  suivi(1)\n objectifs(1)\nprofil\n objectifs(3)\nnutrition\n aliments(66)\n';
+const TREE = 'jardin\n potager\n  tomates(1)\n  courgettes(7)\n outils\n  arrosage(2)\n  suivi(1)\n objectifs(1)\nmaison\n objectifs(3)\narchive\n anciens(66)\n';
 
 let hub, memServer, memBodies = [], procs = [];
 
@@ -31,7 +31,7 @@ describe('Archiviste [Categorie] -> hint', () => {
       let body = '';
       req.on('data', d => { body += d; });
       req.on('end', () => {
-        if (req.method === 'GET' && req.url === '/tree/assistant') { res.setHeader('Content-Type', 'text/plain'); return res.end(TREE); }
+        if (req.method === 'GET' && req.url === '/tree/notes') { res.setHeader('Content-Type', 'text/plain'); return res.end(TREE); }
         const j = JSON.parse(body || '{}');
         res.setHeader('Content-Type', 'application/json');
         if (req.url === '/write') { memBodies.push(j); res.end(JSON.stringify({ success: true, memory_id: 1 })); }
@@ -56,18 +56,19 @@ describe('Archiviste [Categorie] -> hint', () => {
     await say('warmup');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
     fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ lastProcessedMessageId: 0, welcomedAt: new Date().toISOString() }));
-    for (const c of ['retiens: [tomates] mildiou', 'retiens: [Charges actuelles mi-octobre 2026] 10 litres',
+    for (const c of ['retiens: [Tomates] mildiou', 'retiens: [Arrosoir actuel mi-octobre 2026] 10 litres',
       'retiens: [Météo] pluie', 'retiens: [Objectifs] x', 'retiens: sans categorie']) await say(c);
     const p = spawn('node', ['archiviste/archiviste.js'], {
-      env: { ...process.env, ROOM_TOKEN: room.room_token, AGENT_HUB_URL: BASE, MEMORY_API_URL: `http://localhost:${MEM_PORT}`, ARCHIVISTE_STATE_DIR: dir },
+      env: { ...process.env, ROOM_TOKEN: room.room_token, AGENT_HUB_URL: BASE, MEMORY_API_URL: `http://localhost:${MEM_PORT}`, ARCHIVISTE_STATE_DIR: dir,
+        ARCHIVISTE_HINT_SYNONYMS: 'arrosoir:arrosage', ARCHIVISTE_HINT_PREFERRED_ROOT: 'jardin' },
       stdio: 'pipe',
     });
     procs.push(p); if (process.env.DBG) { p.stdout.on("data", d => process.stderr.write(d)); p.stderr.on("data", d => process.stderr.write(d)); }
     await until(() => memBodies.length >= 5);
     const by = (txt) => memBodies.find(b => b.content.description.includes(txt));
-    assert.strictEqual(by('mildiou').hint, 'jardin/outils/tomates');
+    assert.strictEqual(by('mildiou').hint, 'jardin/potager/tomates');
     assert.strictEqual(by('mildiou').path, undefined);
-    assert.strictEqual(by('10 litres').hint, 'jardin/profil/force');
+    assert.strictEqual(by('10 litres').hint, 'jardin/outils/arrosage');
     assert.strictEqual(by('pluie').hint, 'Météo');
     assert.strictEqual(by('x').hint, 'jardin/objectifs');
     assert.strictEqual(by('sans categorie').hint, undefined);

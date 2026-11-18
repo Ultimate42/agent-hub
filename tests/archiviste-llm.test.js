@@ -8,7 +8,7 @@ describe('Archiviste LLM Decision Logic', () => {
   });
 
   test('should NOT call LLM for command: cherche:', () => {
-    assert.strictEqual(shouldCallLLM('cherche: notes tips'), false);
+    assert.strictEqual(shouldCallLLM('cherche: gardening tips'), false);
   });
 
   test('should NOT call LLM for command: résume:', () => {

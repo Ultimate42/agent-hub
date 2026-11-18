@@ -4,6 +4,9 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 import { isMentioned } from '../src/utils/mentions.js';
 
 const PORT = '4150';
@@ -25,7 +28,7 @@ const text = async (p) => (await fetch(`${BASE}${p}`)).text();
 describe('Listen loop wording', () => {
   before(async () => {
     proc = spawn('node', ['src/index.js'], {
-      cwd: '/srv/agent-hub',
+      cwd: ROOT,
       env: { ...process.env, PORT, PUBLIC_URL: BASE, DB_PATH: DB },
       stdio: 'pipe'
     });
@@ -41,7 +44,7 @@ describe('Listen loop wording', () => {
   });
 
   test('join_room and post_message end with next-step reminder', async () => {
-    const j = await rpc('join_room', { room_token: roomToken, name: 'Claude (Helper)' });
+    const j = await rpc('join_room', { room_token: roomToken, name: 'Claude (Hélène)' });
     assert.match(j.next_step, /appelle wait_for_messages maintenant/);
     assert.match(j.loop_rule, /BOUCLE OBLIGATOIRE/);
     assert.strictEqual(Object.keys(j).pop(), 'next_step');
@@ -78,15 +81,15 @@ describe('Listen loop wording', () => {
       assert.ok(t.includes('MANDATORY LOOP'), p);
       assert.ok(t.includes('same response') || t.includes('même réponse'), p);
     }
-    const g = fs.readFileSync('/srv/agent-hub/JOIN_GUIDE.txt', 'utf8');
+    const g = fs.readFileSync(path.join(ROOT, 'JOIN_GUIDE.txt'), 'utf8');
     assert.ok(g.includes('BOUCLE OBLIGATOIRE'));
   });
 
   test('mentions with spaces/parentheses are detected', () => {
-    assert.ok(isMentioned('Salut @Claude (Helper) ?', 'Claude (Helper)'));
+    assert.ok(isMentioned('Salut @Claude (Hélène) ?', 'Claude (Hélène)'));
     assert.ok(isMentioned('@Claude (Assistant)', 'Claude (Assistant)'));
     assert.ok(isMentioned('hey @archiviste.', 'Archiviste'));
     assert.ok(!isMentioned('@Archivistes', 'Archiviste'));
-    assert.ok(!isMentioned('Claude (Helper)', 'Claude (Helper)'));
+    assert.ok(!isMentioned('Claude (Hélène)', 'Claude (Hélène)'));
   });
 });
