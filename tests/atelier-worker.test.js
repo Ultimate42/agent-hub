@@ -6,7 +6,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
 
-// Alice's ComfyUI workshop on a worker machine, end to end: the real launcher + worker against a real hub, a fake
+// the machine owner's ComfyUI workshop on a worker machine, end to end: the real launcher + worker against a real hub, a fake
 // ComfyUI for the workshop and a fake image engine for the hub's jobs. Turned on and off from the hub; while it computes
 // the machine takes no job from the hub, a running GPU job is given back without counting the attempt, and before a
 // GPU job the workshop is asked to free the card (POST /free).

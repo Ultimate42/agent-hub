@@ -105,7 +105,7 @@ export const config = {
   host: process.env.HOST || '0.0.0.0',
   // Proxies allowed to set X-Forwarded-For (Express "trust proxy" entries: 'loopback', CIDR, IP).
   // Anything else reaching the port directly must not be able to spoof the client IP.
-  trustedProxies: (process.env.HUB_TRUSTED_PROXIES || 'loopback,172.18.0.0/16')
+  trustedProxies: (process.env.HUB_TRUSTED_PROXIES || 'loopback')
     .split(',').map(s => s.trim()).filter(Boolean),
   // Concurrent GET /mcp SSE streams kept open (each holds a socket and a keep-alive timer)
   maxSseStreams: positiveInt(process.env.HUB_MAX_SSE_STREAMS, 500),
@@ -187,6 +187,10 @@ export const config = {
   // Wake policy: after this many consecutive agent messages in a room with no human message (and no
   // mention of the member), 'all' wake-ups caused by agent messages are suspended
   wakeLoopLimit: Math.max(1, parseInt(process.env.HUB_WAKE_LOOP_LIMIT || '6', 10) || 6),
+
+  // Times shown in messages written by the hub: IANA timezone (default: the server's) and locale of the text
+  timezone: process.env.HUB_TIMEZONE || undefined,
+  locale: process.env.HUB_LOCALE || 'fr-FR',
 
   // Watchdog
   unreplySeconds: parseInt(process.env.HUB_UNREPLY_SECONDS || '120', 10),

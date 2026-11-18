@@ -1,6 +1,6 @@
 # Générations GPU : images et modèles 3D
 
-Le hub fait générer des images et des modèles 3D par les PC workers RE-USE (aujourd'hui `gpu-box`, RX 6950 XT
+Le hub fait générer des images et des modèles 3D par les PC workers RE-USE (par exemple une carte AMD RDNA2 de 16 Go
 16 Go), avec la même file, le même planning horaire et les mêmes jetons de machine. Le hub ne calcule rien.
 
 ## Pour un agent : trois appels
@@ -46,7 +46,8 @@ du modèle la première fois, puis calcul), `done` (`result.url`, `result.sha256
 `failed` (`error`), `cancelled`. `POST /api/gpu/jobs/:id/cancel` arrête aussi un calcul en cours (la carte est
 libérée en moins de 15 s). `GET /api/gpu/jobs` liste vos travaux, du plus récent au plus ancien.
 
-À savoir avant d'attendre : la machine ne calcule que dans son créneau (gpu-box : voir son planning), un seul travail à la fois, et un nettoyage RE-USE en cours finit d'abord. `capabilities` donne
+À savoir avant d'attendre : la machine ne calcule que dans son créneau (son planning :
+`GET /api/reuse/workers/<nom>/schedule`), un seul travail à la fois, et un nettoyage RE-USE en cours finit d'abord. `capabilities` donne
 `ready_now` et `next_start_at`. Le premier travail d'un type télécharge le modèle (environ 11 Go pour l'image),
 ce qui prend de 10 à 30 minutes. Un travail que personne n'a pris en 48 h passe en échec. Les résultats sont
 effacés du hub 72 h après la fin.
@@ -82,25 +83,25 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
   - `s_per_step` et `executed_s` (temps donné par ComfyUI) ;
   - `wall_s` ;
   - `server_start_s` au premier travail d'une série. ComfyUI reste chargé `gpu_keep_loaded_s`, 10 minutes par défaut.
-- **Lenteur du job 52 (13/11), 232 s par étape.** ComfyUI n'autorise pas le fp16 pour Flux3 : sur RDNA2, qui n'a pas de
+- **Lenteur d'un premier essai, 232 s par étape.** ComfyUI n'autorise pas le fp16 pour Flux3 : sur RDNA2, qui n'a pas de
   bf16, il calculait donc en fp32 (« manual cast »). Le DiT ne tenait plus en mémoire vidéo, et le chargement dynamique
   relisait les poids à chaque étape. Réglages admin du modèle (ils relancent ComfyUI) :
   - `unet_dtype` : default par défaut, soit des poids bf16 calculés en fp32. Sans référence, c'est 4,73 s par étape et
-    une image juste (job 56). En fp16, l'image sort noire (NaN, job 56). Si on impose fp16 et que l'image sort unie, le
+    une image juste. En fp16, l'image sort noire (NaN). Si on impose fp16 et que l'image sort unie, le
     job est refait en default, sauf avec le jeton `no_fallback` ;
   - `dynamic_vram` : false par défaut (`--disable-dynamic-vram`) ;
   - `attention` : quad par défaut, ou split ou pytorch ;
   - `ref_megapixels` : 1,0 par défaut, 0,25 au plus petit ;
   - `vram_mode` : high par défaut (`--highvram`).
-    - Cause du job 53 (260 s par étape en fp16) : en mode normal, ComfyUI réserve pour l'échantillonnage une estimation
+    - Cause d'un autre essai (260 s par étape en fp16) : en mode normal, ComfyUI réserve pour l'échantillonnage une estimation
       prudente. Avec l'attention quad, c'est environ 9 Go à 1024 avec une référence.
     - Il ne chargeait donc que 6,2 Go du DiT de 11,1 Go, et faisait passer le reste à chaque étape.
     - En high, le DiT est chargé en entier.
   - `comfyui_options` : des jetons d'essai pris dans une liste fermée, sans redéployer (voir le catalogue) ;
-  - `text_encoder` : gpu par défaut, 60 à 95 s avant le DiT (contre 422 s sur le processeur, job 54). Ancien défaut :
+  - `text_encoder` : gpu par défaut, 60 à 95 s avant le DiT (contre 422 s sur le processeur). Ancien défaut :
     cpu. L'encodeur, 8,9 Go en fp16, calcule sur le processeur, et le DiT reste seul sur la
     carte d'un travail à l'autre. Avec gpu, l'encodeur passe sur la carte, puis il est déchargé avant le DiT.
-- **Mesures de la nuit du 13/11** (gpu-box, 1024, poids bf16 calculés en fp32, attention quad sauf mention) :
+- **Mesures** (gpu-box, 1024, poids bf16 calculés en fp32, attention quad sauf mention) :
 
   | Job | Références | Temps par étape | Image |
   |---|---|---|---|
@@ -116,7 +117,7 @@ jq -n --arg r "$(base64 -w0 tasse.png)" '{type:"image", model:"flux3-klein", siz
   - Le temps grandit bien plus vite que le nombre de jetons (4 100, 6 100, 8 200).
   - Ce n'est ni la précision, ni l'encodeur resté sur la carte, ni la forme d'attention seule.
   - Cause : l'allocateur de PyTorch par segments fixes, et le compilateur de modèle de ComfyUI. Les deux sont réglés par
-    défaut depuis le 14/11 (`comfyui_options` : `alloc_expandable,no_comfy_compiler`), soit 18,0 s par étape avec une
+    défaut (`comfyui_options` : `alloc_expandable,no_comfy_compiler`), soit 18,0 s par étape avec une
     référence à 1 Mpx.
 - **Diagnostic dans `engine` du job** :
   - `weight_dtype` et `compute_dtype`, la précision réelle ;
@@ -177,14 +178,14 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   travail qui le dépasserait échoue avec la raison, et rien n'est téléchargé. Les versions que le catalogue ne
   cite plus sont supprimées d'abord.
 - **Carte : 14 Go de mémoire vidéo au moins** (`min_vram_gb` du catalogue, lu dans la liste des cartes Vulkan du
-  moteur RE-USE). Une machine plus petite, comme `dev-box` et sa GTX 1060 de 6 Go, ne propose pas le type : elle
+  moteur RE-USE). Une machine plus petite, comme une carte de 6 Go, ne propose pas le type : elle
   téléchargerait 11 Go pour rater chaque travail. Elle le dit dans son journal au démarrage.
 - **Disque : 10 Go restent toujours libres.** Un téléchargement qui laisserait moins de place libre sur le disque
   est refusé de la même façon, même sous le plafond (`"gpu_keep_free_gb"`).
 - Le moteur tourne en priorité basse (`"low_priority": false` pour l'enlever), un travail à la fois, sur la carte
   dédiée demandée explicitement (`--backend gpu` : jamais le processeur ni une carte intégrée).
-- **Moteur image résident.** Charger les 11 Go de poids coûtait environ 580 s par travail (mesure du 12/11, jobs 3
-  et 4 identiques en 1024 et en 512). Le moteur (`sd-server`, fourni dans le même paquet) reste donc chargé
+- **Moteur image résident.** Charger les 11 Go de poids coûtait environ 580 s par travail (deux
+  travaux identiques mesurés, en 1024 et en 512). Le moteur (`sd-server`, fourni dans le même paquet) reste donc chargé
   entre deux travaux. Seul le premier travail d'une série paie le chargement. Il écoute sur 127.0.0.1 seulement,
   rien n'est ouvert au réseau. Il est arrêté et la carte libérée après 10 minutes sans travail
   (`"gpu_keep_loaded_s"`, 0 pour un processus par travail), à l'annulation d'un travail et à l'arrêt du worker.
@@ -198,19 +199,19 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   - `"gpu_keep_loaded_s": 600`.
 - **Réglages du moteur, réservés au jeton admin** :
   - `flash_attn` : auto (défaut : la sonde de sd.cpp décide, elle la coupe sur RDNA2), diffusion (imposée au DiT), on
-    ou off. Mesure sur la RX 6950 XT en 1024 : 21,8 s par étape sans, 26,8 s avec ;
+    ou off. Mesure sur la carte RDNA2 de 16 Go en 1024 : 21,8 s par étape sans, 26,8 s avec ;
   - `mmap` : true par défaut. Les poids sont chargés par projection mémoire, et non par la lecture par flux de sd.cpp,
-    qui plafonne à 25 Mo/s même quand les fichiers sont en cache. Mesure du job 15 : chargement en 1 s environ,
+    qui plafonne à 25 Mo/s même quand les fichiers sont en cache. Mesure : chargement en 1 s environ,
     premier démarrage en 131 s au lieu de 559 s ;
   - `text_encoder` : cpu (défaut) ou gpu. En 1024, cpu libère 4 Go de mémoire vidéo et donne 13,3 s par étape au lieu
-    de 21,7 s (mesure du 12/11) ;
+    de 21,7 s ;
   - `vae_tiling` : true par défaut ;
   - `threads` : 0 par défaut, soit un fil par cœur.
 
   Un membre qui les passe voit ses valeurs ignorées, et listées dans `ignored`. Changer un réglage relance le
   moteur résident, qui relit alors les poids.
 
-  Pourquoi ces défauts, d'après les mesures du 12/11 en 8 étapes avec le moteur déjà chargé :
+  Pourquoi ces défauts, d'après les mesures en 8 étapes avec le moteur déjà chargé :
   - l'attention classique coûte 1,4 s par étape en 512, 9,9 s en 768 et 21,6 s en 1024, alors que la sonde de
     sd.cpp avait coupé la flash attention sur RDNA2. En 1024, sa matrice dépasse les 2 Go par allocation du pilote
     AMD Windows (ggml-vulkan, llama.cpp #30697). Référence publiée sur la même carte : Flux.1-dev 12B en 1024, 6,7 s
@@ -255,7 +256,7 @@ commande). Pour ajouter un modèle, on ajoute une entrée au catalogue, sans tou
   1024 : c'est déjà le défaut de trellis.cpp dans ce cas.
 - Ce qui a été cuit est relevé dans `engine.texture_size` du travail (ligne « textured GLB (atlas N) » du moteur).
 - Essai à distance : `{"kind":"3d","params":{"texture_size":"2048"}}`.
-- **Mesure du 16/11 (job 273, `res` 1024, donc atlas 2048 par défaut) :** sur gpu-box, le flux de forme en cascade
+- **Mesure (`res` 1024, donc atlas 2048 par défaut) :** sur gpu-box, le flux de forme en cascade
   (« [4/7] shape SLAT flow (LR 512 -> upsample -> HR 1024 cascade) ») n'a pas fini en 60 minutes, le plafond du modèle. Le
   travail a été arrêté, puis annulé à la relance. Ce n'est pas la mémoire (pas d'erreur), c'est la durée. Sur cette carte, la
   texture 2048 passe donc par `res` 512 avec `texture_size: "2048"`, qui ne change que la cuisson.
@@ -270,7 +271,7 @@ ou 64). Six matrices des poids q8 sont dans ce cas :
 
 Où en est le correctif :
 - issue #50, corrigé dans main le 23/10/2026 (PR #55) ;
-- le 13/11/2026, aucune version publiée ne le contient (dernière : v0.8.1 du 25/09). Les binaires de main ne sont
+- à la rédaction, aucune version publiée ne le contient (dernière : v0.8.1 du 25/09). Les binaires de main ne sont
   pas téléchargeables sans compte GitHub.
 
 Le catalogue garde donc le contournement `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`.
@@ -360,7 +361,7 @@ Ils sont envoyés à chaque échange. Le worker les pose sur sa config en mémoi
 
 Le témoin `<fichier>.ok` (empreinte, taille, date) évite de re-hacher 20 Go à chaque travail, mais il ne voit pas un
 fichier changé en place sans que sa date bouge (secteur abîmé, écriture par projection mémoire, lien physique réécrit).
-Panne du 15/11 : jobs Klein 187 à 192 plantés en code natif (0xC0000005 dans `torch\lib\c10.dll`), fichiers jamais
+Panne : jobs Klein 187 à 192 plantés en code natif (0xC0000005 dans `torch\lib\c10.dll`), fichiers jamais
 revérifiés. Désormais :
 - Déclencheurs, pour tout modèle : un plantage en code natif (code de sortie Windows 0xC…, signal POSIX, « fatal
   exception » dans le journal), un message de poids illisible (safetensors, GGUF), ou deux échecs de suite sur le même
@@ -404,7 +405,7 @@ Re-hacher les 20 Go de Klein prend une à trois minutes.
 Pourquoi : comparer ComfyUI (IP-Adapter, LoRA, tuiles, nœuds) à stable-diffusion.cpp sur la même carte et le même
 modèle, avec des mesures. ComfyUI n'est pas un type de travail : l'essai l'installe, le mesure, puis l'arrête.
 
-Voie retenue (recherche du 13/11/2026) : les roues PyTorch ROCm stables d'AMD (projet TheRock, index
+Voie retenue : les roues PyTorch ROCm stables d'AMD (projet TheRock, index
 `stable.repo.amd.com/rocm/whl-next`), dans un Python 3.13 embarqué, sans droits admin ni HIP SDK.
 - torch 2.13.0+rocm10.0.0, avec les noyaux `device-gfx1030`. TheRock classe gfx1030 « Release Ready » sous Windows.
 - Les autres voies sont écartées :
@@ -435,7 +436,7 @@ de pip, les caches MIOpen, Hugging Face et torch (variables d'environnement), et
 
 Pour tout retirer : essai `comfyui_remove`, ou supprimer le dossier `gpu\comfyui`.
 
-## Atelier ComfyUI : Alice et les agents du poste client
+## Atelier ComfyUI : le propriétaire et les agents du poste client
 
 Un second ComfyUI sur gpu-box, pour s'en servir à la main (navigateur) ou par l'API (agents du poste client).
 - Il tourne en serveur, sans aucune fenêtre, lancé et surveillé par le worker.
@@ -463,23 +464,23 @@ Il est séparé du ComfyUI des travaux du hub, qui reste sans nœuds additionnel
   - Une écoute sur toutes les adresses vue par netstat arrête l'atelier.
 - Options :
   - catalogue (`benchmarks.comfyui.atelier`) : `--use-quad-cross-attention`, `--disable-pinned-memory`,
-    `--disable-comfy-compiler`, `--preview-method auto`, allocateur extensible (mesures Klein du 14/11) ;
+    `--disable-comfy-compiler`, `--preview-method auto`, allocateur extensible ;
   - jamais `--fast` ni `COMFYUI_ENABLE_MIOPEN`.
 - Survit à une mise à jour du worker : le nouveau worker reprend le processus en marche, et le travail en cours n'est pas
   coupé. Le fichier `STOP` l'arrête avec le worker.
 
 **La carte de l'atelier : jamais le graphique intégré**
-- Sur gpu-box, ROCm voit deux cartes. La n° 0 est le graphique intégré du Ryzen (gfx1036, 13,1 Go de mémoire partagée), la
-  n° 1 est la RX 6950 XT (gfx1030). Les roues PyTorch ne contiennent que les noyaux gfx1030 (`torch[device-gfx1030]`). Or
+- Sur gpu-box, ROCm voit deux cartes. La n° 0 est le graphique intégré du processeur (gfx1036, 13,1 Go de mémoire partagée), la
+  n° 1 est la carte RDNA2 de 16 Go (gfx1030). Les roues PyTorch ne contiennent que les noyaux gfx1030 (`torch[device-gfx1030]`). Or
   ComfyUI sous Windows ne garde que la carte 0 si on ne lui dit rien.
-- **Panne du 16/11, vers 21 h 10.** Les agrandisseurs `4x-PBRify-UpscalerV4` (DAT) et VOSR2 plantaient en
+- **Panne.** Les agrandisseurs `4x-PBRify-UpscalerV4` (DAT) et VOSR2 plantaient en
   `hipErrorInvalidImage` (« device kernel image is invalid »).
   - Cause : l'atelier ne posait `HIP_VISIBLE_DEVICES` que si un travail Klein avait déjà choisi la carte dans ce worker.
-    Démarré à 9 h 46, avant tout travail, il calculait sur le gfx1036. On le voyait à `vram_total_mib` : 12 460 au lieu de
+    Démarré avant tout travail, il calculait sur le gfx1036. On le voyait à `vram_total_mib` : 12 460 au lieu de
     16 368.
   - Ce n'était ni le modèle, ni la précision, ni MIOpen : tout calcul sur carte y aurait échoué. Même symptôme relevé ailleurs
     (wan2gp-amd #5, ComfyUI PR #17673, ouverte).
-  - Contournement du soir : atelier éteint puis rallumé depuis le hub. Il a redémarré sur la RX 6950 XT
+  - Contournement du soir : atelier éteint puis rallumé depuis le hub. Il a redémarré sur la carte RDNA2 de 16 Go
     (`vram_total_mib` 16 368).
 - Depuis :
   - l'atelier choisit lui-même sa carte avant de démarrer, comme les travaux (`comfy_pick_device`), même sans aucun travail
@@ -490,7 +491,7 @@ Il est séparé du ComfyUI des travaux du hub, qui reste sans nœuds additionnel
   - un atelier repris en marche sur une autre carte que celle choisie (version précédente du worker) est relancé une fois,
     dès qu'il ne calcule plus. La raison est dans `error`. S'il y retombe, il n'est plus relancé et `error` le dit.
 - Vérifier : essai `{"kind":"upscale","params":{"model":"4x-PBRify-UpscalerV4.safetensors"}}`, puis `result` 2048x2048 et
-  `device` = la RX 6950 XT.
+  `device` = la carte RDNA2 de 16 Go.
 
 **Partage de la carte (16 Go) : un seul calcul à la fois, l'atelier d'abord**
 - Le worker lit la file de l'atelier (`/queue`) toutes les 3 s. Tant qu'elle n'est pas vide :
@@ -506,7 +507,7 @@ Il est séparé du ComfyUI des travaux du hub, qui reste sans nœuds additionnel
 - Conséquence : des agents qui envoient des graphes sans arrêt bloquent les travaux du hub tout ce temps (voulu).
 
 **Veille : presque rien au repos, réveil à la demande**
-- Constat de Alice : ComfyUI au repos gardait 3,2 Go de mémoire vive en permanence, modèles déjà déchargés (`/free`).
+- Constat du propriétaire : ComfyUI au repos gardait 3,2 Go de mémoire vive en permanence, modèles déjà déchargés (`/free`).
 - Un relais (`atelier_relay.py`, bibliothèque standard seule, environ 20 Mo) écoute à la place de ComfyUI :
   - même port (8188), mêmes adresses (127.0.0.1 et l'adresse Tailscale), même Python (celui de l'atelier, que visent les
     règles du pare-feu) : rien à changer sur le poste client ni dans le pare-feu ;
@@ -574,7 +575,7 @@ Seulement dans `reuse-worker.config.json` du PC :
 **Pare-feu : la commande à coller une fois sur le PC GPU** (PowerShell en administrateur)
 ```powershell
 $DevPc = 'desktop-example'   # nom Tailscale du poste client (Windows : DESKTOP-EXAMPLE) ou son IP 100.x.y.z
-$Py = "$env:USERPROFILE\Documents\ReuseWorker\atelier\python\python.exe"   # dossier du worker sur gpu-box (vérifié le 14/11)
+$Py = "$env:USERPROFILE\Documents\ReuseWorker\atelier\python\python.exe"   # dossier du worker sur gpu-box
 $ts = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source; if (-not $ts) { $ts = "$env:ProgramFiles\Tailscale\tailscale.exe" }
 $Dev = if ($DevPc -match '^\d+(\.\d+){3}$') { $DevPc } else { & $ts ip -4 $DevPc 2>$null | Select-Object -First 1 }
 if ("$Dev" -notmatch '^100\.') { & $ts status; throw "IP Tailscale du poste client introuvable pour '$DevPc' : mettre dans `$DevPc son nom ou son IP (liste ci-dessus)" }
@@ -690,7 +691,7 @@ curl -H "$A" $T ; curl -H "$A" $T/12 ; curl -H "$A" -X POST $T/12/cancel
 - `Get-NetFirewallRule` est lisible sans droits administrateur.
 - Les liens physiques fonctionnent sur ce disque NTFS. Sinon, l'environnement est copié, avec 5,5 Go et un contrôle de
   place.
-- **Sécurité de ComfyUI-Manager** (17/11). Manager décide « local ou distant » avec `--listen` (4.2.2 :
+- **Sécurité de ComfyUI-Manager**. Manager décide « local ou distant » avec `--listen` (4.2.2 :
   `is_loopback(args.listen)`, `manager_server.py`) : derrière le relais, ComfyUI écoute 127.0.0.1, donc toute action venue du
   poste client passe pour locale (et son compteur de clients distants ne voit que le relais). Au niveau par défaut `normal`, les
   actions « middle » (installer ou retirer un nœud du registre, mettre à jour, installer un modèle) sont alors permises à

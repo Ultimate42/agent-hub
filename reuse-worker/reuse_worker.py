@@ -1833,7 +1833,7 @@ class Worker:
             'gpu_state': self.gpu.describe() or None,
             'gpu_models': ','.join(self.gpu.models()) or None,   # modèles qui demandent plus que le moteur du type (ComfyUI)
             'tests': ','.join(GPU_TEST_KINDS),         # essais GPU que cette version sait faire sur ordre du hub
-            'atelier': self.atelier.describe(),         # ComfyUI de Alice : état, écoute réelle, pare-feu, mémoire vidéo
+            'atelier': self.atelier.describe(),         # ComfyUI du propriétaire : état, écoute réelle, pare-feu, mémoire vidéo
         }
 
     def set_state(self, state, job=None):
@@ -2073,7 +2073,7 @@ class Worker:
             period = max(5, min(15, job.get('lease_s', 600) // 5))
             while True:
                 if not preempted and self.atelier.busy(sure=True):
-                    # Alice a lancé un calcul dans l'atelier (file lue, non vide) : il passe d'abord, ce travail repart
+                    # Le propriétaire a lancé un calcul dans l'atelier (file lue, non vide) : il passe d'abord, ce travail repart
                     # dans la file du hub. Un atelier qui répond lentement n'arrête jamais un travail en cours.
                     preempted['why'] = ATELIER_RELEASE
                     log.info('Job %s : %s.', label, preempted['why'])
@@ -2411,7 +2411,7 @@ class Worker:
 
     def atelier_loop(self):
         """Fil de l'atelier : le mène (tick) et, quand il calcule entre deux travaux du hub, arrête les moteurs résidents des
-        travaux (jusqu'à 11 Go gardés 10 minutes) : la carte est à Alice."""
+        travaux (jusqu'à 11 Go gardés 10 minutes) : la carte est au propriétaire."""
         while not self.atelier.stopping.is_set():
             try:
                 self.atelier.tick()
@@ -2525,7 +2525,7 @@ class Worker:
                     time.sleep(pause)
                 continue
             if self.atelier.busy():
-                self.atelier_hold()   # Alice calcule : aucun travail du hub tant que la file de l'atelier n'est pas vide
+                self.atelier_hold()   # le propriétaire calcule : aucun travail du hub tant que la file de l'atelier n'est pas vide
                 continue
             t0 = time.time()
             try:
@@ -3467,7 +3467,7 @@ def comfy_test_report(base, config, kind, params, stop, progress, report):
 
 # Essais GPU : en local (--gpu-test, worker arrêté) ou demandés par le hub (ordre gpu_test, worker en marche, entre deux
 # travaux). Même code, même rapport (logs/gpu-test.json), remonté au hub dans le second cas.
-# ---- Atelier ComfyUI : l'instance de Alice, à côté de celle des travaux -----------------------------------------
+# ---- Atelier ComfyUI : l'instance du propriétaire, à côté de celle des travaux -----------------------------------------
 # Une seconde instance de ComfyUI, pour un humain : nœuds additionnels et ComfyUI-Manager permis, port fixe, écoute sur
 # 127.0.0.1 et sur l'adresse Tailscale du PC (jamais 0.0.0.0), modèles des travaux partagés en lecture. Lancée et surveillée
 # par le worker, sans fenêtre, allumée ou éteinte depuis le hub (réglage atelier_enabled). Un seul calcul à la fois sur la
@@ -4403,7 +4403,7 @@ class Atelier:
     # ---- carte : celle que PyTorch sait calculer, jamais le graphique intégré ----
     def ensure_card(self, spec, lay):
         """Carte ROCm de l'atelier, choisie comme pour les travaux (comfy_pick_device), une fois par vie du worker.
-        Panne du 16/11 : l'atelier ne prenait que le choix déjà fait par un travail Klein ; lancé avant tout travail, il voyait les
+        Panne : l'atelier ne prenait que le choix déjà fait par un travail Klein ; lancé avant tout travail, il voyait les
         deux cartes et ComfyUI gardait la n° 0, le graphique intégré du Ryzen (gfx1036), sans noyau dans les roues gfx1030 :
         tout calcul échouait en hipErrorInvalidImage (agrandisseurs 4x-PBRify-UpscalerV4 et VOSR2). -> HIP_VISIBLE_DEVICES ('' : une
         seule carte, rien à cacher)."""
@@ -4439,7 +4439,7 @@ class Atelier:
 
     # ---- marche, arrêt ----
     def adopt(self, lay):
-        """Atelier resté en marche pendant la mise à jour ou le redémarrage du worker : repris tel quel (le travail de Alice
+        """Atelier resté en marche pendant la mise à jour ou le redémarrage du worker : repris tel quel (le travail du propriétaire
         n'est pas coupé), seulement si ce numéro est bien le Python de l'atelier."""
         st = read_json(lay['state'], {}) or {}
         pid = st.get('pid')
@@ -4507,7 +4507,7 @@ class Atelier:
             code = self.proc.poll()
             if code is not None:
                 self.read_log(force=True)
-                self.forget(lay)   # self.proc vaut None ensuite : le code est lu avant (boucle de relance du 14/11)
+                self.forget(lay)   # self.proc vaut None ensuite : le code est lu avant (boucle de relance)
                 said = [l for l in self.log_lines if not l.startswith('# ')]   # sans la ligne de commande écrite en tête
                 raise RuntimeError('ComfyUI s\'est arrêté au démarrage (code %s) : %s' % (code, ' | '.join(said[-3:])[-230:]))
             if time.time() > deadline:
@@ -4910,7 +4910,7 @@ class Atelier:
         return self.vram
 
     def free(self, why, wait_s=COMFY_FREE_WAIT_S):
-        """Carte rendue par l'atelier (POST /free : modèles déchargés, cache vidé), sans l'arrêter : Alice garde sa page et
+        """Carte rendue par l'atelier (POST /free : modèles déchargés, cache vidé), sans l'arrêter : le propriétaire garde sa page et
         ses réglages. Attend que la mémoire gardée par son PyTorch retombe. -> Mio gardés après (None : inconnu)."""
         if not self.pid or self.state != 'en marche':
             return None

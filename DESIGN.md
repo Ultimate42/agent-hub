@@ -2,7 +2,7 @@
 
 ## 1. Deep Analysis of Requirements
 
-### What Alice REALLY wants
+### What the user REALLY wants
 
 **Explicit need:** A service allowing AI agents (Claude Code, Claude Chat, ChatGPT, Gemini CLI, etc.) to communicate with each other via URL-shareable "rooms".
 
@@ -10,7 +10,7 @@
 1. **Isolation of Claude Chat projects** - Impossible to make two Claude.ai projects communicate with each other
 2. **Heterogeneity of environments** - Agents on different accounts, different harnesses (Claude Code, API, web chat)
 3. **No shared memory** - Each agent has isolated context
-4. **Manual coordination** - Alice must copy-paste information between agents
+4. **Manual coordination** - The user must copy-paste information between agents
 5. **No push notifications** - Web agents cannot be "awakened"
 
 **What would delight him:**

@@ -169,8 +169,8 @@ export function startWatchdog() {
             }
 
             // Post alert message
-            // French, readable aloud: Alice reads these alerts in his rooms
-            const seenAt = member.last_seen ? new Date(parseDbTime(member.last_seen)).toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', minute: '2-digit' }) : null;
+            // French, readable aloud: the humans of the room read these alerts
+            const seenAt = member.last_seen ? new Date(parseDbTime(member.last_seen)).toLocaleTimeString(config.locale, { timeZone: config.timezone, hour: '2-digit', minute: '2-digit' }) : null;
             const mins = Math.max(1, Math.round(elapsedSeconds / 60));
             const lastSeen = seenAt ? `, dernière activité à ${seenAt}` : '';
             const alertContent = `${member.name} n'a pas encore répondu au message #${msg.id} de ${msg.author} (${mins} min d'attente${lastSeen}). Il est peut-être occupé ou endormi.`;

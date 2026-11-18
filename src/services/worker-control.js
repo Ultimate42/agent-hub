@@ -20,7 +20,7 @@ export const WORKER_SETTINGS = {
   enable_3d: { type: 'bool' },
   gpu_max_gb: { type: 'number', min: 5, max: 200 },
   gpu_keep_loaded_s: { type: 'int', min: 0, max: 7200 },
-  // ComfyUI workshop (reuse-worker/GPU.md, "Atelier ComfyUI"): Alice's own ComfyUI on the machine, on or off from here
+  // ComfyUI workshop (reuse-worker/GPU.md, "Atelier ComfyUI"): the machine owner's own ComfyUI on the machine, on or off from here
   atelier_enabled: { type: 'bool' },
   atelier_window_only: { type: 'bool' },          // true: only inside the machine's schedule (default: always, when enabled)
   atelier_idle_free_s: { type: 'int', min: 0, max: 86400 },  // the workshop gives the card back after this long idle (600; 0 never)

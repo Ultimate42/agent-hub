@@ -77,15 +77,16 @@ ni journalisé. Ne jamais l'envoyer, même pour un dépannage : en cas de doute,
 Sans rien installer ni lancer (pour un agent, ou pour relire l'empreinte plus tard) :
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\reuse-worker\install-and-run.ps1 -Fingerprint
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\reuse-worker\install-and-run.ps1 -Fingerprint -HubUrl https://hub.example.com
 ```
 
 ```bash
-bash install-and-run.sh --fingerprint
+bash install-and-run.sh --fingerprint --hub-url=https://hub.example.com
 ```
 
 S'il n'y a pas encore de config, la commande crée le jeton (32 octets aléatoires) et la config, avec l'adresse
-`https://hub.example.com` (à corriger dans le fichier pour un autre hub). S'il y en a une, elle n'y touche pas.
+du hub donnée (`-HubUrl` / `--hub-url=`, sinon la variable `HUB_URL` ; aucune adresse par défaut). S'il y en a une,
+elle n'y touche pas.
 Dans les deux cas elle affiche la seule empreinte, `sha256:` suivi de 64 caractères, puis sort.
 
 Sans le lanceur, à la main, dans le dossier du worker. PowerShell (Windows PowerShell 5.1 ou plus récent) :
@@ -167,7 +168,7 @@ Désinstaller : `install-and-run.ps1 -RemoveStartup` (Linux : `--remove-startup`
 
 ```bash
 H=https://hub.example.com; A="Authorization: Bearer $HUB_REUSE_ADMIN_TOKEN"
-# soumettre un morceau (FLAC mono, sortie de project-audio/pipeline/01_prepare_reuse.sh)
+# soumettre un morceau (FLAC mono, sortie de your own audio preparation script)
 curl -X POST -H "$A" --data-binary @extrait01_000.flac "$H/api/reuse/jobs?batch=extrait01&name=extrait01_000.flac"
 curl -H "$A" "$H/api/reuse/jobs?batch=extrait01"            # avancement, vitesse mesurée, temps restant
 curl -H "$A" -o extrait01_000_clean.flac "$H/api/reuse/jobs/12/output"
@@ -214,14 +215,14 @@ machine sans entrée est toujours disponible (cas de `dev-box`).
 }
 ```
 
-Ce planning est celui du PC GPU : du lundi au vendredi de 19:00 à 09:00 le lendemain, et tout le week-end
-(du vendredi 19:00 au lundi 09:00), heure de Paris.
+Cet exemple ouvre la machine du lundi au vendredi de 20:00 à 08:00 le lendemain, et tout le week-end
+(du vendredi 20:00 au lundi 08:00), heure de Paris.
 
 - Une plage s'écrit `HH:MM-HH:MM`, en heure locale du fuseau, sous le jour où elle **commence** (`sun`, `mon`,
   `tue`, `wed`, `thu`, `fri`, `sat`). Si la fin n'est pas après le début, la plage passe minuit et se termine
-  le lendemain : `"20:00-08:00"` sous `mon` va du lundi 19:00 au mardi 09:00. `24:00` est la fin du jour. Un
+  le lendemain : `"20:00-08:00"` sous `mon` va du lundi 20:00 au mardi 08:00. `24:00` est la fin du jour. Un
   jour absent est fermé.
-- Tout est calculé sur l'heure locale : au changement d'heure d'été ou d'hiver, 19:00 reste 19:00.
+- Tout est calculé sur l'heure locale : au changement d'heure d'été ou d'hiver, 20:00 reste 20:00.
 - **Hors créneau** : la machine ne reçoit aucun nouveau job. `POST /api/reuse/next` lui répond `job: null`,
   la même réponse qu'une file vide, donc aucune version du worker n'a à changer. Elle reste en ligne
   (elle continue d'interroger le hub) et prend les mises à jour.

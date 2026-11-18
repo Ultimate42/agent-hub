@@ -66,7 +66,7 @@ describe('Transcription load balancing (worker identity, min_age, failures, shad
 
   test('parseWorkerMembers keeps Member@room:worker entries only', () => {
     assert.deepStrictEqual(parseWorkerMembers('Claude-Helper@12:dev-box, nocolon, :x, A B@2:w2, NoRoom:w, X@y:z'),
-      [{ member: 'Claude-Helper', roomId: 48, name: 'dev-box' }, { member: 'A B', roomId: 2, name: 'w2' }]);
+      [{ member: 'Claude-Helper', roomId: 12, name: 'dev-box' }, { member: 'A B', roomId: 2, name: 'w2' }]);
   });
 
   test('member token of a listed member acts as its worker; other members refused', async () => {

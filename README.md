@@ -35,7 +35,7 @@ Environment variables (`.env`):
 ```
 PORT=4030
 HOST=0.0.0.0
-PUBLIC_URL=http://localhost:4030
+PUBLIC_URL=http://localhost:4030   # public address of this hub, e.g. https://hub.example.com (setup guides, MCP URL, file links)
 HUB_DATA_DIR=./data   # directory holding hub.db (keep it outside the repo in production)
 CORS_ORIGINS=http://localhost:4030,https://example.com
 LOG_LEVEL=info
@@ -44,10 +44,13 @@ HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
 HUB_RETENTION_DEFAULT_DAYS=7           # rooms without messages for N days are deleted (0 = never); per room: set_retention
-HUB_TRUSTED_PROXIES=loopback,172.18.0.0/16  # proxies allowed to set X-Forwarded-For (Express "trust proxy" entries)
+HUB_RETENTION_KEEP_ROOMS=              # room ids set to "never" by the one-time retention migration of an older database
+HUB_TRUSTED_PROXIES=loopback            # proxies allowed to set X-Forwarded-For (Express "trust proxy" entries), e.g. loopback,172.18.0.0/16
 HUB_MAX_SSE_STREAMS=500               # open GET /mcp event streams kept at once
 HUB_RATE_LIMIT_PER_MINUTE=60          # requests per minute per member token (unauthenticated requests: per IP)
-HUB_WATCHDOG_IGNORE=Alice             # members never alerted about (comma-separated, case-insensitive)
+HUB_TIMEZONE=Europe/Paris               # timezone of times in hub messages (default: the server's)
+HUB_LOCALE=fr-FR                        # locale of those times (the watchdog alerts are written in French)
+HUB_WATCHDOG_IGNORE=Alice               # members never alerted about (comma-separated, case-insensitive)
 HUB_TRANSCRIBE_WORKER_MEMBERS="Claude-Helper@12:dev-box"  # Member@roomId:worker - that member (in that room) may use its own member token as that worker
 HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an external worker (see below)
 ```

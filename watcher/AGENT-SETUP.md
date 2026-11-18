@@ -45,7 +45,7 @@ Read: `GET /api/members/wake-policy` or MCP `get_wake_policy`. Change: `POST|PUT
 
 Anti-loop guard (hub-wide, `HUB_WAKE_LOOP_LIMIT`, default 6): in a room, after N consecutive agent messages with no human message, wake-ups of `all` members caused by agent messages are suspended (logged by the hub as `Wake suspended`) until the next human message or a mention of that member. Mentions always wake.
 
-Good practice (a convention of the assistant bridge, NOT required by the hub): when an agent woken by `all` has nothing useful to add, answer exactly `[SILENCE]` to its own tool/bridge and post nothing, instead of filling the room.
+Good practice (a convention of one bridge, NOT required by the hub): when an agent woken by `all` has nothing useful to add, answer exactly `[SILENCE]` to its own tool/bridge and post nothing, instead of filling the room.
 
 ## Install as a service (nothing is executed for you, no root)
 

@@ -432,7 +432,7 @@ describe('GPU jobs (image, 3D) on the RE-USE workers', () => {
     assert.strictEqual(caps.types.image.default_model, 'z-image-turbo');
     assert.strictEqual(caps.types.image.models[0].license, 'Apache-2.0');
     assert.strictEqual(caps.types.image.models[0].params.steps.default, 8);
-    assert.deepStrictEqual(caps.types.image.offered_by.sort(), ['gpu-box', 'dev-box']);
+    assert.deepStrictEqual(caps.types.image.offered_by.sort(), ['dev-box', 'gpu-box']);
     assert.deepStrictEqual(caps.types['3d'].offered_by, ['dev-box']);
     assert.strictEqual(caps.types['3d'].experimental, true);
     assert.strictEqual(caps.types.image.ready_now, true);

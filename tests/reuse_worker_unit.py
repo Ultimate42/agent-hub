@@ -20,7 +20,7 @@ import zipfile
 from pathlib import Path
 
 # Un seul dossier temporaire par lancement, effacé à la sortie : chaque essai de pip pose 12 Mo, et /tmp est souvent un
-# tmpfs de quelques Go (3 600 dossiers oubliés l'ont rempli le 14/11)
+# tmpfs de quelques Go (3 600 dossiers oubliés l'ont rempli)
 RUN_TMP = tempfile.mkdtemp(prefix='reuse-unit-')
 tempfile.tempdir = RUN_TMP
 atexit.register(shutil.rmtree, RUN_TMP, True)
@@ -883,7 +883,7 @@ class KleinJobTest(unittest.TestCase):
             self.assertTrue(meta2.get('server_reused'))
             self.assertEqual(gpu.comfy['h']['proc'].pid, pid)
             self.assertNotIn('images.image0', json.loads((lay['data'] / 'last-workflow.json').read_text())['refs']['inputs'])
-            # Réglages par défaut (15/11 : Klein en mémoire normale et dynamique) : demi-précision, une seule attention ; et le diagnostic
+            # Réglages par défaut (Klein en mémoire normale et dynamique) : demi-précision, une seule attention ; et le diagnostic
             cmd = (base / 'gpu' / 'logs' / 'comfyui.log').read_text().splitlines()[0]
             self.assertIn('--fp16-unet', cmd)
             self.assertNotIn('--disable-dynamic-vram', cmd)
@@ -1605,7 +1605,7 @@ class AtelierLifeTest(AtelierBase):
         self.assertEqual(args[args.index('--enable-cors-header') + 1], 'http://100.101.102.103:3000')
 
     def test_comfyui_dying_at_start_is_retried_later_and_its_log_is_shown(self):
-        """gpu-box, 14/11 : ComfyUI s'arrêtait au démarrage ; la surveillance lisait le code d'un Popen déjà oublié
+        """gpu-box : ComfyUI s'arrêtait au démarrage ; la surveillance lisait le code d'un Popen déjà oublié
         (AttributeError), relançait aussitôt, toutes les 25 s, état figé sur « démarrage »."""
         (self.lay['src'] / 'main.py').write_text("import sys\nprint('Traceback: ModuleNotFoundError: No module named comfyui_manager', flush=True)\n"
                                                   "print('token=abcdef0123456789 ' + 'a' * 40, flush=True)\nsys.exit(3)\n")
@@ -1856,7 +1856,7 @@ class AtelierRelayTest(unittest.TestCase):
             relay_mod.main(['--listen', '0.0.0.0', '--port', '1', '--backend', '2', '--state', str(self.dir / 'x.json')])
 
     def test_waiting_call_gets_a_sign_of_life_and_a_gone_client_is_dropped(self):
-        """ComfyUI à froid : 3 minutes sans un octet et le client coupe (mesure du 17/11). Le relais envoie « 100 Continue » (sauté
+        """ComfyUI à froid : 3 minutes sans un octet et le client coupe. Le relais envoie « 100 Continue » (sauté
         par les clients HTTP/1.1) ; la réponse finale arrive ensuite, intacte ; un client parti n'est plus compté comme attendant."""
         import socket
         import subprocess
@@ -2230,7 +2230,7 @@ class AtelierSleepTest(AtelierBase):
 
 
 class AtelierCardTest(AtelierBase):
-    """Panne du 16/11 : l'atelier lancé avant tout travail Klein ne choisissait pas de carte ; ComfyUI gardait la n° 0, le
+    """Panne : l'atelier lancé avant tout travail Klein ne choisissait pas de carte ; ComfyUI gardait la n° 0, le
     graphique intégré du Ryzen (gfx1036), et tout agrandissement échouait en hipErrorInvalidImage."""
 
     def test_card_chosen_by_the_workshop_itself(self):
@@ -2304,7 +2304,7 @@ class AtelierCardTest(AtelierBase):
     def test_upscale_on_the_integrated_graphics_says_why(self):
         self.gpu.hip_device = ''   # carte laissée au choix de ComfyUI : la n° 0
         a = self.atelier()
-        a.check_card = lambda busy: None   # sans la vérification, on voit la panne du 16/11
+        a.check_card = lambda busy: None   # sans la vérification, on voit la panne
         a.tick()
         r = a.upscale_test({'model': '4x-PBRify-UpscalerV4.safetensors'}, Path(w.__file__).resolve().parent / w.GPU_TEST_OBJECT,
                            None, lambda f, s: None)

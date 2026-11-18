@@ -16,8 +16,8 @@ import { logger } from '../utils/logger.js';
 //
 // A range is "HH:MM-HH:MM" in the wall clock of the timezone, listed under the day it STARTS. When the end
 // is not after the start, the range runs past midnight and ends the next day ("20:00-08:00" under "mon" =
-// Monday 19:00 to Tuesday 09:00). "24:00" is the end of the day. A day without ranges is closed.
-// Everything is computed on the wall clock, so summer/winter time needs no care: 19:00 is 19:00 local.
+// Monday 20:00 to Tuesday 08:00). "24:00" is the end of the day. A day without ranges is closed.
+// Everything is computed on the wall clock, so summer/winter time needs no care: 20:00 is 20:00 local.
 
 export const DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const RANGE = /^([01]\d|2[0-4]):([0-5]\d)-([01]\d|2[0-4]):([0-5]\d)$/;

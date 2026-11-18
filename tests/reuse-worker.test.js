@@ -161,8 +161,8 @@ const PWSH = process.env.REUSE_TEST_PWSH || (has('pwsh') ? 'pwsh' : null);
 describe('launcher --fingerprint: token made locally, only its SHA-256 shown', { skip: !(process.platform === 'linux' && has('python3') && has('bash')) }, () => {
   const P = '4164', URL_ = `http://localhost:${P}`;
   const launchers = [
-    { name: 'pc-sh', file: 'install-and-run.sh', run: (f, args = ['--fingerprint']) => spawnSync('bash', [f, ...args], { encoding: 'utf8' }) },
-    ...(PWSH ? [{ name: 'pc-ps1', file: 'install-and-run.ps1', run: (f, args = ['-Fingerprint']) => spawnSync(PWSH, ['-NoProfile', '-File', f, ...args], { encoding: 'utf8' }) }] : [])
+    { name: 'pc-sh', file: 'install-and-run.sh', run: (f, args = ['--fingerprint', '--hub-url=https://hub.example.com']) => spawnSync('bash', [f, ...args], { encoding: 'utf8' }) },
+    ...(PWSH ? [{ name: 'pc-ps1', file: 'install-and-run.ps1', run: (f, args = ['-Fingerprint', '-HubUrl', 'https://hub.example.com']) => spawnSync(PWSH, ['-NoProfile', '-File', f, ...args], { encoding: 'utf8' }) }] : [])
   ];
   let tmp, hub;
 
@@ -234,6 +234,15 @@ describe('launcher --fingerprint: token made locally, only its SHA-256 shown', {
       assert.strictEqual(r.status, 2, r.stdout + r.stderr);
       assert.ok(!/sha256:/.test(r.stdout));
       assert.strictEqual(fs.readFileSync(configFile, 'utf8'), '{"hub_url":"https://hub.invalid","token":" "}');
+    });
+
+    test(`${l.file}: no hub address given, no config written (no built-in hub)`, { skip: !!process.env.HUB_URL }, () => {
+      const dir = path.join(tmp, `${l.name}-nourl`);
+      fs.mkdirSync(dir);
+      fs.copyFileSync(path.join(SRC, l.file), path.join(dir, l.file));
+      const r = l.run(path.join(dir, l.file), [l.file.endsWith('.sh') ? '--fingerprint' : '-Fingerprint']);
+      assert.strictEqual(r.status, 2, r.stdout + r.stderr);
+      assert.ok(!fs.existsSync(path.join(dir, 'reuse-worker.config.json')));
     });
   }
 });

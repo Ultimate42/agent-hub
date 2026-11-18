@@ -14,6 +14,7 @@
 #   Journal : logs/worker.log      État : logs/state.json
 #   --crash-test      essai complet sans hub ni jeton (reuse_worker.py posé à côté) : rapport logs/crash-test.json
 #   --fingerprint     afficher l'empreinte du jeton de cette machine (le crée s'il n'existe pas) et sortir
+#   --hub-url URL     adresse du hub pour la première config (ou --hub-url=URL ; sinon variable HUB_URL, sinon demandée)
 #   Prérequis : python3 (>= 3.9), flac ou ffmpeg, pilote Vulkan de la carte (Mesa RADV pour AMD),
 #   glibc >= 2.43 (Ubuntu 26.04 ou plus récent).
 #
@@ -29,12 +30,16 @@ mkdir -p "$BASE/logs"
 
 say() { local line; line="$(date '+%Y-%m-%d %H:%M:%S') | LANCEUR | $*"; echo "$line"; echo "$line" >> "$BASE/logs/worker.log"; }
 
-STARTUP=1; CRASH_TEST=0; FINGERPRINT=0
-for arg in "$@"; do
+STARTUP=1; CRASH_TEST=0; FINGERPRINT=0; HUB_ARG="${HUB_URL:-}"
+ARGS=("$@"); i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+  arg="${ARGS[$i]}"; i=$((i + 1))
   case "$arg" in
     --no-startup) STARTUP=0 ;;
     --crash-test) CRASH_TEST=1 ;;
     --fingerprint) FINGERPRINT=1 ;;
+    --hub-url=*) HUB_ARG="${arg#--hub-url=}" ;;
+    --hub-url) HUB_ARG="${ARGS[$i]:-}"; i=$((i + 1)) ;;
     --remove-startup)
       systemctl --user disable --now "$UNIT" 2>/dev/null; rm -f "$HOME/.config/systemd/user/$UNIT"
       systemctl --user daemon-reload 2>/dev/null; say "Inscription au démarrage retirée."; exit 0 ;;
@@ -52,8 +57,10 @@ if [ "$CRASH_TEST" = 1 ]; then
 fi
 
 # Écrit la config. Sans jeton fourni, il est créé ici : il ne quitte jamais ce dossier.
-write_config() {  # $1 = adresse du hub, $2 = jeton (vide = en créer un)
-  ( umask 077; HUB_URL="${1:-https://hub.example.com}" HUB_TOKEN="$2" "$PYTHON" -c '
+write_config() {  # $1 = adresse du hub (vide = --hub-url ou HUB_URL), $2 = jeton (vide = en créer un)
+  local url="${1:-$HUB_ARG}"
+  [[ "$url" =~ ^[[:space:]]*$ ]] && { say "Adresse du hub manquante : --hub-url=https://... ou variable HUB_URL."; exit 2; }
+  ( umask 077; HUB_URL="$url" HUB_TOKEN="$2" "$PYTHON" -c '
 import json, os, secrets, sys
 token = os.environ["HUB_TOKEN"].strip() or secrets.token_urlsafe(32)
 json.dump({"hub_url": os.environ["HUB_URL"].strip(), "token": token, "backend": "auto"}, open(sys.argv[1], "w"), indent=1)' "$CONFIG" ) \
@@ -83,7 +90,8 @@ fi
 if [ ! -f "$CONFIG" ]; then
   [ -t 0 ] || { say "Config absente : $CONFIG. Lancer ce script une fois à la main pour la créer."; exit 2; }
   echo; echo "Première installation du worker RE-USE."
-  read -r -p "Adresse du hub (Entrée = https://hub.example.com) : " HUB_URL
+  HUB_URL="$HUB_ARG"
+  while [[ "$HUB_URL" =~ ^[[:space:]]*$ ]]; do read -r -p "Adresse du hub (ex. https://hub.example.com) : " HUB_URL || exit 2; done
   read -r -s -p "Jeton de cette machine (Entrée = en créer un ici) : " HUB_TOKEN; echo
   write_config "$HUB_URL" "$HUB_TOKEN"
   if [[ "$HUB_TOKEN" =~ ^[[:space:]]*$ ]]; then

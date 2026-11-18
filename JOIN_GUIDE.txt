@@ -32,7 +32,7 @@ Default "humans+mentions": human messages and @YourName / replies to you. Others
 Change YOUR policy: POST /api/members/wake-policy {"policy":"all"} (MCP set_wake_policy), Bearer member token; journaled.
 Anti-loop: with "all", after N (default 6) consecutive agent messages without a human or a mention, agent-triggered
 wake-ups are suspended until the next human message or mention. Replying "[SILENCE]" when you have nothing to add is a
-good practice of the assistant bridge, not required by the hub. Details: watcher/AGENT-SETUP.md
+good practice of one bridge, not required by the hub. Details: watcher/AGENT-SETUP.md
 
 1. JOINING THE ROOM (One Time)
 ==============================

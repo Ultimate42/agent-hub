@@ -81,7 +81,7 @@
                "--base-directory", "{base}"],
       "env": { "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "MIOPEN_FIND_MODE": "2", "HF_HUB_OFFLINE": "1", "DO_NOT_TRACK": "1" },
       "atelier": {
-        "notes": "Atelier de Alice (GPU.md) : seconde instance, environnement Python clone par liens physiques de celui-ci, noeuds additionnels et ComfyUI-Manager permis, ecoute 127.0.0.1 + adresse Tailscale (jamais 0.0.0.0, ajoutee seulement quand les regles de pare-feu du groupe 'ComfyUI atelier' sont en place). Allocateur extensible et compilateur coupe : 18 s par etape au lieu de 111 sur Klein (14/11).",
+        "notes": "Atelier du proprietaire (GPU.md) : seconde instance, environnement Python clone par liens physiques de celui-ci, noeuds additionnels et ComfyUI-Manager permis, ecoute 127.0.0.1 + adresse Tailscale (jamais 0.0.0.0, ajoutee seulement quand les regles de pare-feu du groupe 'ComfyUI atelier' sont en place). Allocateur extensible et compilateur coupe : 18 s par etape au lieu de 111 sur Klein.",
         "port": 8188,
         "start_timeout_s": 600,
         "args": ["--listen", "{listen}", "--port", "{port}", "--disable-auto-launch", "--use-quad-cross-attention", "--disable-pinned-memory",
@@ -92,7 +92,7 @@
         "env": { "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "MIOPEN_FIND_MODE": "2", "DO_NOT_TRACK": "1",
                  "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True", "PYTORCH_ALLOC_CONF": "expandable_segments:True" }
       },
-      "reference": { "engine": "stable-diffusion.cpp Vulkan, Z-Image Turbo Q8_0, 1024x1024, encodeur texte sur CPU (mesure du 12/11, job 15)", "s_per_step": 13.2 },
+      "reference": { "engine": "stable-diffusion.cpp Vulkan, Z-Image Turbo Q8_0, 1024x1024, encodeur texte sur CPU (mesure)", "s_per_step": 13.2 },
       "workflow_source": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/benchmarks/image_z_image_turbo.json (30/09/2026)",
       "workflow": {
         "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "bench", "images": ["57:8", 0] } },
@@ -150,14 +150,14 @@
             "strength": { "type": "number", "min": 0.05, "max": 1, "default": 0.75, "needs_input": true },
             "flash_attn": { "type": "enum", "values": ["auto", "diffusion", "on", "off"], "default": "auto", "admin": true,
                             "cli": { "diffusion": "auto,diffusion=on" },
-                            "notes": "Attention de sd.cpp. auto : sa sonde décide (coupée sur RDNA2) ; diffusion : imposée au DiT ; on : partout. Mesuré le 12/11 sur RX 6950 XT en 1024, 8 étapes : 21,8 s par étape sans flash attention, 26,8 s avec (chemin scalaire, sans coopmat)." },
+                            "notes": "Attention de sd.cpp. auto : sa sonde décide (coupée sur RDNA2) ; diffusion : imposée au DiT ; on : partout. Mesuré sur la carte RDNA2 de 16 Go en 1024, 8 étapes : 21,8 s par étape sans flash attention, 26,8 s avec (chemin scalaire, sans coopmat)." },
             "vae_tiling": { "type": "bool", "default": true, "admin": true,
                             "notes": "Décodage par tuiles : sans elles, le VAE dépasse la taille de tampon permise par le pilote en 1024 et retombe en partie sur le processeur (34 à 41 s)." },
             "text_encoder": { "type": "enum", "values": ["cpu", "gpu"], "default": "cpu", "admin": true,
                               "cli": { "gpu": "gpu", "cpu": "te=cpu,gpu" },
-                              "notes": "Où calculer l'encodeur texte Qwen3-4B (4 Go), une fois par image. Mesuré le 12/11 en 1024 : 13,3 s par étape avec cpu, 21,7 s avec gpu (encodeur, DiT et tampon de 4,4 Go dans 16 Go : la mémoire vidéo déborde)." },
+                              "notes": "Où calculer l'encodeur texte Qwen3-4B (4 Go), une fois par image. Mesuré en 1024 : 13,3 s par étape avec cpu, 21,7 s avec gpu (encodeur, DiT et tampon de 4,4 Go dans 16 Go : la mémoire vidéo déborde)." },
             "mmap": { "type": "bool", "default": true, "admin": true,
-                       "notes": "Charger les poids par projection mémoire (--mmap) au lieu de std::ifstream. Mesuré le 12/11 : les fichiers se lisent à 953 Mo/s d'un seul lecteur, mais sd.cpp les relit à 25 Mo/s par ifstream, même en cache. Avec --mmap (job 15) : poids chargés en 1 s environ, premier démarrage en 131 s au lieu de 559 s, étape inchangée (13,2 s)." },
+                       "notes": "Charger les poids par projection mémoire (--mmap) au lieu de std::ifstream. Mesuré : les fichiers se lisent à 953 Mo/s d'un seul lecteur, mais sd.cpp les relit à 25 Mo/s par ifstream, même en cache. Avec --mmap : poids chargés en 1 s environ, premier démarrage en 131 s au lieu de 559 s, étape inchangée (13,2 s)." },
             "threads": { "type": "int", "min": 0, "max": 64, "default": 0, "admin": true,
                          "notes": "Fils du moteur, lecture des poids comprise (0 = un par cœur). Le premier chargement lit le disque à 25 Mo/s environ avec la valeur par défaut." }
           },
@@ -182,7 +182,7 @@
            "mirror_note": "Depot officiel a acces controle (connexion Hugging Face exigee) : fichiers pris sur le miroir rootlocalghost/flux-3-image-klein-comfy, commit epingle. Empreintes du modele et du VAE identiques sur un second miroir independant (ml-resources/flux-3-image-klein) ; le README officiel dit que ce sont les memes fichiers que model.safetensors et ae.safetensors du depot d'origine.",
            "engine": "comfyui",
            "min_vram_gb": 14,
-           "notes": "Distille : 16 etapes, sans guidage (cfg 1). Ecrire une description complete de la scene, en anglais, comme une legende detaillee : le hub n'ajoute pas l'agrandisseur de prompt de BFL (Qwen3.5 9B, 18,8 Go). Resolution conseillee 1024x1024 (jusqu'a 1248 au carre, multiples de 16). references : 0 a 4 images PNG ou JPEG de 4 Mo au plus, ramenees par ComfyUI a 1 megapixel ; dans le prompt, les citer dans l'ordre (the first image, the second image...). Pour une reference de STYLE seulement : commencer le prompt par \"Use only the art style, line work, colors and rendering of image 1. Do not copy its subject, its objects or its composition.\", mettre ref_megapixels a 0.25, recadrer toute signature de la reference et finir par \"no signature, no text, no watermark\" (style verifie le 14/11, signature non verifiee).",
+           "notes": "Distille : 16 etapes, sans guidage (cfg 1). Ecrire une description complete de la scene, en anglais, comme une legende detaillee : le hub n'ajoute pas l'agrandisseur de prompt de BFL (Qwen3.5 9B, 18,8 Go). Resolution conseillee 1024x1024 (jusqu'a 1248 au carre, multiples de 16). references : 0 a 4 images PNG ou JPEG de 4 Mo au plus, ramenees par ComfyUI a 1 megapixel ; dans le prompt, les citer dans l'ordre (the first image, the second image...). Pour une reference de STYLE seulement : commencer le prompt par \"Use only the art style, line work, colors and rendering of image 1. Do not copy its subject, its objects or its composition.\", mettre ref_megapixels a 0.25, recadrer toute signature de la reference et finir par \"no signature, no text, no watermark\" (style verifie, signature non verifiee).",
            "files": [
             {
              "dir": "diffusion_models",
@@ -251,7 +251,7 @@
              ],
              "default": "default",
              "admin": true,
-             "notes": "Précision du DiT. default (défaut) : ce que ComfyUI choisit pour Flux3 sur RDNA2, poids bf16 calculés en fp32 ; mesuré le 13/11 (job 56, sans référence) : 4,73 s par étape, image juste. fp16 : image noire (NaN), même job 56 ; ComfyUI l'exclut pour Flux3 à raison. bf16 : sans support matériel sur gfx1030."
+             "notes": "Précision du DiT. default (défaut) : ce que ComfyUI choisit pour Flux3 sur RDNA2, poids bf16 calculés en fp32 ; mesuré (sans référence) : 4,73 s par étape, image juste. fp16 : image noire (NaN), même un essai ; ComfyUI l'exclut pour Flux3 à raison. bf16 : sans support matériel sur gfx1030."
             },
             "attention": {
              "type": "enum",
@@ -287,7 +287,7 @@
              ],
              "default": "normal",
              "admin": true,
-             "notes": "Mode mémoire de ComfyUI. normal : il réserve pour l'échantillonnage une estimation prudente (0,15 Mo par unité de surface avec l'attention quad, environ 9 Go à 1024 avec une référence) et ne charge que le reste du DiT. Job 53 du 13/11 : « loaded partially; 6403 MB usable, 6241 loaded, 4341 offloaded », 260 s par étape. high (défaut) : le DiT de 11,1 Go est chargé en entier (--highvram). low : --lowvram."
+             "notes": "Mode mémoire de ComfyUI. normal : il réserve pour l'échantillonnage une estimation prudente (0,15 Mo par unité de surface avec l'attention quad, environ 9 Go à 1024 avec une référence) et ne charge que le reste du DiT. Job 53 : « loaded partially; 6403 MB usable, 6241 loaded, 4341 offloaded », 260 s par étape. high (défaut) : le DiT de 11,1 Go est chargé en entier (--highvram). low : --lowvram."
             },
             "text_encoder": {
              "type": "enum",
@@ -297,14 +297,14 @@
              ],
              "default": "gpu",
              "admin": true,
-             "notes": "Où calculer l'encodeur Qwen3-VL-4B (8,9 Go). gpu (défaut) : chargé sur la carte puis déchargé avant le DiT, 60 à 95 s avant le DiT (jobs 56, 57). cpu : 422 s (job 54)."
+             "notes": "Où calculer l'encodeur Qwen3-VL-4B (8,9 Go). gpu (défaut) : chargé sur la carte puis déchargé avant le DiT, 60 à 95 s avant le DiT. cpu : 422 s."
             },
             "comfyui_options": {
              "type": "string",
              "max": 200,
              "default": "alloc_expandable,no_comfy_compiler",
              "admin": true,
-             "notes": "Défaut : alloc_expandable,no_comfy_compiler. Mesuré la nuit du 13/11 avec 1 référence à 1 Mpx en 1024 : 125 s par étape sans (job 58), 39,3 s avec alloc_expandable seul (job 63), 18,0 s avec les deux (job 62), image juste. Autres jetons, sans redéploiement : jetons séparés par des virgules : kitchen_hip_off, upcast_attention, no_upcast_attention, fp16_accumulation, pinned_memory, no_async_offload, no_smart_memory (modèle inutilisé déchargé tout de suite), reserve_vram_2, alloc_expandable et alloc_gc (allocateur de PyTorch), no_fallback. Un jeton inconnu est ignoré (engine.comfyui_options_ignored)."
+             "notes": "Défaut : alloc_expandable,no_comfy_compiler. Mesuré la nuit avec 1 référence à 1 Mpx en 1024 : 125 s par étape sans, 39,3 s avec alloc_expandable seul, 18,0 s avec les deux, image juste. Autres jetons, sans redéploiement : jetons séparés par des virgules : kitchen_hip_off, upcast_attention, no_upcast_attention, fp16_accumulation, pinned_memory, no_async_offload, no_smart_memory (modèle inutilisé déchargé tout de suite), reserve_vram_2, alloc_expandable et alloc_gc (allocateur de PyTorch), no_fallback. Un jeton inconnu est ignoré (engine.comfyui_options_ignored)."
             }
            },
            "workflow_source": "workflows/flux3_klein_bf16_mi2i.json du depot black-forest-labs/flux-3-image-klein-comfy (sous-graphe Multiple image to image, sans l'agrandisseur de prompt), converti au format API",
@@ -510,7 +510,7 @@
           "license": "MIT (TRELLIS.2, BiRefNet) ; encodeur DINOv3 sous licence DINOv3 de Meta (libre de redevance, usages militaires interdits)",
           "source": "https://huggingface.co/microsoft/TRELLIS.2-4B",
           "min_vram_gb": 14,
-          "notes": "Experimental : pas encore prouve sur la RX 6950 XT. Image d'entree PNG ou JPEG, objet seul de preference (le fond est retire).",
+          "notes": "Experimental : pas encore prouve sur la carte RDNA2 de 16 Go. Image d'entree PNG ou JPEG, objet seul de preference (le fond est retire).",
           "files": [
             { "role": "birefnet", "name": "birefnet.gguf", "size": 882749024, "sha256": "10c5dd4dcac904cf81c9a16180eb66f167dd52ab55867f54a44567b0b2babbc1",
               "url": "https://huggingface.co/ilintar/trellis2-gguf/resolve/a57397bd3d351599d9729fc144b3f87c3f87d65b/q8/birefnet.gguf" },

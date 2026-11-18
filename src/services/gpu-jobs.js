@@ -661,7 +661,7 @@ function recordFailure(j, name, reason, now, final = false) {
 
 /**
  * final: the worker says the same job would fail the same way (too slow for the cap, image broken twice): no retry.
- * release: the worker gives the job back without having failed it (Alice's ComfyUI workshop took the card): back to
+ * release: the worker gives the job back without having failed it (the machine owner's ComfyUI workshop took the card): back to
  * pending, attempt not counted.
  */
 export function failGpu(id, name, { error, final, release } = {}, now = Date.now()) {

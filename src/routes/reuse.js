@@ -162,7 +162,7 @@ router.post('/api/reuse/workers/:name/settings', guard('admin'), json, (req, res
 
 /**
  * GET /api/reuse/workers/:name/atelier - {settings, online, atelier: {enabled, state, listen, listening, firewall, busy, vram...,
- * mode, relay, ram_mib, relay_ram_mib, wakes, sleeps, last_wake, last_sleep}}: Alice's ComfyUI workshop on that machine, as
+ * mode, relay, ram_mib, relay_ram_mib, wakes, sleeps, last_wake, last_sleep}}: the machine owner's ComfyUI workshop on that machine, as
  * the worker last described it (admin). state "en veille": ComfyUI stopped, its relay keeps the port and wakes it on a call.
  * POST {on: true|false} - turn it on or off (setting atelier_enabled, journaled; applied at the worker's next poll).
  */

@@ -12,12 +12,13 @@
 #   -NoStartup      ne pas s'inscrire au demarrage        -RemoveStartup  retirer l'inscription et sortir
 #   -CrashTest      essai complet sans hub ni jeton (reuse_worker.py pose a cote) : rapport logs\crash-test.json
 #   -Fingerprint    afficher l'empreinte du jeton de cette machine (le cree s'il n'existe pas) et sortir
+#   -HubUrl URL     adresse du hub pour la premiere config (sinon variable HUB_URL, sinon demandee)
 #   Arreter : creer un fichier nomme STOP dans le dossier (le supprimer pour repartir).
 #   Journal : logs\worker.log      Etat : logs\state.json
 #
 # Ce fichier reste volontairement court et en ASCII : toute la logique est dans app\reuse_worker.py,
 # que le hub met a jour. Ici : installation de Python, premier telechargement, relance, retour arriere.
-param([switch]$NoStartup, [switch]$RemoveStartup, [switch]$CrashTest, [switch]$Fingerprint)
+param([switch]$NoStartup, [switch]$RemoveStartup, [switch]$CrashTest, [switch]$Fingerprint, [string]$HubUrl = $env:HUB_URL)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -106,8 +107,8 @@ function Read-Config {
         }
         Write-Host ''
         Write-Host 'Premiere installation du worker RE-USE.'
-        $url = Read-Host 'Adresse du hub (Entree = https://hub.example.com)'
-        if (-not $url) { $url = 'https://hub.example.com' }
+        $url = $HubUrl
+        while (-not $url -or -not $url.Trim()) { $url = Read-Host 'Adresse du hub (ex. https://hub.example.com)' }
         $token = Read-Host 'Jeton de cette machine (Entree = en creer un ici)'
         if ($token -and $token.Trim()) { Write-Config $url $token }
         else {
@@ -262,8 +263,9 @@ if ($Fingerprint) {
         try { $token = [string](Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json).token } catch { }   # l'erreur citerait le contenu
         if (-not $token.Trim()) { Say "Config illisible ou sans jeton : $ConfigPath"; exit 2 }
     } else {
+        if (-not $HubUrl -or -not $HubUrl.Trim()) { Say 'Adresse du hub manquante : -HubUrl https://... ou variable HUB_URL.'; exit 2 }
         $token = New-LocalToken
-        Write-Config 'https://hub.example.com' $token
+        Write-Config $HubUrl $token
     }
     Show-Fingerprint $token
     exit 0

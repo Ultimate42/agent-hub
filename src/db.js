@@ -208,12 +208,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
 `);
 
-// Migration (once): rooms that must never expire when room retention is introduced
-// (rooms 7, 8, 9 on the production hub)
+// Migration (once): rooms that must never expire when room retention is introduced, listed by id in
+// HUB_RETENTION_KEEP_ROOMS ("12,15"; a deployment setting, empty by default). Later: set_retention per room.
 db.exec('CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT)');
 if (!db.prepare("SELECT 1 FROM hub_meta WHERE key = 'retention_v1'").get()) {
+  const keep = String(process.env.HUB_RETENTION_KEEP_ROOMS || '').split(',').map(x => parseInt(x, 10)).filter(n => n > 0);
   db.transaction(() => {
-    for (const r of db.prepare('SELECT id, settings FROM rooms WHERE id IN (7, 8, 9)').all()) {
+    for (const r of db.prepare(`SELECT id, settings FROM rooms WHERE id IN (${keep.map(() => '?').join(',')})`).all(...keep)) {
       const settings = { ...JSON.parse(r.settings || '{}'), retention_days: 0 };
       db.prepare('UPDATE rooms SET settings = ? WHERE id = ?').run(JSON.stringify(settings), r.id);
     }

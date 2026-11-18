@@ -45,7 +45,7 @@ ATTACH_WAIT_S = 10          # au réveil, branchement des WebSockets gardés ava
 FLUSH_S = 5                 # dernière activité écrite au plus toutes les 5 s
 HEARTBEAT_S = 10            # un appel HTTP qui attend le réveil reçoit un signe de vie toutes les 10 s (0 : aucun)
 INTERIM = b'HTTP/1.1 100 Continue\r\n\r\n'   # sauté par http.client (urllib, requests), aiohttp, curl, Node http, navigateurs ; 102/103 font échouer http.client
-NO_INTERIM_AGENTS = ('node', 'undici')   # fetch de Node (undici) : un 100 non demandé = « bad response », appel perdu (vérifié Node 20, 17/11)
+NO_INTERIM_AGENTS = ('node', 'undici')   # fetch de Node (undici) : un 100 non demandé = « bad response », appel perdu
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 LOOPBACK = ipaddress.ip_network('127.0.0.0/8')
 try:   # empreinte de ce fichier : le worker relance un relais repris d'une version précédente (quand l'atelier ne calcule pas)
