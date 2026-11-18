@@ -22,12 +22,13 @@ function roomWithActivity(name, ageDays, settings = {}) {
 describe('Room retention', () => {
   before(async () => {
     process.env.DB_PATH = path.join(DIR, 'hub.db');
-    // Pre-existing production rooms 38-40 must be set to "never" by the one-time migration
+    // Pre-existing rooms listed in HUB_RETENTION_KEEP_ROOMS must be set to "never" by the one-time migration
+    process.env.HUB_RETENTION_KEEP_ROOMS = '7, 8,9';
     const Database = (await import('better-sqlite3')).default;
     const raw = new Database(process.env.DB_PATH);
     raw.exec(`CREATE TABLE rooms (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL, admin_token TEXT NOT NULL,
       name TEXT, directive TEXT, settings TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-    for (const id of [37, 38, 39, 40]) raw.prepare('INSERT INTO rooms (id, token, admin_token, name, settings) VALUES (?, ?, ?, ?, ?)').run(id, `t${id}`, `a${id}`, `R${id}`, '{"secure_mode":false}');
+    for (const id of [6, 7, 8, 9]) raw.prepare('INSERT INTO rooms (id, token, admin_token, name, settings) VALUES (?, ?, ?, ?, ?)').run(id, `t${id}`, `a${id}`, `R${id}`, '{"secure_mode":false}');
     raw.close();
     ({ database } = await import('../src/db.js'));
     retention = await import('../src/services/retention.js');
@@ -38,13 +39,13 @@ describe('Room retention', () => {
     fs.rmSync(DIR, { recursive: true, force: true });
   });
 
-  test('migration: rooms 38, 39, 40 never expire, others keep the default', () => {
-    for (const id of [38, 39, 40]) {
+  test('migration: rooms 7, 8, 9 never expire, others keep the default', () => {
+    for (const id of [7, 8, 9]) {
       const s = database.getRoomById(id).settings;
       assert.strictEqual(s.retention_days, 0);
       assert.strictEqual(s.secure_mode, false, 'other settings kept');
     }
-    assert.strictEqual(database.getRoomById(37).settings.retention_days, undefined);
+    assert.strictEqual(database.getRoomById(6).settings.retention_days, undefined);
     assert.strictEqual(retention.roomRetentionDays({}), 7);
   });
 

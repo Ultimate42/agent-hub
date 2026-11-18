@@ -1,0 +1,1 @@
+This repository is public and used by other people, so it never contains personal data: no real domain, person, machine, room or private detail of any deployment goes into code, tests, docs or commit messages (use example.com, Alice, gpu-box), because each deployment's configuration lives outside the repo, in its environment.
