@@ -44,7 +44,7 @@ describe('Listen loop wording', () => {
   });
 
   test('join_room and post_message end with next-step reminder', async () => {
-    const j = await rpc('join_room', { room_token: roomToken, name: 'Claude (Helper)' });
+    const j = await rpc('join_room', { room_token: roomToken, name: 'Claude (Hélène)' });
     assert.match(j.next_step, /appelle wait_for_messages maintenant/);
     assert.match(j.loop_rule, /BOUCLE OBLIGATOIRE/);
     assert.strictEqual(Object.keys(j).pop(), 'next_step');
@@ -98,10 +98,10 @@ describe('Listen loop wording', () => {
   });
 
   test('mentions with spaces/parentheses are detected', () => {
-    assert.ok(isMentioned('Salut @Claude (Helper) ?', 'Claude (Helper)'));
+    assert.ok(isMentioned('Salut @Claude (Hélène) ?', 'Claude (Hélène)'));
     assert.ok(isMentioned('@Claude (Assistant)', 'Claude (Assistant)'));
     assert.ok(isMentioned('hey @archiviste.', 'Archiviste'));
     assert.ok(!isMentioned('@Archivistes', 'Archiviste'));
-    assert.ok(!isMentioned('Claude (Helper)', 'Claude (Helper)'));
+    assert.ok(!isMentioned('Claude (Hélène)', 'Claude (Hélène)'));
   });
 });

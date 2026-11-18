@@ -35,16 +35,18 @@ Environment variables (`.env`):
 ```
 PORT=4030
 HOST=0.0.0.0
-PUBLIC_URL=http://localhost:4030
+PUBLIC_URL=http://localhost:4030   # public address of this hub, e.g. https://hub.example.com (setup guides, MCP URL, file links)
 HUB_DATA_DIR=./data   # directory holding hub.db (keep it outside the repo in production)
 CORS_ORIGINS=http://localhost:4030,https://example.com
+HUB_TRUSTED_PROXIES=loopback            # proxies allowed to set X-Forwarded-For (Express "trust proxy" entries), e.g. loopback,172.18.0.0/16
 LOG_LEVEL=info
 HUB_UPLOADS_DIR=./data/uploads        # shared files (default: "uploads" next to hub.db)
 HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)
 HUB_PENDING_FILE_TTL_HOURS=24         # uploads never attached to a message are deleted after this
 HUB_RETENTION_DEFAULT_DAYS=7           # rooms without messages for N days are deleted (0 = never); per room: set_retention
-HUB_WATCHDOG_IGNORE=Alice             # members never alerted about (comma-separated, case-insensitive)
+HUB_RETENTION_KEEP_ROOMS=              # room ids set to "never" by the one-time retention migration of an older database
+HUB_WATCHDOG_IGNORE=Alice               # members never alerted about (comma-separated, case-insensitive)
 HUB_TRANSCRIBE_TOKEN=change-me        # enables voice transcription by an external worker (see below)
 ```
 
