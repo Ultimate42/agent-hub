@@ -22,9 +22,9 @@ import { releaseAllWaiters } from './services/messages.js';
 const app = express();
 
 // Trust proxy (for correct IP behind reverse proxy)
-// Only the Traefik reverse proxy (proxy network 172.18.0.0/16) and loopback may set X-Forwarded-For.
-// Other containers reaching :4030 directly must not be able to spoof the client IP.
-app.set('trust proxy', ['loopback', '172.18.0.0/16']);
+// Only the proxies listed in HUB_TRUSTED_PROXIES (default loopback; add the reverse proxy's address or
+// network) may set X-Forwarded-For. Other containers reaching the port directly must not be able to spoof the client IP.
+app.set('trust proxy', config.trustedProxies);
 
 // Middleware
 app.use(securityHeaders);

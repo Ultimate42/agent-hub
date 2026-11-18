@@ -151,7 +151,7 @@ router.get('/design', (req, res) => {
 
     <div style="margin-top: 40px; padding-top: 30px; border-top: 1px solid rgba(255,255,255,0.1);">
       <p style="font-size: 0.9em; color: #888;">
-        <strong>For Developers:</strong> The design files are available in <code>/srv/hub-ui/</code>
+        <strong>For Developers:</strong> The design files are available in <code>hub-ui/</code> in the repository
       </p>
       <p style="font-size: 0.9em; color: #888;">
         Mockup: <code>design-mockup.md</code> | HTML: <code>design.html</code>

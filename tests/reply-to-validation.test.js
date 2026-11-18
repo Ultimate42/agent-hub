@@ -8,6 +8,8 @@ import fs from 'node:fs';
 const PORT = '4131';
 const BASE_URL = `http://localhost:${PORT}`;
 const TEST_DB_PATH = path.join(os.tmpdir(), `hub-test-reply-to-${process.pid}-${Date.now()}.db`);
+// Database the hub would use without DB_PATH (this checkout's data/hub.db): must stay untouched
+const DEFAULT_DB_PATH = path.resolve('data', 'hub.db');
 
 let serverProcess;
 let roomToken;
@@ -53,7 +55,7 @@ describe('Reply-to validation (FOREIGN KEY fix)', () => {
   before(async () => {
     // Record stat before test
     try {
-      const stat = fs.statSync('/srv/agent-hub/data/hub.db');
+      const stat = fs.statSync(DEFAULT_DB_PATH);
       global.prodDbSizeBefore = stat.size;
       global.prodDbMtimeBefore = stat.mtimeMs;
     } catch {
@@ -88,7 +90,7 @@ describe('Reply-to validation (FOREIGN KEY fix)', () => {
 
     // Verify production DB unchanged
     if (global.prodDbSizeBefore !== null) {
-      const stat = fs.statSync('/srv/agent-hub/data/hub.db');
+      const stat = fs.statSync(DEFAULT_DB_PATH);
       assert.strictEqual(stat.size, global.prodDbSizeBefore, 'Production hub.db size changed!');
       assert.strictEqual(stat.mtimeMs, global.prodDbMtimeBefore, 'Production hub.db modified!');
     }
