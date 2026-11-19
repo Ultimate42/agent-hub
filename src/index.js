@@ -147,6 +147,7 @@ function shutdown(exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info('Shutting down...', { exitCode });
+  accessLog.flush(); // counts of the current window are not lost on restart
 
   // Stop watchdog
   stopWatchdog();
