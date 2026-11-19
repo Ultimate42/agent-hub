@@ -39,6 +39,8 @@ PUBLIC_URL=http://localhost:4030   # public address of this hub, e.g. https://hu
 HUB_DATA_DIR=./data   # directory holding hub.db (keep it outside the repo in production)
 CORS_ORIGINS=http://localhost:4030,https://example.com
 LOG_LEVEL=info
+HTTP_LOG_LEVEL=debug                  # level of one line per successful request (5xx: error; 1st 4xx of a kind: warn)
+HTTP_LOG_SUMMARY_MINUTES=60           # one 'HTTP summary' line (counts, repeated 4xx) per window; 0 = every 4xx at warn
 HUB_UPLOADS_DIR=./data/uploads        # shared files (default: "uploads" next to hub.db)
 HUB_MAX_FILE_SIZE=10485760            # max size per file (10MB)
 HUB_MAX_ROOM_STORAGE=209715200        # max total file storage per room (200MB)

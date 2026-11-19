@@ -2,6 +2,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
+import { createAccessLog } from './utils/access-log.js';
 import { securityHeaders, corsHandler, rateLimitMiddleware } from './utils/security.js';
 import { setupWebSocket } from './ws/handler.js';
 import apiRoutes from './routes/api.js';
@@ -45,7 +46,9 @@ app.use('/mcp', express.json({ limit: Math.ceil(config.maxFileSize * 4 / 3) + 64
 // Parse JSON with size limit (64KB)
 app.use(express.json({ limit: '64kb' }));
 
-// Request logging (mask tokens in URLs)
+// Request logging (mask tokens in URLs) : levels and hourly summary in utils/access-log.js
+const accessLog = createAccessLog();
+if (config.httpLogSummaryMs > 0) setInterval(() => accessLog.flush(), config.httpLogSummaryMs).unref();
 app.use((req, res, next) => {
   const start = Date.now();
 
@@ -53,7 +56,7 @@ app.use((req, res, next) => {
     // Mask any token-like strings in URL
     const safeUrl = req.originalUrl.replace(/([?&]token=)[^&]+/g, '$1***').replace(/(\/(?:rooms|r)\/)[A-Za-z0-9_-]{8,}/g, '$1***');
 
-    logger.info('HTTP request', {
+    accessLog.record({
       method: req.method,
       url: safeUrl,
       status: res.statusCode,

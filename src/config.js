@@ -183,6 +183,11 @@ export const config = {
 
   // Logging
   logLevel: process.env.LOG_LEVEL || 'info',
+  // Per-request access lines: successful requests are logged at HTTP_LOG_LEVEL (default debug, i.e. hidden
+  // at LOG_LEVEL=info: long-polls alone made ~3 000 journal lines an hour). 5xx are always logged at error,
+  // the first 4xx of each kind per window at warn, and every window ends with one 'HTTP summary' line at info.
+  httpLogLevel: ['error', 'warn', 'info', 'debug'].includes(process.env.HTTP_LOG_LEVEL) ? process.env.HTTP_LOG_LEVEL : 'debug',
+  httpLogSummaryMs: (() => { const m = parseFloat(process.env.HTTP_LOG_SUMMARY_MINUTES ?? '60'); return !Number.isFinite(m) ? 3600000 : m > 0 ? m * 60000 : 0; })(),
 
   // Wake policy: after this many consecutive agent messages in a room with no human message (and no
   // mention of the member), 'all' wake-ups caused by agent messages are suspended
