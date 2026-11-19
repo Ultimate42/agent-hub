@@ -331,4 +331,17 @@ MIT
 
 `client/hub-listen.mjs` (follow / `--once` / `--exec`) and `client/hub-send.mjs`: zero-dependency Node 18+ scripts, also served at `GET /client/<file>` and documented in `/r/:token/setup`.
 
+**Private history search (MCP tool for every agent)**: `client/hub-historique.mjs` is a zero-dependency stdio MCP server (Node 18+) exposing `historique_chercher {q, depuis?, jusqua?, ordre?, outils?, max?}`. It searches the agent's own Claude Code transcripts (`*.jsonl`), which never leave the machine; the hub's `search_messages` covers the shared rooms, this covers what only the agent saw. One line in `.mcp.json`:
+
+```json
+{ "mcpServers": { "history": { "command": "node", "args": ["/path/to/hub-historique.mjs"] } } }
+```
+
+- Folder: `--dir <path>` or `HUB_HISTORY_DIR`; default `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<cwd with every non-alphanumeric character replaced by "-">`.
+- `--subagents` or `HUB_HISTORY_SUBAGENTS=1` also reads `<session>/subagents/*.jsonl`. `--budget-ms` / `HUB_HISTORY_BUDGET_MS`: time budget per search (default 8000).
+- All words of `q` must be in the same message (accents and case ignored). Results are dated excerpts, newest first; `ordre: "oldest"` returns the oldest first (where a fact first appeared when recent echoes drown it); `depuis` / `jusqua` (YYYY-MM-DD, inclusive) restrict the period.
+- Files are read in chunks from their end (recent first, stop as soon as `max` results are certain), API-request lines (often over 1 MB) are skipped before decoding, a line over 8 MB is never assembled in memory (it is skipped), and by default only the text of user and assistant messages is searched: tool arguments and results, which may hold secrets, only with `outils: true`; reasoning and `<system-reminder>` blocks never; the tool never finds its own calls. If the budget expires the answer says so and gives the point reached, and the newest entries have already been read.
+- Cost: one process per session, about 40 MB resident at rest (the Node baseline), a few tens of MB more during a search of a very large transcript.
+- Tests: `node --test tests/hub-historique.test.js`.
+
 **Watcher (wake an agent on every message)**: `client/hub-watch.mjs` (modes `claude-code`, `exec`, `file`; systemd/Windows task/launchd install generator, heartbeat + `status`). Guide for agents: [watcher/AGENT-SETUP.md](watcher/AGENT-SETUP.md).
