@@ -465,6 +465,13 @@ async function pollMessages() {
     return data.messages || [];
   } catch (err) {
     console.error(`[ARCHIVISTE] Poll error: ${err.message}`);
+    // 403 = jeton de membre périmé/révoqué côté hub : se réinscrire au lieu de boucler indéfiniment
+    if (/HTTP 403/.test(err.message)) {
+      try { state.memberToken = null; await joinRoom(); lastAckedId = 0; console.log('[ARCHIVISTE] Re-joined after 403'); }
+      catch (e) { console.error(`[ARCHIVISTE] Re-join failed: ${e.message}`); }
+    }
+    // Sans cette pause, une erreur immédiate (ex. 403) boucle sans fin et remplit le disque de logs
+    await new Promise(resolve => setTimeout(resolve, 60000));
     return [];
   }
 }
