@@ -1,7 +1,7 @@
 // Orchestration : une session + un abonnement hub par agent de la config.
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { decide, formatMessage, RateLimiter, readSecretFile } from './lib.js';
 import { AgentSession } from './session.js';
 import { HubSubscription } from './hub-client.js';
@@ -74,13 +74,20 @@ export class Runner {
   async start() {
     const cfg = this.cfg;
     const peers = cfg.agents.map((a) => a.name);
+    // Réglage modèle/effort externe : module absent ou illisible => modèle de la config (comportement sans réglage)
+    let getAgentSetting = null;
+    if (cfg.settingsModule) {
+      try { ({ getAgentSetting } = await import(pathToFileURL(cfg.settingsModule).href)); }
+      catch (e) { this.log(`settingsModule illisible (${e.message}) : modèles de la config`); }
+    }
     for (const agent of cfg.agents) {
       const memberToken = readSecretFile(agent.memberTokenFile);
       const roomToken = agent.roomToken || readSecretFile(agent.roomTokenFile);
       const env = { ...process.env };
       if (agent.oauthTokenFile) env.CLAUDE_CODE_OAUTH_TOKEN = readSecretFile(agent.oauthTokenFile);
       const log = (s) => this.log(`[${agent.name}] ${s}`);
-      const session = new AgentSession({ agent, queryFn: this.queryFn, appendPrompt: buildAppendPrompt(agent, cfg, roomToken), env, claudeExecutable: cfg.claudeExecutable, log });
+      const session = new AgentSession({ agent, queryFn: this.queryFn, appendPrompt: buildAppendPrompt(agent, cfg, roomToken), env, claudeExecutable: cfg.claudeExecutable, log,
+        ...(getAgentSetting && agent.settingsId ? { getSetting: () => getAgentSetting(agent.settingsId) } : {}) });
       const bridge = new AgentBridge({ agent, peers, session, log });
       const sub = new this.SubscriptionImpl({
         hubUrl: cfg.hubUrl, roomToken, memberToken, log,

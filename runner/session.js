@@ -1,8 +1,13 @@
 // Session Claude Agent SDK en entrée continue (flux), avec rotation par résumé quand le nombre de tours dépasse un seuil.
 // `queryFn` est injecté (SDK réel ou simulé dans les tests).
+import { ALLOWED_MODELS } from './lib.js';
+
+const NO_SETTING = () => ({ model: null, effort: null });
+
 export class AgentSession {
-  constructor({ agent, queryFn, appendPrompt = '', env, claudeExecutable, log = () => {}, restartDelayMs = 5000, summaryMaxChars = 6000 }) {
-    Object.assign(this, { agent, queryFn, appendPrompt, env, claudeExecutable, log, restartDelayMs, summaryMaxChars });
+  // getSetting() -> {model, effort} : réglage externe relu à chaque (re)démarrage de session (voir settingsModule, README)
+  constructor({ agent, queryFn, appendPrompt = '', env, claudeExecutable, log = () => {}, restartDelayMs = 5000, summaryMaxChars = 6000, getSetting = NO_SETTING }) {
+    Object.assign(this, { agent, queryFn, appendPrompt, env, claudeExecutable, log, restartDelayMs, summaryMaxChars, getSetting });
     this.queue = [];         // entrées { text, resolve? } ; resolve(true|false) = message traité / non traité (ack côté hub)
     this.inflight = [];      // entrées déjà envoyées au SDK, en attente de leur 'result' (FIFO)
     this.wake = null;
@@ -73,11 +78,15 @@ export class AgentSession {
       this.queue.unshift({ text: `[Démarrage] Tu es ${a.name}, session continue connectée au hub. Les messages du salon arrivent étiquetés « [Hub <salon> #id de <auteur>] ». Réponds seulement quand c'est utile.` });
     }
     this.busy = true;
-    this.log(`session #${this.generation} démarrée (modèle ${a.model})`);
+    // Relu à chaque (re)démarrage de session (rotation incluse) ; un modèle hors ALLOWED_MODELS est ignoré.
+    let cs = NO_SETTING();
+    try { cs = this.getSetting() || cs; } catch (e) { this.log(`réglage externe illisible : ${e.message}`); }
+    const model = cs.model && ALLOWED_MODELS.includes(cs.model) ? cs.model : a.model;
+    this.log(`session #${this.generation} démarrée (modèle ${model}${cs.effort ? ', effort ' + cs.effort : ''})`);
     this.q = this.queryFn({
       prompt: this._input(this.ctl),
       options: {
-        model: a.model, cwd: a.cwd,
+        model, ...(cs.effort ? { effort: cs.effort } : {}), cwd: a.cwd,
         permissionMode: a.permissionMode,
         ...(a.allowedTools?.length ? { allowedTools: a.allowedTools } : {}),
         ...(a.permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),

@@ -99,6 +99,7 @@ export function normalizeConfig(raw, base = process.cwd()) {
       allowedTools: a.allowedTools || d.allowedTools || [`Bash(node ${HUB_POST}:*)`],
       settingSources: a.settingSources || d.settingSources || ['project'],
       oauthTokenFile: abs(a.oauthTokenFile || d.oauthTokenFile),
+      settingsId: a.settingsId || null, // clé de l'agent dans settingsModule (absent : pas de réglage externe)
     };
   });
   const names = new Set();
@@ -109,6 +110,8 @@ export function normalizeConfig(raw, base = process.cwd()) {
     claudeExecutable: d.claudeExecutable,
     sdkModule: d.sdkModule, // chemin d'un module @anthropic-ai/claude-agent-sdk si non installé ici
     logFile: abs(d.logFile),
+    // Module ES optionnel exportant getAgentSetting(id) -> {model, effort} (null = défaut de la config), relu à chaque session
+    settingsModule: abs(d.settingsModule),
     agents,
   };
 }
