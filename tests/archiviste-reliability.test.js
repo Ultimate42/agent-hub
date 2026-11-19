@@ -3,13 +3,13 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4150';
 const MEM_PORT = 4151;
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-archiviste-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 let firstId = 0, hub, memServer, memDelay = 300, memWrites = [];
@@ -94,7 +94,7 @@ describe('Archiviste reliability', () => {
   test('concurrent processing, ordered replies, authors with spaces/parentheses', async () => {
     memDelay = 400; memWrites = []; memMaxInFlight = 0;
     const { room, members } = await newRoom(['Claude (Helper)', 'Claude (Assistant)']);
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+    const dir = tmpDir('arch-');
     seedState(dir, 0);
     const toks = Object.values(members);
     for (let i = 0; i < 6; i++) await say(room, toks[i % 2], `retiens: note ${i}`);
@@ -119,7 +119,7 @@ describe('Archiviste reliability', () => {
     memDelay = 1500; memWrites = [];
     const { room, members } = await newRoom(['Claude (Helper)']);
     const tok = members['Claude (Helper)'];
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+    const dir = tmpDir('arch-');
     seedState(dir, 0);
     const m = (await say(room, tok, 'retiens: test crash')).data;
     const id = m.id ?? m.message?.id;
@@ -139,7 +139,7 @@ describe('Archiviste reliability', () => {
     memDelay = 800; memWrites = [];
     const { room, members } = await newRoom(['Claude (Helper)']);
     const tok = members['Claude (Helper)'];
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+    const dir = tmpDir('arch-');
     seedState(dir, 0);
     await say(room, tok, 'retiens: graceful');
     const p1 = startArchiviste(room, dir);
@@ -159,7 +159,7 @@ describe('Archiviste reliability', () => {
     memDelay = 50; memWrites = [];
     const { room, members } = await newRoom(['Claude (Helper)']);
     const tok = members['Claude (Helper)'];
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+    const dir = tmpDir('arch-');
     const id = (await say(room, tok, 'retiens: idem')).data;
     const mid = id.id ?? id.message?.id;
     fs.mkdirSync(dir, { recursive: true });
@@ -174,7 +174,7 @@ describe('Archiviste reliability', () => {
     memDelay = 1500; memWrites = [];
     const { room, members } = await newRoom(['Claude (Helper)']);
     const tok = members['Claude (Helper)'];
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+    const dir = tmpDir('arch-');
     seedState(dir, 0);
     await say(room, tok, 'retiens: avant ack');
     const p1 = startArchiviste(room, dir, { ARCHIVISTE_SHUTDOWN_GRACE_MS: '100' });

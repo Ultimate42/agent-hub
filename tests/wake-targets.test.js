@@ -5,10 +5,11 @@ import { createServer } from 'http';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4136';
 const BASE_URL = `http://localhost:${PORT}`;
-const TEST_DB_PATH = path.join(os.tmpdir(), `hub-test-wake-targets-${process.pid}-${Date.now()}.db`);
+const TEST_DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 const WEBHOOK_PORT = 9999;
 
 let serverProcess;
@@ -370,7 +371,7 @@ describe('Wake Targets Tests', () => {
   });
 
   test('Notification written to file', async () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-test-'));
+    const tempDir = tmpDir('wake-test-');
 
     // Update target to use temp directory
     await request('/api/members/wake-target', {

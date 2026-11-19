@@ -2,13 +2,13 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4147';
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-cursor-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 let proc;
 let room;
 
@@ -173,7 +173,7 @@ describe('Server-side read cursor', () => {
 
 describe('Migration', () => {
   test('legacy DB (no last_read_id) is migrated idempotently, without losing a single row', async () => {
-    const legacy = path.join(os.tmpdir(), `hub-test-legacy-${process.pid}-${Date.now()}.db`);
+    const legacy = path.join(tmpDir('hub-test-'), 'hub.db');
     const db = new Database(legacy);
     db.exec(`
       CREATE TABLE rooms (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL, admin_token TEXT NOT NULL, name TEXT, directive TEXT, settings TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP);

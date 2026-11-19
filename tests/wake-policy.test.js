@@ -3,10 +3,10 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import { decideWake, agentStreak, normalizePolicy, effectivePolicy, WAKE_POLICIES } from '../src/wake-policy.js';
 import { until } from './runner-helpers.js';
+import { tmpDir } from './tmp.js';
 
 const me = { id: 1, name: 'Alice' };
 const msg = (o = {}) => ({ author_id: 2, author: 'Bob', author_role: 'agent', content: 'hello', type: 'message', ...o });
@@ -93,7 +93,7 @@ describe('anti-loop guard', () => {
 describe('wake policy API (temporary DB)', () => {
   const PORT = '4196';
   const BASE = `http://localhost:${PORT}`;
-  const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'wakepol-'));
+  const TMP = tmpDir('wakepol-');
   let hub, roomToken; const tok = {};
   const api = async (p, method = 'GET', body, token) => {
     const r = await fetch(`${BASE}${p}`, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });

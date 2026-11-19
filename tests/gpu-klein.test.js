@@ -3,14 +3,14 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // FLUX 3 Klein through POST /api/gpu/jobs: reference images (validation, storage, worker download) and the machines
 // that may take such a job (they announce the model: it needs ComfyUI installed, not only the image engine).
 const PORT = '4199';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-klein-'));
+const TMP_DIR = tmpDir('hub-klein-');
 const WORKER_DIR = path.join(TMP_DIR, 'worker-files');
 const ADMIN = 'reuse-admin-secret-klein-0123456789';
 const AMD = 'gpu-box-worker-secret-klein-0123456789';

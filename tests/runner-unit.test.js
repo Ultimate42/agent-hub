@@ -2,12 +2,12 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
-import path from 'node:path';
 import { decide, formatMessage, RateLimiter, normalizeConfig, assertModel, isMentioned, readSecretFile } from '../runner/lib.js';
 import { AgentSession } from '../runner/session.js';
 import { AgentBridge } from '../runner/runner.js';
 import { HubSubscription } from '../runner/hub-client.js';
 import { makeFakeQuery, until } from './runner-helpers.js';
+import { tmpDir } from './tmp.js';
 
 const A = { name: 'Alpha', maxTurns: 3, maxMessagesPerMinute: 3, model: 'claude-sonnet-5-5', cwd: os.tmpdir(), permissionMode: 'bypassPermissions', settingSources: [] };
 const peers = ['Alpha', 'Beta'];
@@ -30,7 +30,7 @@ describe('modèles', () => {
     assert.equal(c.hubUrl, 'http://localhost:4030');
   });
   test('readSecretFile accepte "k=v" ou la valeur brute', () => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-'));
+    const d = tmpDir('sec-');
     fs.writeFileSync(`${d}/a`, 'member_token=abc123\n'); fs.writeFileSync(`${d}/b`, 'xyz\n');
     assert.equal(readSecretFile(`${d}/a`), 'abc123'); assert.equal(readSecretFile(`${d}/b`), 'xyz');
   });

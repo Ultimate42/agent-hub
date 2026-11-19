@@ -3,13 +3,13 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import { transcribeCmd, transcribeHttp } from '../scripts/transcribe-worker.mjs';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4148';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-transcribe-'));
+const TMP_DIR = tmpDir('hub-transcribe-');
 const WORKER_TOKEN = 'test-transcribe-secret-0123456789';
 
 let hubProcess, workerProcess, fakeWhisper, whisperPort;

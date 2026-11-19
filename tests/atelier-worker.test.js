@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // the machine owner's ComfyUI workshop on a worker machine, end to end: the real launcher + worker against a real hub, a fake
 // ComfyUI for the workshop and a fake image engine for the hub's jobs. Turned on and off from the hub; while it computes
@@ -96,7 +97,7 @@ describe('worker: ComfyUI workshop beside the hub jobs', { skip: !canRun }, () =
   const runs = () => (fs.existsSync(path.join(data, 'argv.jsonl')) ? fs.readFileSync(path.join(data, 'argv.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)) : []);
 
   before(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'atelier-worker-'));
+    tmp = tmpDir('atelier-worker-');
     publish = path.join(tmp, 'publish');
     pc = path.join(tmp, 'pc');
     const store = path.join(tmp, 'store');

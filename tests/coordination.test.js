@@ -2,15 +2,15 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // Coordination routes: admin-only writes must stay inside the admin's room, never crash on a
 // missing body, and never let a negative limit become "no limit".
 
 const PORT = '4170';
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-coordination-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 let proc;
 
 async function req(p, { method = 'GET', body, token, raw } = {}) {

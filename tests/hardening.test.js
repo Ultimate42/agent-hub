@@ -7,14 +7,15 @@ import fs from 'node:fs';
 import WebSocket from 'ws';
 import Database from 'better-sqlite3';
 import { isPrivateHost, isLoopbackIp } from '../src/utils/net.js';
+import { tmpDir } from './tmp.js';
 
 // Never touch the production DB: point any in-process import at a temp file
-process.env.DB_PATH = path.join(os.tmpdir(), `hub-test-hardening-unit-${process.pid}.db`);
+process.env.DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 const { parseDbTime } = await import('../src/watchdog.js');
 
 const PORT = '4141';
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-hardening-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 let proc;
 
 async function req(p, { method = 'GET', body, token, headers = {} } = {}) {

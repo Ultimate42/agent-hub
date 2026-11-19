@@ -2,15 +2,15 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // Repository root (tests must run from any checkout, not only the VPS path)
 const ROOT = path.resolve(import.meta.dirname, '..');
 
 const PORT = '4132';
 const BASE_URL = `http://localhost:${PORT}`;
-const TEST_DB_PATH = path.join(os.tmpdir(), `hub-test-${process.pid}-${Date.now()}-guide.db`);
+const TEST_DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 
 let serverProcess;
 let roomToken;

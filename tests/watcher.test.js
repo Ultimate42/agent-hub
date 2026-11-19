@@ -7,10 +7,11 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { until } from './runner-helpers.js';
 import { Watcher, buildConfig, parseArgs, statusOf, generateService, splitArgs, shouldWake } from '../client/hub-watch.mjs';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4193';
 const BASE = `http://localhost:${PORT}`;
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-it-'));
+const TMP = tmpDir('watcher-it-');
 let hub, roomToken, tokens = {};
 const api = async (p, method = 'GET', body, token) => {
   const r = await fetch(`${BASE}${p}`, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });

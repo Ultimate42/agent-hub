@@ -3,15 +3,15 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // Remote control of a worker machine from the hub: settings overrides (enable_3d...) and GPU tests
 // (remote --gpu-test, ComfyUI bench), driven by the admin token, run by the worker between two jobs.
 
 const PORT = '4198';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wctl-'));
+const TMP_DIR = tmpDir('hub-wctl-');
 const WORKER_DIR = path.join(TMP_DIR, 'worker-files');
 const ADMIN = 'reuse-admin-secret-wctl-0123456789';
 const AMD = 'gpu-box-worker-secret-wctl-0123456789';
@@ -333,7 +333,7 @@ describe('RE-USE worker remote control', () => {
 
 describe('worker-control: expiry (clock passed in)', () => {
   let wc;
-  const DB_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-wctl-db-'));
+  const DB_DIR = tmpDir('hub-wctl-db-');
   before(async () => {
     process.env.DB_PATH = path.join(DB_DIR, 'hub.db');
     wc = await import('../src/services/worker-control.js');

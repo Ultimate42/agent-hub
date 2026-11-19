@@ -3,13 +3,13 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import http from 'node:http';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4151';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-'));
+const TMP_DIR = tmpDir('hub-reuse-');
 const WORKER_DIR = path.join(TMP_DIR, 'worker-files');
 const ADMIN = 'reuse-admin-secret-0123456789';
 const AMD = 'gpu-box-worker-secret-0123456789';
@@ -377,7 +377,7 @@ describe('RE-USE cleaning queue', () => {
 
 describe('RE-USE queue disabled', () => {
   test('404 on every route when no token is configured', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-off-'));
+    const tmp = tmpDir('hub-reuse-off-');
     const env = { ...process.env, PORT: '4152', DB_PATH: path.join(tmp, 'hub.db') };
     delete env.HUB_REUSE_ADMIN_TOKEN; delete env.HUB_REUSE_WORKER_TOKENS;
     const hub = spawn('node', ['src/index.js'], { cwd: process.cwd(), env, stdio: 'ignore' });
@@ -398,7 +398,7 @@ describe('RE-USE queue disabled', () => {
 
 describe('RE-USE queue storage cap', () => {
   test('507 instead of filling the disk; room comes back when a batch is deleted', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-cap-'));
+    const tmp = tmpDir('hub-reuse-cap-');
     const flac = fakeFlac({ salt: 'cap' });
     const hub = spawn('node', ['src/index.js'], {
       cwd: process.cwd(), stdio: 'ignore',
@@ -462,7 +462,7 @@ describe('RE-USE queue hardening', () => {
   const view = async (id) => (await http(`/api/reuse/jobs/${id}`, { token: ADMIN })).data;
 
   before(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-hard-'));
+    tmp = tmpDir('hub-reuse-hard-');
     reuseDir = path.join(tmp, '.state', 'reuse'); // under a dot folder on purpose (downloads must still work)
     workerDir = path.join(tmp, 'worker-files');
     fs.mkdirSync(path.join(tmp, '.state'));
@@ -572,7 +572,7 @@ describe('RE-USE portable Python fallback', () => {
   const publish = (text) => fs.writeFileSync(path.join(workerDir, 'install-and-run.ps1'), text);
 
   before(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-py-'));
+    tmp = tmpDir('hub-reuse-py-');
     workerDir = path.join(tmp, 'worker-files');
     fs.mkdirSync(workerDir);
     fs.writeFileSync(path.join(workerDir, 'reuse_worker.py'), 'print("v1")\n');
@@ -666,7 +666,7 @@ describe('RE-USE tokens declared by fingerprint', () => {
   let hub, tmp, out = '';
 
   before(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-fp-'));
+    tmp = tmpDir('hub-reuse-fp-');
     hub = spawn('node', ['src/index.js'], {
       cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
       env: {

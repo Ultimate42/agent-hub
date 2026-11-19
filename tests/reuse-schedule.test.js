@@ -1,14 +1,14 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // Worker schedules of the RE-USE queue (src/services/reuse-schedule.js): pure window arithmetic on the
 // wall clock of a timezone, then the file the hub reads them from. The refusal to serve a job outside
 // the window is tested against a real hub in reuse-queue.test.js.
 
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-reuse-schedule-'));
+const TMP_DIR = tmpDir('hub-reuse-schedule-');
 process.env.DB_PATH = path.join(TMP_DIR, 'hub.db');
 process.env.HUB_REUSE_DIR = path.join(TMP_DIR, 'reuse');
 const FILE = path.join(TMP_DIR, 'reuse', 'schedules.json');

@@ -2,19 +2,19 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // MCP wait_for_messages is woken by the publication itself (no 500 ms DB polling):
 // a message posted while an agent waits reaches it at once, and a timeout answer never hides a
 // message published just before it.
 
-process.env.DB_PATH = path.join(os.tmpdir(), `hub-test-mcp-wait-unit-${process.pid}.db`);
+process.env.DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 const { MAX_WAITERS_PER_ROOM } = await import('../src/services/messages.js');
 
 const PORT = '4172';
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-mcp-wait-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 let proc;
 
 async function rpc(name, args) {

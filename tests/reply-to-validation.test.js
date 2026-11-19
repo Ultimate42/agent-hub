@@ -2,12 +2,12 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4131';
 const BASE_URL = `http://localhost:${PORT}`;
-const TEST_DB_PATH = path.join(os.tmpdir(), `hub-test-reply-to-${process.pid}-${Date.now()}.db`);
+const TEST_DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 // Database the hub would use without DB_PATH (this checkout's data/hub.db): must stay untouched
 const DEFAULT_DB_PATH = path.resolve('data', 'hub.db');
 

@@ -3,8 +3,8 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // Wake webhooks: (1) a public hostname resolving to a private address is refused and the vetted
 // address is the one connected to, (2) max_retries is honoured with a capped backoff, (3) the
@@ -12,12 +12,12 @@ import fs from 'node:fs';
 // (5) one delivery chain per member (newer notifications are coalesced), (6) a webhook registered
 // from the hub host may resolve to a private address, one registered through a proxy may not.
 
-process.env.DB_PATH = path.join(os.tmpdir(), `hub-test-wake-unit-${process.pid}.db`);
+process.env.DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 const { resolveWebhookTarget, notifyWebhook } = await import('../src/wake-targets.js');
 
 const PORT = '4173';
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-wake-hardening-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 const HOOK_PORT = 4174;
 let proc, hook;
 const hits = [];       // every webhook request: { path, body }

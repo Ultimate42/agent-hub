@@ -3,13 +3,13 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4160';
 const MEM_PORT = 4161;
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-archiviste-hint-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const TREE = 'jardin\n potager\n  tomates(1)\n  courgettes(7)\n outils\n  arrosage(2)\n  suivi(1)\n objectifs(1)\nmaison\n objectifs(3)\narchive\n anciens(66)\n';
 
@@ -54,7 +54,7 @@ describe('Archiviste [Categorie] -> hint', () => {
     const tok = (await api(`/api/rooms/${room.room_token}/join`, { method: 'POST', body: JSON.stringify({ name: 'Claude (Assistant)' }) })).data.member_token;
     const say = (c) => api(`/api/rooms/${room.room_token}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${tok}` }, body: JSON.stringify({ content: c, type: 'message' }) });
     await say('warmup');
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+    const dir = tmpDir('arch-');
     fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ lastProcessedMessageId: 0, welcomedAt: new Date().toISOString() }));
     for (const c of ['retiens: [Tomates] mildiou', 'retiens: [Arrosoir actuel mi-octobre 2026] 10 litres',
       'retiens: [Météo] pluie', 'retiens: [Objectifs] x', 'retiens: sans categorie']) await say(c);

@@ -3,8 +3,8 @@ import assert from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // The worker program (reuse-worker/): pure functions, then the real launcher + worker against a real hub,
 // with a fake engine (ffmpeg halves the volume) so the whole loop, self-update and rollback run in seconds.
@@ -41,7 +41,7 @@ describe('worker end to end (launcher, job, self-update, rollback)', { skip: !ca
   const publishWorker = (edit) => fs.writeFileSync(path.join(publish, 'reuse_worker.py'), edit(fs.readFileSync(path.join(SRC, 'reuse_worker.py'), 'utf8')));
 
   before(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reuse-worker-'));
+    tmp = tmpDir('reuse-worker-');
     publish = path.join(tmp, 'publish');
     pc = path.join(tmp, 'pc');
     fs.mkdirSync(publish);
@@ -167,7 +167,7 @@ describe('launcher --fingerprint: token made locally, only its SHA-256 shown', {
   let tmp, hub;
 
   before(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reuse-fp-'));
+    tmp = tmpDir('reuse-fp-');
     for (const l of launchers) {
       l.dir = path.join(tmp, l.name);
       fs.mkdirSync(l.dir);

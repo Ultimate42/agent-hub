@@ -8,10 +8,11 @@ import fs from 'node:fs';
 import { normalizeConfig } from '../runner/lib.js';
 import { Runner } from '../runner/runner.js';
 import { makeFakeQuery, until } from './runner-helpers.js';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4187';
 const BASE = `http://localhost:${PORT}`;
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-it-'));
+const TMP = tmpDir('runner-it-');
 const DB = path.join(TMP, 'hub.db');
 let hub, roomToken, tokens = {};
 

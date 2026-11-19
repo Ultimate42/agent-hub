@@ -3,14 +3,14 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import { until } from './runner-helpers.js';
+import { tmpDir } from './tmp.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const PORT = '4188';
 const BASE = `http://127.0.0.1:${PORT}`; // IPv4: the hub listens on 0.0.0.0, and localhost may resolve to ::1 first
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'client-it-'));
+const TMP = tmpDir('client-it-');
 let hub, roomToken, bob;
 let hubStderr = '';
 // On a network error, say whether the test hub died and show its stderr (it is not printed otherwise)

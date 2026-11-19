@@ -1,10 +1,10 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
-const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-retention-'));
+const DIR = tmpDir('hub-retention-');
 const DAY = 24 * 3600 * 1000;
 let database, retention;
 

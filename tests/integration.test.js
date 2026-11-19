@@ -3,13 +3,13 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import WebSocket from 'ws';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4130';
 const BASE_URL = `http://localhost:${PORT}`;
 const WS_URL = `ws://localhost:${PORT}/ws`;
-const TEST_DB_PATH = path.join(os.tmpdir(), `hub-test-${process.pid}-${Date.now()}.db`);
+const TEST_DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 
 let serverProcess;
 let roomToken;

@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { search, createServer, defaultDir } from '../client/hub-historique.mjs';
+import { tmpDir } from './tmp.js';
 
 // hub-historique: search in the private Claude Code transcripts of an agent.
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-'));
+const dir = tmpDir('hist-');
 const L = (o) => JSON.stringify(o);
 const u = (ts, text) => L({ type: 'user', timestamp: ts, message: { role: 'user', content: text } });
 const a = (ts, blocks) => L({ type: 'assistant', timestamp: ts, message: { role: 'assistant', content: blocks } });
@@ -58,7 +58,7 @@ test('time budget: announced stop with the point reached, never a block', async 
   const r = await search({ q: 'plan' }, { ...o, budgetMs: -1 }); assert.ok(r.truncated);
 });
 test('recent order keeps the newest when the budget expires inside one big file', async () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-big-'));
+  const d = tmpDir('hist-big-');
   const rows = []; for (let i = 0; i < 40000; i++) rows.push(u(new Date(Date.UTC(2026, 0, 1) + i * 1000).toISOString(), 'filler message number ' + i + ' ' + 'y'.repeat(200)));
   rows.push(u('2026-12-31T00:00:00.000Z', 'needle recent')); fs.writeFileSync(path.join(d, 'f.jsonl'), rows.join('\n') + '\n');
   const r = await search({ q: 'needle', max: 1 }, { dir: d, budgetMs: 8000 });
@@ -66,7 +66,7 @@ test('recent order keeps the newest when the budget expires inside one big file'
   const t0 = Date.now(); assert.equal((await search({ q: 'filler number 5', max: 3 }, { dir: d })).found, 3); assert.ok(Date.now() - t0 < 2000);
 });
 test('lines longer than a chunk are read whole, in both directions', async () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-long-'));
+  const d = tmpDir('hist-long-');
   const long = u('2026-05-01T00:00:00.000Z', 'start ' + 'é'.repeat(700000) + ' needle-long');
   fs.writeFileSync(path.join(d, 'f.jsonl'), [long, u('2026-05-02T00:00:00.000Z', 'tail')].join('\n'));
   for (const ordre of ['recent', 'oldest']) assert.equal((await search({ q: 'needle-long', ordre }, { dir: d })).found, 1);
@@ -82,14 +82,14 @@ test('tool arguments and results are not searched by default, only with outils; 
   assert.equal((await search({ q: 'plan output' }, o)).found, 0);
   assert.equal((await search({ q: 'echo plan' }, o)).found, 0);
   assert.equal((await search({ q: 'echo plan', outils: true }, o)).found, 1);
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-rem-'));
+  const d = tmpDir('hist-rem-');
   fs.writeFileSync(path.join(d, 'f.jsonl'), R('2026-04-01T00:00:00.000Z', 'secret-sauce') + '\n');
   assert.equal((await search({ q: 'secret-sauce' }, { dir: d })).found, 0);
   assert.equal((await search({ q: 'secret-sauce', outils: true }, { dir: d })).found, 0);
   assert.equal((await search({ q: 'visible words' }, { dir: d })).found, 1);
 });
 test('a huge line is not assembled in memory: bounded, skipped, neighbours still read, both directions', async () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-huge-'));
+  const d = tmpDir('hist-huge-');
   const f = path.join(d, 'f.jsonl'), fd = fs.openSync(f, 'w');
   fs.writeSync(fd, u('2026-06-01T00:00:00.000Z', 'before needle-x') + '\n');
   fs.writeSync(fd, '{"type":"api-request","x":"'); const blk = 'z'.repeat(1 << 20);
@@ -118,7 +118,7 @@ test('MCP stdio: robust to JSON that is not a request, client responses, and end
   assert.equal(JSON.parse(JSON.parse(q.o).result.content[0].text).found, 1);
 });
 test('a file truncated during the read ends cleanly', async () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-trunc-')); const f = path.join(d, 'f.jsonl');
+  const d = tmpDir('hist-trunc-'); const f = path.join(d, 'f.jsonl');
   fs.writeFileSync(f, u('2026-07-01T00:00:00.000Z', 'x'.repeat(600000) + ' needle-t') + '\n');
   const orig = fs.promises.open; let first = true;
   fs.promises.open = async (...a) => { const fh = await orig(...a); const rd = fh.read.bind(fh); fh.read = async (...r) => { if (first) { first = false; return rd(...r); } return { bytesRead: 0, buffer: r[0] }; }; return fh; };

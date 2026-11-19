@@ -2,13 +2,13 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import WebSocket from 'ws';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4149';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-actions-'));
+const TMP_DIR = tmpDir('hub-actions-');
 
 let serverProcess;
 let roomToken, alice, bob;

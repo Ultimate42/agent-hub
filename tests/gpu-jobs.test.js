@@ -3,13 +3,13 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // GPU jobs (image, 3D) through the hub: member tokens, catalog validation, sharing the RE-USE workers and schedule.
 const PORT = '4161';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-gpu-'));
+const TMP_DIR = tmpDir('hub-gpu-');
 const WORKER_DIR = path.join(TMP_DIR, 'worker-files');
 const ADMIN = 'reuse-admin-secret-0123456789';
 const AMD = 'gpu-box-worker-secret-0123456789';

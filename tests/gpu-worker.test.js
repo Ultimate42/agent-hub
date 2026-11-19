@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // The real launcher + worker against a real hub, generating images and 3D with fake engines. The engines and model
 // files are installed exactly as on the PC: from the published catalog (same command lines), archives and files
@@ -139,7 +140,7 @@ describe('worker: image and 3D generation end to end', { skip: !canRun }, () => 
   });
 
   before(async () => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gpu-worker-'));
+    tmp = tmpDir('gpu-worker-');
     publish = path.join(tmp, 'publish');
     pc = path.join(tmp, 'pc');
     const store = path.join(tmp, 'store');

@@ -2,16 +2,16 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 
 // Repository root (tests must run from any checkout, not only the VPS path)
 const ROOT = path.resolve(import.meta.dirname, '..');
 import { isMentioned } from '../src/utils/mentions.js';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4150';
 const BASE = `http://localhost:${PORT}`;
-const DB = path.join(os.tmpdir(), `hub-test-${process.pid}-${Date.now()}-loop.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 let proc, roomToken;
 
 async function rpc(name, args) {

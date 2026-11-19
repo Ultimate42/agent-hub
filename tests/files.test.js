@@ -2,13 +2,13 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import http from 'node:http';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4147';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-files-'));
+const TMP_DIR = tmpDir('hub-files-');
 const TEST_DB_PATH = path.join(TMP_DIR, 'hub.db');
 
 // 1x1 transparent PNG
@@ -198,7 +198,7 @@ describe('Shared files (attachments)', () => {
 
 describe('Pending file sweeper', () => {
   test('deletes uploads never attached to a message, keeps attached ones', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-sweep-'));
+    const dir = tmpDir('hub-sweep-');
     process.env.DB_PATH = path.join(dir, 'hub.db');
     const { database } = await import('../src/db.js');
     const { storeFile, sweepPendingFiles, attachmentPath } = await import('../src/services/files.js');

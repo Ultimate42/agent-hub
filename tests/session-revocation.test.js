@@ -3,8 +3,8 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import WebSocket from 'ws';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
+import { tmpDir } from './tmp.js';
 
 // JOIN_GUIDE promises: "Rejoining invalidates all old connections using the previous token".
 // Live WebSocket sockets, REST long-polls and MCP wait_for_messages opened with the old token must
@@ -13,7 +13,7 @@ import fs from 'node:fs';
 const PORT = '4171';
 const BASE = `http://localhost:${PORT}`;
 const WS_URL = `ws://localhost:${PORT}/ws`;
-const DB = path.join(os.tmpdir(), `hub-test-revocation-${process.pid}-${Date.now()}.db`);
+const DB = path.join(tmpDir('hub-test-'), 'hub.db');
 let proc;
 
 async function req(p, { method = 'GET', body, token } = {}) {

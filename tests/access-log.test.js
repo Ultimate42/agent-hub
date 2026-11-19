@@ -1,9 +1,9 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
 import path from 'node:path';
-import os from 'node:os';
+import { tmpDir } from './tmp.js';
 
-process.env.DB_PATH = path.join(os.tmpdir(), `hub-test-access-log-${process.pid}.db`);
+process.env.DB_PATH = path.join(tmpDir('hub-test-'), 'hub.db');
 const { createAccessLog, routeKey } = await import('../src/utils/access-log.js');
 
 function fakeLog() {

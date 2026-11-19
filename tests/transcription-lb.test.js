@@ -2,13 +2,13 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs';
 import { parseWorkerTokens, parseWorkerMembers } from '../src/config.js';
+import { tmpDir } from './tmp.js';
 
 const PORT = '4149';
 const BASE_URL = `http://localhost:${PORT}`;
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-transcribe-lb-'));
+const TMP_DIR = tmpDir('hub-transcribe-lb-');
 const LEGACY = 'legacy-transcribe-secret-0123456789';
 const PC = 'dev-box-worker-secret-0123456789';
 
